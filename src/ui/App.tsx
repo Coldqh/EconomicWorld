@@ -8,14 +8,17 @@ import { runMonths, stepMonth } from "../economy/simulation.ts";
 import { bankCapitalRatioBps } from "../finance/credit.ts";
 import { bankLiquidityRatioBps } from "../finance/liquidity.ts";
 import type { LedgerTransaction, MetricPoint, TransactionKind, WorldState } from "../domain/model.ts";
-import { SaveRepository, type SaveManifest } from "../persistence/save-repository.ts";
+import { SaveRepository, type PersistenceDiagnostics, type SaveManifest } from "../persistence/save-repository.ts";
 import { acceptJobOffer, applyForJob, availableOccupations, resignPlayerJob, setPlayerProfile, setPlayerSavingsTarget } from "../player/commands.ts";
 import { playerFinancialSummary, playerHousehold, playerPerson, SKILL_LABELS, tracePlayerMoney } from "../player/system.ts";
 import { applyUniversity, buyDurable, buyProperty, enrollUniversity, rentProperty, sellDurable, startTravel, travelOptions } from "../player/world-commands.ts";
 import { BootSequence } from "./BootSequence.tsx";
-import { DeltaSparkline, LineAreaChart, MarketBars } from "./charts.tsx";
+import { LineAreaChart, MarketBars, MiniTrendChart } from "./charts.tsx";
+import { companyValuation, declareDividend, issueBond, ownershipBps, raiseEquity, startIpo } from "../corporate/finance.ts";
+import { openBrokerageAccount, placeOrder, portfolioSummary } from "../markets/exchange.ts";
+import { APP_BUILD, applyAppUpdate, checkForUpdate, registerAppServiceWorker, serviceWorkerDiagnostics, type UpdateState } from "../pwa/update-manager.ts";
 
-type View = "life" | "world" | "career" | "education" | "finances" | "economy" | "banks" | "ledger" | "control";
+type View = "life" | "world" | "career" | "education" | "finances" | "economy" | "companies" | "markets" | "portfolio" | "banks" | "ledger" | "control" | "settings";
 
 const NAV: Array<{ id: View; label: string; short: string }> = [
   { id: "life", label: "Моя жизнь", short: "Жизнь" },
@@ -24,18 +27,32 @@ const NAV: Array<{ id: View; label: string; short: string }> = [
   { id: "education", label: "Институты", short: "Вузы" },
   { id: "finances", label: "Мои финансы", short: "Финансы" },
   { id: "economy", label: "Экономика", short: "Экономика" },
+  { id: "companies", label: "Компании", short: "Компании" },
+  { id: "markets", label: "Рынки", short: "Рынки" },
+  { id: "portfolio", label: "Портфель", short: "Портфель" },
   { id: "banks", label: "Банки", short: "Банки" },
   { id: "ledger", label: "Общий реестр", short: "Реестр" },
   { id: "control", label: "Контроль", short: "Контроль" },
+  { id: "settings", label: "Настройки", short: "Настройки" },
 ];
+
+const MOBILE_PRIMARY: Array<{ id: View; label: string }> = [
+  { id: "life", label: "Главная" },
+  { id: "economy", label: "Экономика" },
+  { id: "markets", label: "Рынки" },
+  { id: "career", label: "Карьера" },
+];
+const MOBILE_MORE = NAV.filter((item) => !MOBILE_PRIMARY.some((primary) => primary.id === item.id));
 
 const TX_LABELS: Record<TransactionKind, string> = {
   GENESIS: "Начальный баланс", TRANSFER: "Перевод", WAGE: "Зарплата", INCOME_TAX: "Налог на доход", SALES_TAX: "Налог с продаж", CORPORATE_TAX: "Налог на прибыль", SOCIAL_TRANSFER: "Социальная выплата", GOODS_CLEARING: "Покупка товара", INPUT_PURCHASE: "Закупка сырья", CAPITAL_CONTRIBUTION: "Вклад в капитал", LOAN_ISSUED: "Выдача кредита", LOAN_INTEREST: "Проценты по кредиту", LOAN_PRINCIPAL: "Погашение кредита", LOAN_DEFAULT: "Дефолт", INVENTORY_SEED: "Начальные запасы", INVENTORY_TRANSFER: "Передача запасов", COGS: "Себестоимость продаж", PRODUCTION: "Производство", DEPRECIATION: "Амортизация", CAPITAL_INVESTMENT: "Капитальные вложения", ACCOUNTING_CLOSE: "Закрытие периода", INTERBANK_LOAN: "Межбанковский кредит", CENTRAL_BANK_FACILITY: "Кредит центрального банка", EDUCATION: "Краткий курс", UNIVERSITY_TUITION: "Оплата вуза", COHORT_INCOME: "Доход когорты", COHORT_CONSUMPTION: "Потребление когорты", MATERIALIZATION: "Материализация", DEMATERIALIZATION: "Дематериализация", TRAVEL: "Поездка", RENT: "Аренда", PROPERTY_PURCHASE: "Покупка жилья", DURABLE_PURCHASE: "Покупка актива", USED_ASSET: "Подержанный актив", LOGISTICS: "Логистика",
+  EQUITY_ISSUE: "Выпуск акций", EQUITY_SECONDARY: "Сделка с акциями", DIVIDEND: "Дивиденд", BOND_ISSUE: "Выпуск облигаций", BOND_COUPON: "Купон", BOND_REPAYMENT: "Погашение облигации", ACQUISITION: "Поглощение", IPO: "IPO", BROKER_DEPOSIT: "Брокерский счёт", MARKET_TRADE: "Биржевая сделка", BROKER_FEE: "Комиссия брокера", EXCHANGE_FEE: "Комиссия биржи", BANKRUPTCY_DISTRIBUTION: "Распределение при банкротстве", SECURITY_REVALUATION: "Переоценка ценной бумаги",
 };
 
 const rubles = new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB", maximumFractionDigits: 0 });
 const number = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 });
 const money = (cents: number) => rubles.format(cents / 100);
+const currencyMoney = (cents: number, currency: string) => new Intl.NumberFormat("ru-RU", { style: "currency", currency, maximumFractionDigits: 0 }).format(cents / 100);
 const compactMoney = (cents: number) => {
   const value = cents / 100;
   if (Math.abs(value) >= 1_000_000_000) return `${number.format(value / 1_000_000_000)} млрд ₽`;
@@ -59,7 +76,9 @@ function entityLabel(world: WorldState, id: string): string {
     ?? (id.startsWith("housing-sector:") && sectorCity ? `Жилищный рынок · ${sectorCity.name}` : undefined)
     ?? (id.startsWith("transport-sector:") && sectorCity ? `Транспорт · ${sectorCity.name}` : undefined)
     ?? world.banks.find((item) => item.id === id)?.name
-    ?? (id === world.government.id ? "Правительство" : id === world.centralBank.id ? world.centralBank.name : id === "academy-provider" ? "Дополнительное обучение" : id);
+    ?? world.governments.find((item) => item.id === id)?.id.replace("government-", "Правительство · ")
+    ?? world.centralBanks.find((item) => item.id === id)?.name
+    ?? (id === "academy-provider" ? "Дополнительное обучение" : id);
 }
 
 function Section({ title, meta }: { title: string; meta?: string }) {
@@ -82,7 +101,7 @@ function WhyModal({ value, close }: { value: { title: string; text: string } | n
 }
 
 function Kpi({ label, value, note, values, why, open }: { label: string; value: string; note?: string; values?: number[]; why?: string; open: (title: string, text: string) => void }) {
-  return <article className="kpi"><header><span>{label}</span>{why && <WhyButton title={label} text={why} open={open} />}</header><strong>{value}</strong><footer><small>{note ?? ""}</small>{values && <DeltaSparkline values={values} accent="mint" ariaLabel={`Динамика: ${label}`} />}</footer></article>;
+  return <article className="kpi"><header><span>{label}</span>{why && <WhyButton title={label} text={why} open={open} />}</header><strong>{value}</strong><footer><small>{note ?? ""}</small>{values && <MiniTrendChart values={values} format={compactMoney} accent="mint" ariaLabel={`Динамика: ${label}`} />}</footer></article>;
 }
 
 function MyLife({ world, openWhy }: { world: WorldState; openWhy: (title: string, text: string) => void }) {
@@ -157,11 +176,84 @@ function Economy({ world, openWhy }: { world: WorldState; openWhy: (title: strin
 }
 
 function CompanyTable({ world }: { world: WorldState }) {
-  return <article className="panel"><header className="panel-title"><h2>Компании</h2><span>{world.companies.filter((item) => item.active).length} работают</span></header><div className="responsive-table"><table><thead><tr><th>Компания</th><th>Рынок</th><th>Статус</th><th>Штат</th><th>Деньги</th><th>Выручка</th><th>Прибыль</th></tr></thead><tbody>{world.companies.map((company) => { const report = company.financialReports.at(-1); return <tr key={company.id}><td><b>{company.name}</b><small>{company.id}</small></td><td>{world.goods.find((item) => item.id === company.goodId)?.shortName}</td><td><span className={`pill ${company.active && !company.distressMonths ? "ok" : "warn"}`}>{company.active ? company.distressMonths ? "Риск" : "Работает" : "Закрыта"}</span></td><td>{company.employees.length}</td><td>{compactMoney(depositOf(world, company.id))}</td><td>{compactMoney(company.lastGrossRevenueCents)}</td><td>{compactMoney(report?.netIncomeCents ?? 0)}</td></tr>; })}</tbody></table></div></article>;
+  const countryId = world.cities.find((city) => city.id === world.player.currentCityId)?.countryId ?? "ru";
+  const companies = world.companies.filter((company) => company.headquartersCountryId === countryId);
+  return <article className="panel"><header className="panel-title"><h2>Компании</h2><span>{companies.filter((item) => item.active).length} работают</span></header><div className="responsive-table"><table><thead><tr><th>Компания</th><th>Рынок</th><th>Статус</th><th>Штат</th><th>Деньги</th><th>Выручка</th><th>Прибыль</th></tr></thead><tbody>{companies.map((company) => { const report = company.financialReports.at(-1); return <tr key={company.id}><td><b>{company.name}</b><small>{company.id}</small></td><td>{world.goods.find((item) => item.id === company.goodId)?.shortName}</td><td><span className={`pill ${company.active && !company.distressMonths ? "ok" : "warn"}`}>{company.active ? company.distressMonths ? "Риск" : "Работает" : "Закрыта"}</span></td><td>{company.employees.length}</td><td>{compactMoney(depositOf(world, company.id))}</td><td>{compactMoney(company.lastGrossRevenueCents)}</td><td>{compactMoney(report?.netIncomeCents ?? 0)}</td></tr>; })}</tbody></table></div></article>;
+}
+
+function Companies({ world, commit, notify, openWhy }: { world: WorldState; commit: () => void; notify: (text: string) => void; openWhy: (title: string, text: string) => void }) {
+  const playerCountryId = world.cities.find((city) => city.id === world.player.currentCityId)?.countryId ?? "ru";
+  const localCompanies = world.companies.filter((company) => company.headquartersCountryId === playerCountryId);
+  const [selectedId, setSelectedId] = useState(localCompanies[0]?.id ?? world.companies[0].id);
+  const [tab, setTab] = useState<"overview" | "finance" | "ownership" | "debt" | "governance" | "events">("overview");
+  const company = world.companies.find((item) => item.id === selectedId) ?? localCompanies[0] ?? world.companies[0];
+  const country = world.countries.find((item) => item.id === company.headquartersCountryId)!;
+  const city = world.cities.find((item) => item.id === company.headquartersCityId)!;
+  const security = world.equitySecurities.find((item) => item.id === company.equitySecurityId)!;
+  const holdings = world.equityHoldings.filter((holding) => holding.securityId === security.id).sort((a, b) => b.shares - a.shares);
+  const bonds = world.corporateBonds.filter((bond) => bond.issuerCompanyId === company.id);
+  const actions = world.corporateActions.filter((action) => action.companyId === company.id).slice(-12).reverse();
+  const valuation = companyValuation(world, company.id);
+  const playerShare = ownershipBps(world, security.id, world.player.householdId);
+  const controlled = playerShare >= 5_001;
+  const sharePrice = Math.max(1, Math.round(valuation.equityValueCents / Math.max(1, security.sharesOutstanding)));
+  const act = (answer: { ok: boolean; message: string }) => { commit(); notify(answer.message); };
+  return <>
+    <Section title="Компании" meta={`${country.name} · ${localCompanies.length} компаний`} />
+    <div className="company-explorer">
+      <aside className="panel company-list">{localCompanies.map((item) => <button key={item.id} className={item.id === company.id ? "active" : ""} onClick={() => setSelectedId(item.id)}><span><b>{item.name}</b><small>{item.industry} · {world.cities.find((cityItem) => cityItem.id === item.cityId)?.name}</small></span><i className={item.active ? "ok" : "fail"}>{item.corporateStatus === "public" ? "Публичная" : item.active ? "Частная" : "Закрыта"}</i></button>)}</aside>
+      <section className="panel company-detail">
+        <header className="company-identity"><div><span>{country.name} · {city.name}</span><h2>{company.name}</h2><small>{company.industry} · уровень {company.representationTier} · {company.sizeClass === "large" ? "крупная" : company.sizeClass === "medium" ? "средняя" : "малая"}</small></div><div><b>{currencyMoney(depositOf(world, company.id), country.currencyReference)}</b><small>Деньги</small></div></header>
+        <nav className="detail-tabs">{[["overview","Обзор"],["finance","Финансы"],["ownership","Собственность"],["debt","Долг"],["governance","Управление"],["events","События"]].map(([id,label]) => <button className={tab === id ? "active" : ""} key={id} onClick={() => setTab(id as typeof tab)}>{label}</button>)}</nav>
+        {tab === "overview" && <div className="company-section"><dl className="metric-list"><div><dt>Статус</dt><dd>{company.active ? "Работает" : "Закрыта"}</dd></div><div><dt>Работники</dt><dd>{company.employees.length}</dd></div><div><dt>Производство</dt><dd>{number.format(company.lastProductionMilliUnits / 1_000)}</dd></div><div><dt>Загрузка</dt><dd>{percent(company.capacityUtilizationBps)}</dd></div><div><dt>Цена</dt><dd>{currencyMoney(company.priceCents, country.currencyReference)}</dd></div><div><dt>Качество</dt><dd>{number.format(company.qualityBps / 100)}</dd></div></dl></div>}
+        {tab === "finance" && <div className="company-section"><section className="valuation-band"><div><span>Оценка капитала</span><strong>{currencyMoney(valuation.equityValueCents, country.currencyReference)}</strong></div><div><span>Диапазон стоимости бизнеса</span><strong>{currencyMoney(valuation.enterpriseValueLowCents, country.currencyReference)} — {currencyMoney(valuation.enterpriseValueHighCents, country.currencyReference)}</strong></div><div><span>WACC</span><strong>{percent(valuation.waccBps)}</strong></div><WhyButton title="Метод оценки" text={`${valuation.method}. Оценка не создаёт деньги и не меняет реестр.`} open={openWhy} /></section><dl className="metric-list"><div><dt>Выручка</dt><dd>{currencyMoney(company.lastGrossRevenueCents, country.currencyReference)}</dd></div><div><dt>Расходы</dt><dd>{currencyMoney(company.lastOperatingExpenseCents, country.currencyReference)}</dd></div><div><dt>Нераспределённая прибыль</dt><dd>{currencyMoney(company.retainedEarningsCents, country.currencyReference)}</dd></div><div><dt>Капитал</dt><dd>{currencyMoney(company.productiveCapital.bookValueCents, country.currencyReference)}</dd></div></dl></div>}
+        {tab === "ownership" && <div className="company-section"><div className="cap-table"><header><span>Владелец</span><span>Акции</span><span>Доля</span><span>Стоимость приобретения</span></header>{holdings.map((holding) => <div key={holding.id}><span>{entityLabel(world, holding.ownerId)}</span><b>{holding.shares.toLocaleString("ru-RU")}</b><b>{percent(Math.round(holding.shares * 10_000 / security.sharesOutstanding))}</b><b>{currencyMoney(holding.costBasisCents, security.currencyId)}</b></div>)}</div><footer className="register-total"><span>В обращении</span><b>{security.sharesOutstanding.toLocaleString("ru-RU")}</b></footer></div>}
+        {tab === "debt" && <div className="company-section">{bonds.length ? <div className="bond-list">{bonds.map((bond) => <article key={bond.id}><span>{bond.id} · {bond.seniority === "senior" ? "старший" : "субординированный"}</span><strong>{currencyMoney(bond.outstandingFaceValueCents, bond.currencyId)}</strong><small>Купон {percent(bond.couponBps)} · погашение {bond.maturityMonth + 1}м · {bond.status}</small></article>)}</div> : <p className="empty">Облигаций нет.</p>}</div>}
+        {tab === "governance" && <div className="company-section"><dl className="metric-list"><div><dt>Контроль игрока</dt><dd>{percent(playerShare)}</dd></div><div><dt>Совет директоров</dt><dd>{world.corporateBoards.find((board) => board.id === company.boardId)?.directorOwnerIds.map((id) => entityLabel(world, id)).join(", ")}</dd></div><div><dt>Материнская компания</dt><dd>{company.parentCompanyId ? entityLabel(world, company.parentCompanyId) : "Нет"}</dd></div><div><dt>Дочерние компании</dt><dd>{company.subsidiaryIds.length}</dd></div></dl></div>}
+        {tab === "events" && <div className="company-section action-list">{actions.length ? actions.map((action) => <article key={action.id}><span>{action.elapsedMonth + 1}м</span><b>{action.title}</b><strong>{currencyMoney(action.amountCents, country.currencyReference)}</strong></article>) : <p className="empty">Корпоративных событий нет.</p>}</div>}
+        {controlled && <footer className="corporate-actions"><button onClick={() => act(raiseEquity(world, company.id, world.player.householdId, Math.min(500_000_00, Math.floor(depositOf(world, world.player.householdId) / 4)), sharePrice))}>Внести капитал</button><button disabled={company.retainedEarningsCents <= 0} onClick={() => act(declareDividend(world, company.id, Math.min(company.retainedEarningsCents, Math.floor(depositOf(world, company.id) / 10))))}>Дивиденд</button><button onClick={() => act(issueBond(world, company.id, world.player.householdId, Math.min(250_000_00, Math.floor(depositOf(world, world.player.householdId) / 5)), 850, 36))}>Купить выпуск облигаций</button>{company.corporateStatus === "private" && <button className="primary" onClick={() => act(startIpo(world, company.id, world.player.householdId, Math.min(500_000_00, Math.floor(depositOf(world, world.player.householdId) / 4)), sharePrice))}>Провести IPO</button>}</footer>}
+      </section>
+    </div>
+  </>;
+}
+
+function Markets({ world, commit, notify }: { world: WorldState; commit: () => void; notify: (text: string) => void }) {
+  const countryId = world.cities.find((city) => city.id === world.player.currentCityId)?.countryId ?? "ru";
+  const exchange = world.exchanges.find((item) => item.countryId === countryId)!;
+  const broker = world.brokers.find((item) => item.countryId === countryId)!;
+  const account = world.brokerageAccounts.find((item) => item.ownerId === world.player.householdId && item.brokerId === broker.id && item.status === "active");
+  const listings = world.listings.filter((listing) => listing.exchangeId === exchange.id);
+  const [selectedSecurityId, setSelectedSecurityId] = useState(listings[0]?.securityId ?? "");
+  const listing = listings.find((item) => item.securityId === selectedSecurityId) ?? listings[0];
+  const [quantity, setQuantity] = useState(10);
+  const [price, setPrice] = useState(listing?.lastPriceCents ?? 1_000);
+  const orders = listing ? world.marketOrders.filter((order) => order.securityId === listing.securityId && (order.status === "open" || order.status === "partially-filled")) : [];
+  const bars = listing ? world.ohlcvBars.filter((bar) => bar.securityId === listing.securityId).slice(-24) : [];
+  const submit = (side: "buy" | "sell") => {
+    if (!account || !listing) return;
+    const answer = placeOrder(world, account.id, listing.securityId, side, "limit", quantity, price);
+    commit(); notify(answer.message);
+  };
+  return <>
+    <Section title="Рынки" meta={`${exchange.name} · ${exchange.currencyId}`} />
+    {!account && <article className="panel broker-open"><div><span>{broker.name}</span><h2>Брокерский счёт</h2><small>Расчёты идут с реального банковского депозита. Валютный обмен не моделируется.</small></div><button className="primary" onClick={() => { const answer = openBrokerageAccount(world, world.player.householdId, broker.id); commit(); notify(answer.message); }}>Открыть счёт</button></article>}
+    <section className="listing-strip">{listings.map((item) => { const company = world.companies.find((companyItem) => companyItem.id === item.companyId)!; const changeBps = Math.round((item.lastPriceCents - item.previousCloseCents) * 10_000 / Math.max(1, item.previousCloseCents)); return <button className={listing?.id === item.id ? "active" : ""} key={item.id} onClick={() => { setSelectedSecurityId(item.securityId); setPrice(item.lastPriceCents); }}><span>{item.ticker}</span><b>{currencyMoney(item.lastPriceCents, item.currencyId)}</b><small className={changeBps >= 0 ? "positive" : "negative"}>{changeBps >= 0 ? "+" : ""}{percent(changeBps)}</small><i>{company.name}</i></button>; })}</section>
+    {listing ? <div className="market-workspace"><article className="panel market-chart"><header className="panel-title"><h2>{listing.ticker}</h2><span>OHLCV · сделки формируют цену</span></header><LineAreaChart values={bars.map((bar) => bar.closeCents)} labels={bars.map((bar) => `${bar.elapsedMonth + 1}м`)} format={(value) => currencyMoney(value, listing.currencyId)} ariaLabel={`Цена ${listing.ticker}`} /></article><article className="panel order-ticket"><header className="panel-title"><h2>Заявка</h2><span>{broker.name}</span></header><label>Количество<input type="number" min="1" value={quantity} onChange={(event) => setQuantity(Math.max(1, Number(event.target.value)))} /></label><label>Лимитная цена<input type="number" min="1" value={price} onChange={(event) => setPrice(Math.max(1, Number(event.target.value)))} /></label><div><button disabled={!account} onClick={() => submit("sell")}>Продать</button><button className="primary" disabled={!account} onClick={() => submit("buy")}>Купить</button></div><small>Сумма: {currencyMoney(quantity * price, listing.currencyId)}</small></article><article className="panel order-book"><header className="panel-title"><h2>Книга заявок</h2><span>Цена · время</span></header><div className="book-head"><span>Покупка</span><span>Цена</span><span>Продажа</span></div>{[...orders].sort((a,b) => (b.limitPriceCents ?? 0) - (a.limitPriceCents ?? 0)).slice(0, 16).map((order) => <div key={order.id}><b>{order.side === "buy" ? order.remainingQuantity : "—"}</b><span>{currencyMoney(order.limitPriceCents ?? listing.lastPriceCents, listing.currencyId)}</span><b>{order.side === "sell" ? order.remainingQuantity : "—"}</b></div>)}{!orders.length && <p className="empty">Нет открытых заявок.</p>}</article></div> : <p className="empty">На локальной бирже пока нет инструментов.</p>}
+  </>;
+}
+
+function Portfolio({ world }: { world: WorldState }) {
+  const summary = portfolioSummary(world, world.player.householdId);
+  const countryId = world.cities.find((city) => city.id === world.player.currentCityId)?.countryId ?? "ru";
+  const currency = world.countries.find((country) => country.id === countryId)?.currencyReference ?? "RUB";
+  return <><Section title="Портфель" meta={`${summary.positions.length} позиций`} /><section className="kpi-grid four"><Kpi label="Деньги" value={currencyMoney(summary.cashCents, currency)} open={() => undefined} /><Kpi label="Рыночная стоимость" value={currencyMoney(summary.marketValueCents, currency)} open={() => undefined} /><Kpi label="Нереализованный результат" value={currencyMoney(summary.unrealizedPnlCents, currency)} open={() => undefined} /><Kpi label="Дивиденды и купоны" value={currencyMoney(summary.realizedIncomeCents, currency)} open={() => undefined} /></section><article className="panel"><header className="panel-title"><h2>Позиции</h2><span>Средняя стоимость и результат</span></header><div className="responsive-table"><table><thead><tr><th>Инструмент</th><th>Количество</th><th>Цена</th><th>Стоимость</th><th>Затраты</th><th>Результат</th></tr></thead><tbody>{summary.positions.map((position) => <tr key={position.securityId}><td><b>{position.ticker}</b><small>{world.companies.find((company) => company.equitySecurityId === position.securityId)?.name}</small></td><td>{position.shares.toLocaleString("ru-RU")}</td><td>{currencyMoney(position.priceCents, currency)}</td><td>{currencyMoney(position.valueCents, currency)}</td><td>{currencyMoney(position.costBasisCents, currency)}</td><td className={position.pnlCents >= 0 ? "positive" : "negative"}>{currencyMoney(position.pnlCents, currency)}</td></tr>)}</tbody></table>{!summary.positions.length && <p className="empty">Позиции появятся после покупки акций.</p>}</div></article></>;
 }
 
 function Banks({ world, openWhy }: { world: WorldState; openWhy: (title: string, text: string) => void }) {
-  return <><Section title="Банки" meta={`${world.loans.filter((item) => item.status === "active").length} активных кредитов`} /><section className="bank-grid">{world.banks.map((bank) => { const book = entityBook(world, bank.id); const reserves = balanceOf(world, accountIds.bankReserve(bank.id)); const deposits = Object.values(world.ledger.accounts).filter((account) => account.ownerId === bank.id && account.category === "liability" && account.instrument === "deposit").reduce((sum, account) => sum + balanceOf(world, account.id), 0); const loans = world.loans.filter((loan) => loan.lenderBankId === bank.id && loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0); return <article className="panel bank-card" key={bank.id}><header><div><span>Коммерческий банк</span><h2>{bank.name}</h2></div><WhyButton title={bank.name} text="Капитал поглощает убытки, а ликвидность нужна для межбанковских расчётов. Это разные ограничения кредитования." open={openWhy} /></header><dl><div><dt>Капитал</dt><dd>{compactMoney(book.capital)}</dd></div><div><dt>Норматив капитала</dt><dd>{percent(bankCapitalRatioBps(world, bank.id))}</dd></div><div><dt>Ликвидность</dt><dd>{compactMoney(reserves)}</dd></div><div><dt>Коэффициент ликвидности</dt><dd>{percent(bankLiquidityRatioBps(world, bank.id))}</dd></div><div><dt>Депозиты</dt><dd>{compactMoney(deposits)}</dd></div><div><dt>Кредитный портфель</dt><dd>{compactMoney(loans)}</dd></div></dl></article>; })}</section><article className="panel policy"><header className="panel-title"><h2>Центральный банк</h2><span>{world.centralBank.name}</span></header><div><Kpi label="Ключевая ставка" value={percent(world.centralBank.policyRateBps)} note="Пересмотр раз в квартал" open={openWhy} /><Kpi label="Цель инфляции" value={percent(world.centralBank.inflationTargetBps)} note="Годовой темп" open={openWhy} /><Kpi label="Кредиты ликвидности" value={world.bankFunding.filter((item) => item.kind === "central-bank" && item.status === "active").length.toString()} note="Активные договоры" open={openWhy} /></div></article></>;
+  const countryId = world.cities.find((city) => city.id === world.player.currentCityId)?.countryId ?? "ru";
+  const banks = world.banks.filter((bank) => bank.countryId === countryId);
+  const centralBank = world.centralBanks.find((bank) => bank.countryId === countryId) ?? world.centralBank;
+  return <><Section title="Банки" meta={`${world.loans.filter((item) => item.status === "active" && banks.some((bank) => bank.id === item.lenderBankId)).length} активных кредитов`} /><section className="bank-grid">{banks.map((bank) => { const book = entityBook(world, bank.id); const reserves = balanceOf(world, accountIds.bankReserve(bank.id)); const deposits = Object.values(world.ledger.accounts).filter((account) => account.ownerId === bank.id && account.category === "liability" && account.instrument === "deposit").reduce((sum, account) => sum + balanceOf(world, account.id), 0); const loans = world.loans.filter((loan) => loan.lenderBankId === bank.id && loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0); return <article className="panel bank-card" key={bank.id}><header><div><span>Коммерческий банк</span><h2>{bank.name}</h2></div><WhyButton title={bank.name} text="Капитал поглощает убытки, а ликвидность нужна для межбанковских расчётов. Это разные ограничения кредитования." open={openWhy} /></header><dl><div><dt>Капитал</dt><dd>{compactMoney(book.capital)}</dd></div><div><dt>Норматив капитала</dt><dd>{percent(bankCapitalRatioBps(world, bank.id))}</dd></div><div><dt>Ликвидность</dt><dd>{compactMoney(reserves)}</dd></div><div><dt>Коэффициент ликвидности</dt><dd>{percent(bankLiquidityRatioBps(world, bank.id))}</dd></div><div><dt>Депозиты</dt><dd>{compactMoney(deposits)}</dd></div><div><dt>Кредитный портфель</dt><dd>{compactMoney(loans)}</dd></div></dl></article>; })}</section><article className="panel policy"><header className="panel-title"><h2>Центральный банк</h2><span>{centralBank.name}</span></header><div><Kpi label="Ключевая ставка" value={percent(centralBank.policyRateBps)} note="Пересмотр раз в квартал" open={openWhy} /><Kpi label="Цель инфляции" value={percent(centralBank.inflationTargetBps)} note="Годовой темп" open={openWhy} /><Kpi label="Кредиты ликвидности" value={world.bankFunding.filter((item) => item.lenderId === centralBank.id && item.status === "active").length.toString()} note="Активные договоры" open={openWhy} /></div></article></>;
 }
 
 function transactionAmount(transaction: LedgerTransaction): number {
@@ -198,6 +290,23 @@ function Control({ world }: { world: WorldState }) {
   </>;
 }
 
+const UPDATE_LABELS: Record<UpdateState, string> = {
+  unsupported: "Не поддерживается",
+  current: "Актуальная версия",
+  checking: "Проверка…",
+  available: "Доступно обновление",
+  applying: "Обновление…",
+  offline: "Нет сети",
+  error: "Ошибка проверки",
+};
+
+function Settings({ repository, updateState, autosaveState, checkUpdate, updateNow, forceUpdate }: { repository: SaveRepository; updateState: UpdateState; autosaveState: string; checkUpdate: () => void; updateNow: () => void; forceUpdate: () => void }) {
+  const [persistence, setPersistence] = useState<PersistenceDiagnostics | null>(null);
+  const [worker, setWorker] = useState<{ controlled: boolean; state: string; scriptUrl: string | null; cacheNames: string[] } | null>(null);
+  useEffect(() => { void Promise.all([repository.diagnostics(), serviceWorkerDiagnostics()]).then(([storage, serviceWorker]) => { setPersistence(storage); setWorker(serviceWorker); }); }, [repository, updateState, autosaveState]);
+  return <><Section title="Настройки" meta={`Версия ${APP_BUILD.version}`} /><section className="settings-grid"><article className="panel settings-card"><header className="panel-title"><h2>Приложение</h2><span>{UPDATE_LABELS[updateState]}</span></header><dl><div><dt>Версия</dt><dd>{APP_BUILD.version}</dd></div><div><dt>Сборка</dt><dd>{APP_BUILD.buildId}</dd></div><div><dt>Коммит</dt><dd>{APP_BUILD.commit}</dd></div><div><dt>Дата сборки</dt><dd>{new Date(APP_BUILD.buildDate).toLocaleString("ru-RU")}</dd></div></dl><footer><button onClick={checkUpdate}>Проверить</button><button className="primary" onClick={updateNow}>Обновить сейчас</button><button className="danger" onClick={forceUpdate}>Принудительно обновить</button></footer></article><article className="panel settings-card"><header className="panel-title"><h2>Сохранение</h2><span>{autosaveState}</span></header><dl><div><dt>Активный мир</dt><dd>{persistence?.activeWorldId ?? "—"}</dd></div><div><dt>Последняя запись</dt><dd>{persistence?.lastAutosaveIso ? new Date(persistence.lastAutosaveIso).toLocaleString("ru-RU") : "—"}</dd></div><div><dt>Схема хранилища</dt><dd>{persistence?.databaseVersion ?? "—"}</dd></div><div><dt>Использовано</dt><dd>{persistence?.usageBytes ? `${number.format(persistence.usageBytes / 1_000_000)} МБ` : "—"}</dd></div></dl></article><article className="panel settings-card"><header className="panel-title"><h2>Офлайн</h2><span>{worker?.controlled ? "Активен" : "Подготовка"}</span></header><dl><div><dt>Service Worker</dt><dd>{worker?.state ?? "—"}</dd></div><div><dt>Кэши приложения</dt><dd>{worker?.cacheNames.filter((name) => name.startsWith("economic-world-app-")).length ?? 0}</dd></div><div><dt>Сценарий</dt><dd>{worker?.scriptUrl?.split("/").at(-1) ?? "—"}</dd></div><div><dt>Данные мира</dt><dd>IndexedDB не очищается при обновлении</dd></div></dl></article></section></>;
+}
+
 function Onboarding({ world, complete }: { world: WorldState; complete: (name: string, profile: string) => void }) {
   const [name, setName] = useState(playerPerson(world).displayName === "Игрок" ? "" : playerPerson(world).displayName);
   const [profile, setProfile] = useState("student");
@@ -211,6 +320,7 @@ export function App() {
   const [world, setWorld] = useState<WorldState>(() => createWorld());
   const worldRef = useRef(world);
   const [view, setView] = useState<View>("life");
+  const [moreOpen, setMoreOpen] = useState(false);
   const [showBoot, setShowBoot] = useState(initialBoot);
   const [showOnboarding, setShowOnboarding] = useState(initialOnboarding);
   const [why, setWhy] = useState<{ title: string; text: string } | null>(null);
@@ -220,13 +330,48 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [saves, setSaves] = useState<SaveManifest[]>([]);
+  const [restoring, setRestoring] = useState(true);
+  const [autosaveState, setAutosaveState] = useState("Ожидание");
+  const [updateState, setUpdateState] = useState<UpdateState>("current");
+  const autosaveTimer = useRef<number | null>(null);
+  const autosaveChain = useRef<Promise<unknown>>(Promise.resolve());
+  const moreDragStart = useRef<number | null>(null);
   const repository = useMemo(() => new SaveRepository(), []);
   const commit = useCallback(() => { setWorld({ ...worldRef.current }); }, []);
   const completeBoot = useCallback(() => { try { sessionStorage.setItem("economic-world-booted-v2", "1"); } catch { /* недоступно */ } setShowBoot(false); }, []);
   const openWhy = useCallback((title: string, text: string) => setWhy({ title, text }), []);
 
+  const saveActiveNow = useCallback(async () => {
+    const snapshot = structuredClone(worldRef.current);
+    const cityId = snapshot.player.currentCityId;
+    const countryId = snapshot.cities.find((city) => city.id === cityId)?.countryId;
+    setAutosaveState("Сохранение…");
+    autosaveChain.current = autosaveChain.current.then(() => repository.saveActive(snapshot, { route: view, cityId, countryId })).then(() => setAutosaveState("Сохранено")).catch(() => setAutosaveState("Ошибка сохранения"));
+    await autosaveChain.current;
+  }, [repository, view]);
+
   useEffect(() => { repository.list().then(setSaves).catch(() => setSaves([])); }, [repository]);
-  useEffect(() => { if (!playing || busy) return; const timer = window.setInterval(() => { runMonths(worldRef.current, speed); commit(); }, 1_000); return () => window.clearInterval(timer); }, [playing, busy, speed, commit]);
+  useEffect(() => {
+    let active = true;
+    void repository.loadActive().then((restored) => {
+      if (!active || !restored) return;
+      worldRef.current = restored.world;
+      setWorld(restored.world);
+      if (restored.uiState && NAV.some((item) => item.id === restored.uiState!.route)) setView(restored.uiState.route as View);
+      setNotice(restored.recovered ? "Восстановлена резервная контрольная точка" : "Активный мир восстановлен");
+    }).catch(() => setNotice("Создан новый мир")).finally(() => { if (active) setRestoring(false); });
+    return () => { active = false; };
+  }, [repository]);
+  useEffect(() => {
+    void registerAppServiceWorker(() => setUpdateState("available"));
+  }, []);
+  useEffect(() => {
+    if (restoring) return;
+    if (autosaveTimer.current !== null) window.clearTimeout(autosaveTimer.current);
+    autosaveTimer.current = window.setTimeout(() => { void saveActiveNow(); }, 450);
+    return () => { if (autosaveTimer.current !== null) window.clearTimeout(autosaveTimer.current); };
+  }, [world, view, restoring, saveActiveNow]);
+  useEffect(() => { if (!playing || busy || restoring) return; const timer = window.setInterval(() => { runMonths(worldRef.current, speed); commit(); }, 1_000); return () => window.clearInterval(timer); }, [playing, busy, restoring, speed, commit]);
 
   const advance = async (months: number) => {
     if (busy) return;
@@ -238,11 +383,14 @@ export function App() {
   const load = async () => { const target = saves[0]; if (!target) return; setBusy(true); try { worldRef.current = await repository.load(target.id); commit(); setNotice("Сохранение загружено"); } finally { setBusy(false); } };
   const reset = () => { if (!window.confirm("Создать новый мир?")) return; worldRef.current = createWorld(); commit(); setPlaying(false); setShowOnboarding(true); setNotice("Новый мир создан"); };
   const profile = (name: string, profileId: string) => { setPlayerProfile(worldRef.current, name, profileId); commit(); try { localStorage.setItem("economic-world-onboarded-v2", "1"); } catch { /* недоступно */ } setShowOnboarding(false); };
+  const checkUpdate = async () => { setUpdateState("checking"); setUpdateState(await checkForUpdate()); };
+  const updateNow = async (force = false) => { setUpdateState("applying"); try { await applyAppUpdate(saveActiveNow, force); } catch { setUpdateState("error"); } };
   const passing = useMemo(() => checkInvariants(world).every((item) => item.ok), [world]);
 
   return <>
     {showBoot && <BootSequence onComplete={completeBoot} />}
     {!showBoot && showOnboarding && <Onboarding world={world} complete={profile} />}
+    {restoring && <div className="restore-screen"><span>Восстановление мира…</span></div>}
     <WhyModal value={why} close={() => setWhy(null)} />
     <div className="app-shell">
       <aside className="sidebar">
@@ -253,7 +401,7 @@ export function App() {
       <div className="workspace">
         <header className="topbar">
           <div className="date"><span>Дата мира</span><strong>{formatSimulationDate(world.clock)}</strong></div>
-          <div className="simulation-controls"><button onClick={() => { stepMonth(worldRef.current); commit(); setNotice("Выполнен 1 месяц"); }} disabled={busy}>+1 месяц</button><button className="primary" onClick={() => setPlaying((value) => !value)} disabled={busy}>{playing ? "Пауза" : "Запуск"}</button><select value={speed} onChange={(event) => setSpeed(Number(event.target.value))} aria-label="Скорость"><option value="1">1 мес./с</option><option value="3">3 мес./с</option><option value="12">12 мес./с</option></select></div>
+          <div className="simulation-controls"><button onClick={() => { stepMonth(worldRef.current); commit(); setNotice("Выполнен 1 месяц"); }} disabled={busy || restoring}>+1 месяц</button><button className="primary" onClick={() => setPlaying((value) => !value)} disabled={busy || restoring}>{playing ? "Пауза" : "Запуск"}</button><select value={speed} onChange={(event) => setSpeed(Number(event.target.value))} aria-label="Скорость" disabled={restoring}><option value="1">1 мес./с</option><option value="3">3 мес./с</option><option value="12">12 мес./с</option></select></div>
           <div className="world-actions"><button onClick={save} disabled={busy}>Сохранить</button><button onClick={load} disabled={busy || !saves.length}>Загрузить</button><button onClick={reset} disabled={busy}>Новый мир</button></div>
         </header>
         <div className="quick-run"><span>{busy ? `Расчёт · ${progress}%` : notice}</span><div><button onClick={() => advance(12)} disabled={busy}>+1 год</button><button onClick={() => advance(240)} disabled={busy}>+20 лет</button></div>{busy && <i style={{ width: `${progress}%` }} />}</div>
@@ -264,12 +412,17 @@ export function App() {
           {view === "education" && <Education world={world} commit={commit} notify={setNotice} openWhy={openWhy} />}
           {view === "finances" && <MyFinances world={world} commit={commit} openWhy={openWhy} />}
           {view === "economy" && <Economy world={world} openWhy={openWhy} />}
+          {view === "companies" && <Companies world={world} commit={commit} notify={setNotice} openWhy={openWhy} />}
+          {view === "markets" && <Markets world={world} commit={commit} notify={setNotice} />}
+          {view === "portfolio" && <Portfolio world={world} />}
           {view === "banks" && <Banks world={world} openWhy={openWhy} />}
           {view === "ledger" && <Ledger world={world} openWhy={openWhy} />}
           {view === "control" && <Control world={world} />}
+          {view === "settings" && <Settings repository={repository} updateState={updateState} autosaveState={autosaveState} checkUpdate={() => { void checkUpdate(); }} updateNow={() => { void updateNow(false); }} forceUpdate={() => { void updateNow(true); }} />}
         </main>
       </div>
-      <nav className="mobile-nav">{NAV.map((item) => <button className={view === item.id ? "active" : ""} key={item.id} onClick={() => setView(item.id)}>{item.short}</button>)}</nav>
+      <nav className="mobile-nav" aria-label="Основные разделы">{MOBILE_PRIMARY.map((item) => <button className={view === item.id ? "active" : ""} key={item.id} onClick={() => { setView(item.id); setMoreOpen(false); }}>{item.label}</button>)}<button className={MOBILE_MORE.some((item) => item.id === view) ? "active" : ""} onClick={() => setMoreOpen(true)}>Ещё</button></nav>
+      {moreOpen && <div className="more-layer" role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget) setMoreOpen(false); }}><section className="more-sheet" role="dialog" aria-modal="true" aria-label="Все разделы" onPointerDown={(event) => { moreDragStart.current = event.clientY; }} onPointerUp={(event) => { if (moreDragStart.current !== null && event.clientY - moreDragStart.current > 70) setMoreOpen(false); moreDragStart.current = null; }}><header><h2>Разделы</h2><button aria-label="Закрыть" onClick={() => setMoreOpen(false)}>×</button></header><div>{MOBILE_MORE.map((item) => <button className={view === item.id ? "active" : ""} key={item.id} onClick={() => { setView(item.id); setMoreOpen(false); }}><span>{item.label}</span><small>Открыть</small></button>)}</div></section></div>}
     </div>
   </>;
 }

@@ -34,6 +34,7 @@ export function LineAreaChart({
   const gradientId = useId().replaceAll(":", "");
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
   const points = useMemo(() => coordinates(values), [values]);
+  if (!values.length) return <div className={`line-area-chart chart-${accent}`} role="img" aria-label={`${ariaLabel}: нет данных`}><p className="chart-empty">Нет данных</p></div>;
   const line = points.map((point) => `${point.x},${point.y}`).join(" ");
   const area = `${PAD_X},${HEIGHT - PAD_BOTTOM} ${line} ${WIDTH - PAD_X},${HEIGHT - PAD_BOTTOM}`;
   const active = activeIndex === null ? points.at(-1) : points[activeIndex];
@@ -79,21 +80,51 @@ export function LineAreaChart({
   );
 }
 
-export function DeltaSparkline({
+export function MiniTrendChart({
   values,
+  format = (value) => value.toLocaleString("ru-RU"),
   accent = "mint",
   ariaLabel,
 }: {
   values: number[];
+  format?: (value: number) => string;
   accent?: "mint" | "cyan" | "amber" | "violet";
   ariaLabel: string;
 }) {
-  const points = coordinates(values).map((point) => `${point.x},${point.y}`).join(" ");
-  return (
-    <svg className={`delta-spark chart-${accent}`} viewBox={`0 0 ${WIDTH} ${HEIGHT}`} role="img" aria-label={ariaLabel}>
-      <polyline points={points} />
+  const gradientId = useId().replaceAll(":", "");
+  const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  if (!values.length) return <div className="mini-trend-empty" role="img" aria-label={`${ariaLabel}: нет данных`}>Нет данных</div>;
+  const source = values.length === 1 ? [values[0], values[0]] : values;
+  const minValue = Math.min(...source);
+  const maxValue = Math.max(...source);
+  const padding = Math.max(1, (maxValue - minValue) * 0.12);
+  const scaleMin = minValue === maxValue ? minValue - Math.max(1, Math.abs(minValue) * 0.02) : minValue - padding;
+  const scaleMax = minValue === maxValue ? maxValue + Math.max(1, Math.abs(maxValue) * 0.02) : maxValue + padding;
+  const points = source.map((value, index) => ({
+    value,
+    x: 4 + (index / Math.max(1, source.length - 1)) * 112,
+    y: 4 + (1 - (value - scaleMin) / Math.max(1, scaleMax - scaleMin)) * 34,
+  }));
+  const line = points.map((point) => `${point.x},${point.y}`).join(" ");
+  const area = `4,40 ${line} 116,40`;
+  const zeroY = scaleMin < 0 && scaleMax > 0 ? 4 + (1 - (0 - scaleMin) / (scaleMax - scaleMin)) * 34 : null;
+  const last = points.at(-1)!;
+  const active = activeIndex === null ? null : points[activeIndex];
+  return <div className={`mini-trend chart-${accent}`}>
+    <svg viewBox="0 0 120 44" role="img" aria-label={ariaLabel} onPointerDown={(event) => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const index = Math.round(((event.clientX - rect.left) / Math.max(1, rect.width)) * (points.length - 1));
+      setActiveIndex(Math.max(0, Math.min(points.length - 1, index)));
+    }} onPointerLeave={() => setActiveIndex(null)}>
+      <defs><linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="currentColor" stopOpacity=".22" /><stop offset="100%" stopColor="currentColor" stopOpacity="0" /></linearGradient></defs>
+      {zeroY !== null && <line className="mini-zero" x1="4" x2="116" y1={zeroY} y2={zeroY} />}
+      <polygon className="mini-area" points={area} fill={`url(#${gradientId})`} />
+      <polyline className="mini-line" points={line} />
+      <circle className="mini-last" cx={last.x} cy={last.y} r="2.3" />
+      {active && <circle className="mini-active" cx={active.x} cy={active.y} r="3.4" />}
     </svg>
-  );
+    {active && <span className="mini-tooltip">{format(active.value)}</span>}
+  </div>;
 }
 
 export function MarketBars({ production, sales }: { production: number; sales: number }) {

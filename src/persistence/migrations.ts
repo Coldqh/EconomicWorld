@@ -42,14 +42,22 @@ function migrateMetric(metric: Partial<MetricPoint>, world: WorldState): MetricP
 
 export function migrateWorldState(raw: unknown): WorldState {
   const legacy = structuredClone(raw) as LegacyWorld;
-  if (legacy.schemaVersion === 3 && legacy.saveVersion === 3) return legacy as WorldState;
+  if ((legacy.schemaVersion ?? 1) > 4 || (legacy.saveVersion ?? 1) > 4) {
+    throw new Error("Сохранение создано более новой версией приложения");
+  }
+  if (legacy.schemaVersion === 4 && legacy.saveVersion === 4) return legacy as WorldState;
   const template = createWorld();
   const world = {
     ...template,
     ...legacy,
-    schemaVersion: 3 as const,
-    saveVersion: 3 as const,
+    schemaVersion: 4 as const,
+    saveVersion: 4 as const,
     goods: template.goods.map((good) => ({ ...good, ...(legacy.goods?.find((item) => item.id === good.id) ?? {}), essential: good.essential })),
+    countries: template.countries.map((base) => ({ ...base, ...(legacy.countries?.find((item) => item.id === base.id) ?? {}) })),
+    cities: template.cities.map((base) => ({ ...base, ...(legacy.cities?.find((item) => item.id === base.id) ?? {}) })),
+    populationCohorts: template.populationCohorts.map((base) => ({ ...base, ...(legacy.populationCohorts?.find((item) => item.id === base.id) ?? {}) })),
+    firmCohorts: template.firmCohorts.map((base) => ({ ...base, ...(legacy.firmCohorts?.find((item) => item.id === base.id) ?? {}) })),
+    housingCohorts: template.housingCohorts.map((base) => ({ ...base, ...(legacy.housingCohorts?.find((item) => item.id === base.id) ?? {}) })),
     people: template.people.map((base) => ({ ...base, ...(legacy.people?.find((item) => item.id === base.id) ?? {}) })),
     households: template.households.map((base) => ({ ...base, ...(legacy.households?.find((item) => item.id === base.id) ?? {}), personIds: base.personIds, savingsPreferenceBps: (legacy.households?.find((item) => item.id === base.id) as Partial<typeof base> | undefined)?.savingsPreferenceBps ?? base.savingsPreferenceBps, preferenceWeightsBps: base.preferenceWeightsBps, preferredSellerByGoodId: {} })),
     companies: template.companies.map((base) => {
@@ -67,6 +75,42 @@ export function migrateWorldState(raw: unknown): WorldState {
     player: { ...template.player, ...(legacy.player ?? {}) },
     nextFundingId: legacy.nextFundingId ?? 1,
   } as WorldState;
+  const localBankId = (countryId: string, offset = 0): string => {
+    const banks = world.banks.filter((bank) => bank.countryId === countryId);
+    return banks[offset % Math.max(1, banks.length)]?.id ?? world.banks[0].id;
+  };
+  for (const [index, household] of world.households.entries()) {
+    const countryId = world.cities.find((city) => city.id === household.cityId)?.countryId ?? "ru";
+    if (!world.banks.some((bank) => bank.id === household.bankId)) household.bankId = localBankId(countryId, index);
+  }
+  for (const [index, company] of world.companies.entries()) {
+    const city = world.cities.find((item) => item.id === company.cityId) ?? world.cities[0];
+    company.headquartersCityId = city.id;
+    company.headquartersCountryId = city.countryId;
+    if (!world.banks.some((bank) => bank.id === company.bankId)) company.bankId = localBankId(city.countryId, index);
+  }
+  for (const [index, cohort] of world.populationCohorts.entries()) {
+    cohort.countryId = world.cities.find((city) => city.id === cohort.cityId)?.countryId ?? cohort.countryId ?? "ru";
+    if (!world.banks.some((bank) => bank.id === cohort.bankId)) cohort.bankId = localBankId(cohort.countryId, index);
+  }
+  for (const [index, cohort] of world.firmCohorts.entries()) {
+    cohort.countryId = world.cities.find((city) => city.id === cohort.cityId)?.countryId ?? cohort.countryId ?? "ru";
+    if (!world.banks.some((bank) => bank.id === cohort.bankId)) cohort.bankId = localBankId(cohort.countryId, index);
+  }
+  for (const [index, university] of world.universities.entries()) {
+    const countryId = world.cities.find((city) => city.id === university.cityId)?.countryId ?? "ru";
+    if (!world.banks.some((bank) => bank.id === university.bankId)) university.bankId = localBankId(countryId, index);
+  }
+  for (const country of world.countries) {
+    const base = template.countries.find((item) => item.id === country.id);
+    country.companyIds = world.companies.filter((company) => company.headquartersCountryId === country.id).map((company) => company.id);
+    country.bankIds = world.banks.filter((bank) => bank.countryId === country.id).map((bank) => bank.id);
+    country.universityIds = world.universities.filter((university) => world.cities.find((city) => city.id === university.cityId)?.countryId === country.id).map((university) => university.id);
+    country.governmentId = base?.governmentId ?? `government-${country.id}`;
+    country.centralBankId = base?.centralBankId ?? `central-bank-${country.id}`;
+    country.exchangeIds = base?.exchangeIds ?? [`exchange-${country.id}`];
+    country.industries = base?.industries ?? [];
+  }
   world.metricsHistory = (legacy.metricsHistory ?? []).map((metric) => migrateMetric(metric, world));
   for (const company of world.companies) {
     ensureEntityAccounts(world.ledger, company.id);
