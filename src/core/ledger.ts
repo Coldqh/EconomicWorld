@@ -19,6 +19,10 @@ export const accountIds = {
   finishedInventory: (ownerId: string) => `${ownerId}:asset:inventory:finished`,
   inputInventory: (ownerId: string, goodId: string) => `${ownerId}:asset:inventory:input:${goodId}`,
   productiveCapital: (ownerId: string) => `${ownerId}:asset:productive-capital`,
+  property: (ownerId: string, propertyId: string) => `${ownerId}:asset:property:${propertyId}`,
+  durable: (ownerId: string, assetId: string) => `${ownerId}:asset:durable:${assetId}`,
+  cohortCapital: (ownerId: string) => `${ownerId}:asset:cohort-capital`,
+  materializationEquity: (ownerId: string) => `${ownerId}:equity:materialization`,
   investment: (ownerId: string, companyId = "portfolio") =>
     `${ownerId}:asset:investment:${companyId}`,
   loanLiability: (ownerId: string, bankId: string) =>
@@ -63,6 +67,9 @@ function instrumentFor(
   if (id.includes(":loan")) return "loan";
   if (id.includes(":inventory")) return "inventory";
   if (id.includes(":productive-capital")) return "productive-capital";
+  if (id.includes(":property:")) return "property";
+  if (id.includes(":durable:")) return "durable";
+  if (id.includes(":cohort-capital")) return "cohort-capital";
   if (id.includes(":interbank")) return "interbank";
   if (id.includes(":central-bank-facility")) return "central-bank-facility";
   if (id.includes(":investment")) return "investment";
@@ -163,6 +170,17 @@ export function findBankIdForEntity(world: WorldState, entityId: string): string
   if (household) return household.bankId;
   const company = world.companies.find((item) => item.id === entityId);
   if (company) return company.bankId;
+  const populationCohort = world.populationCohorts.find((item) => item.id === entityId);
+  if (populationCohort) return populationCohort.bankId;
+  const firmCohort = world.firmCohorts.find((item) => item.id === entityId);
+  if (firmCohort) return firmCohort.bankId;
+  const university = world.universities.find((item) => item.id === entityId);
+  if (university) return university.bankId;
+  const sectorCityId = entityId.includes(":") ? entityId.split(":").at(-1) : undefined;
+  if (sectorCityId && world.cities.some((city) => city.id === sectorCityId)) {
+    const cityIndex = world.cities.findIndex((city) => city.id === sectorCityId);
+    return world.banks[Math.max(0, cityIndex) % world.banks.length].id;
+  }
   if (entityId === world.government.id || entityId === "goods-market" || entityId === "academy-provider") {
     return world.banks[0].id;
   }
@@ -385,6 +403,15 @@ export function transferDeposit(
     | "GOODS_CLEARING"
     | "INPUT_PURCHASE"
     | "EDUCATION"
+    | "UNIVERSITY_TUITION"
+    | "COHORT_INCOME"
+    | "COHORT_CONSUMPTION"
+    | "TRAVEL"
+    | "RENT"
+    | "PROPERTY_PURCHASE"
+    | "DURABLE_PURCHASE"
+    | "USED_ASSET"
+    | "LOGISTICS"
   >,
   memo: string,
   causeIds: string[] = [],
@@ -392,6 +419,76 @@ export function transferDeposit(
   ensureEntityAccounts(world.ledger, payerId);
   ensureEntityAccounts(world.ledger, recipientId);
   return settleDepositPayment(world, payerId, recipientId, amountCents, kind, memo, accountIds.operatingExpense(payerId), accountIds.operatingIncome(recipientId), causeIds);
+}
+
+export function reallocateDepositOwnership(
+  world: WorldState,
+  fromId: string,
+  toId: string,
+  amountCents: number,
+  kind: "MATERIALIZATION" | "DEMATERIALIZATION",
+  memo: string,
+): string | null {
+  amountCents = Math.floor(amountCents);
+  if (amountCents <= 0 || depositOf(world, fromId) < amountCents) return null;
+  const fromBankId = findBankIdForEntity(world, fromId);
+  const toBankId = findBankIdForEntity(world, toId);
+  ensureBankingAccounts(world, fromId, fromBankId);
+  ensureBankingAccounts(world, toId, toBankId);
+  ensureAccount(world.ledger, accountIds.materializationEquity(fromId), fromId, "Перенос из агрегата", "equity");
+  ensureAccount(world.ledger, accountIds.materializationEquity(toId), toId, "Перенос из агрегата", "equity");
+  if (fromBankId !== toBankId) ensureSettlementLiquidity(world, fromBankId, amountCents);
+  const entries: LedgerEntry[] = [
+    { accountId: accountIds.materializationEquity(fromId), side: "debit", amountCents },
+    { accountId: accountIds.deposit(fromId), side: "credit", amountCents },
+    { accountId: accountIds.deposit(toId), side: "debit", amountCents },
+    { accountId: accountIds.materializationEquity(toId), side: "credit", amountCents },
+    { accountId: accountIds.bankDepositLiability(fromBankId, fromId), side: "debit", amountCents },
+    { accountId: accountIds.bankDepositLiability(toBankId, toId), side: "credit", amountCents },
+  ];
+  if (fromBankId !== toBankId) entries.push(
+    { accountId: accountIds.bankReserve(fromBankId), side: "credit", amountCents },
+    { accountId: accountIds.bankReserve(toBankId), side: "debit", amountCents },
+    { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, fromBankId), side: "debit", amountCents },
+    { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, toBankId), side: "credit", amountCents },
+  );
+  return postTransaction(world, kind, memo, entries);
+}
+
+export function transferOwnedAsset(
+  world: WorldState,
+  buyerId: string,
+  sellerId: string,
+  amountCents: number,
+  buyerAssetAccountId: string,
+  sellerAssetAccountId: string,
+  assetName: string,
+): string | null {
+  amountCents = Math.floor(amountCents);
+  if (amountCents <= 0 || depositOf(world, buyerId) < amountCents) return null;
+  const buyerBankId = findBankIdForEntity(world, buyerId);
+  const sellerBankId = findBankIdForEntity(world, sellerId);
+  ensureBankingAccounts(world, buyerId, buyerBankId);
+  ensureBankingAccounts(world, sellerId, sellerBankId);
+  ensureAccount(world.ledger, buyerAssetAccountId, buyerId, assetName, "asset");
+  ensureAccount(world.ledger, sellerAssetAccountId, sellerId, assetName, "asset");
+  if (balanceOf(world, sellerAssetAccountId) < amountCents) return null;
+  if (buyerBankId !== sellerBankId) ensureSettlementLiquidity(world, buyerBankId, amountCents);
+  const entries: LedgerEntry[] = [
+    { accountId: buyerAssetAccountId, side: "debit", amountCents },
+    { accountId: accountIds.deposit(buyerId), side: "credit", amountCents },
+    { accountId: accountIds.deposit(sellerId), side: "debit", amountCents },
+    { accountId: sellerAssetAccountId, side: "credit", amountCents },
+    { accountId: accountIds.bankDepositLiability(buyerBankId, buyerId), side: "debit", amountCents },
+    { accountId: accountIds.bankDepositLiability(sellerBankId, sellerId), side: "credit", amountCents },
+  ];
+  if (buyerBankId !== sellerBankId) entries.push(
+    { accountId: accountIds.bankReserve(buyerBankId), side: "credit", amountCents },
+    { accountId: accountIds.bankReserve(sellerBankId), side: "debit", amountCents },
+    { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, buyerBankId), side: "debit", amountCents },
+    { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, sellerBankId), side: "credit", amountCents },
+  );
+  return postTransaction(world, "USED_ASSET", `Сделка с подержанным активом: ${assetName}`, entries);
 }
 
 export function seedNonCashAsset(
