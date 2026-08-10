@@ -76,10 +76,7 @@ function createCompanyReport(world: WorldState, company: Company): CompanyFinanc
   };
 }
 
-function closeOwnerProfitAndLoss(world: WorldState, ownerId: string): void {
-  const accounts = Object.values(world.ledger.accounts).filter(
-    (account) => account.ownerId === ownerId && (account.category === "income" || account.category === "expense"),
-  );
+function closeOwnerProfitAndLoss(world: WorldState, ownerId: string, accounts: Array<(typeof world.ledger.accounts)[string]>): void {
   const income = accounts.filter((account) => account.category === "income").map((account) => ({ account, value: balanceOf(world, account.id) })).filter((item) => item.value > 0);
   const expenses = accounts.filter((account) => account.category === "expense").map((account) => ({ account, value: balanceOf(world, account.id) })).filter((item) => item.value > 0);
   const incomeTotal = income.reduce((sum, item) => sum + item.value, 0);
@@ -106,12 +103,23 @@ export function closeMonthlyAccounting(world: WorldState): void {
     ...world.households.map((item) => item.id),
     ...world.companies.map((item) => item.id),
     ...world.banks.map((item) => item.id),
-    world.government.id,
-    world.centralBank.id,
+    ...world.governments.map((item) => item.id),
+    ...world.centralBanks.map((item) => item.id),
+    ...world.brokers.map((item) => item.id),
+    ...world.exchanges.map((item) => item.id),
+    ...world.populationCohorts.map((item) => item.id),
+    ...world.firmCohorts.map((item) => item.id),
     "goods-market",
     "academy-provider",
   ];
-  owners.forEach((ownerId) => closeOwnerProfitAndLoss(world, ownerId));
+  const accountsByOwner = new Map<string, Array<(typeof world.ledger.accounts)[string]>>();
+  for (const account of Object.values(world.ledger.accounts)) {
+    if (account.category !== "income" && account.category !== "expense") continue;
+    const accounts = accountsByOwner.get(account.ownerId) ?? [];
+    accounts.push(account);
+    accountsByOwner.set(account.ownerId, accounts);
+  }
+  owners.forEach((ownerId) => closeOwnerProfitAndLoss(world, ownerId, accountsByOwner.get(ownerId) ?? []));
   for (const company of world.companies) {
     company.retainedEarningsCents = balanceOf(world, accountIds.retainedEarnings(company.id));
   }

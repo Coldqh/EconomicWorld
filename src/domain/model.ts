@@ -21,8 +21,12 @@ export interface LedgerAccount {
     | "property"
     | "durable"
     | "cohort-capital"
+    | "security"
+    | "bond"
+    | "goodwill"
+    | "intercentral"
     | "monetary-base";
-  currency: "RUB";
+  currency: string;
 }
 
 export interface LedgerEntry {
@@ -66,7 +70,21 @@ export type TransactionKind =
   | "PROPERTY_PURCHASE"
   | "DURABLE_PURCHASE"
   | "USED_ASSET"
-  | "LOGISTICS";
+  | "LOGISTICS"
+  | "EQUITY_ISSUE"
+  | "EQUITY_SECONDARY"
+  | "DIVIDEND"
+  | "BOND_ISSUE"
+  | "BOND_COUPON"
+  | "BOND_REPAYMENT"
+  | "ACQUISITION"
+  | "IPO"
+  | "BROKER_DEPOSIT"
+  | "MARKET_TRADE"
+  | "BROKER_FEE"
+  | "EXCHANGE_FEE"
+  | "BANKRUPTCY_DISTRIBUTION"
+  | "SECURITY_REVALUATION";
 
 export interface LedgerTransaction {
   id: string;
@@ -141,7 +159,19 @@ export type EventType =
   | "DurableResold"
   | "PersonMaterialized"
   | "PersonDematerialized"
-  | "CohortMigrated";
+  | "CohortMigrated"
+  | "EquityIssued"
+  | "SharesTransferred"
+  | "DividendDeclared"
+  | "BondIssued"
+  | "BondCouponPaid"
+  | "BondRepaid"
+  | "AcquisitionClosed"
+  | "CompanyListed"
+  | "OrderPlaced"
+  | "OrderCancelled"
+  | "TradeExecuted"
+  | "BrokerageOpened";
 
 export interface DomainEvent {
   id: string;
@@ -310,6 +340,17 @@ export interface Company {
   marginalCostCents: number;
   capacityUtilizationBps: number;
   occupationFamilyNeeds: Record<string, number>;
+  headquartersCountryId: string;
+  headquartersCityId: string;
+  industry: string;
+  representationTier: "A" | "B" | "C";
+  sizeClass: "small" | "medium" | "large";
+  corporateStatus: "private" | "public" | "subsidiary" | "bankrupt";
+  equitySecurityId: string;
+  boardId: string;
+  parentCompanyId: string | null;
+  subsidiaryIds: string[];
+  goodwillCents: number;
 }
 
 export interface Bank {
@@ -318,6 +359,10 @@ export interface Bank {
   baseSpreadBps: number;
   minimumCapitalRatioBps: number;
   minimumLiquidityRatioBps: number;
+  countryId: string;
+  baseCurrency: string;
+  centralBankId: string;
+  representationTier: "A" | "B";
 }
 
 export interface Government {
@@ -326,6 +371,8 @@ export interface Government {
   salesTaxBps: number;
   corporateTaxBps: number;
   monthlyUnemploymentBenefitCents: number;
+  countryId: string;
+  currencyId: string;
 }
 
 export interface PolicyRatePoint {
@@ -339,6 +386,8 @@ export interface CentralBank {
   policyRateBps: number;
   inflationTargetBps: number;
   policyRateHistory: PolicyRatePoint[];
+  countryId: string;
+  currencyId: string;
 }
 
 export interface Loan {
@@ -458,6 +507,13 @@ export interface Country {
   legalProfile: string;
   taxContext: string;
   cityIds: string[];
+  companyIds: string[];
+  bankIds: string[];
+  universityIds: string[];
+  governmentId: string;
+  centralBankId: string;
+  exchangeIds: string[];
+  industries: string[];
 }
 
 export interface City {
@@ -635,6 +691,7 @@ export interface PopulationCohort {
 
 export interface FirmCohort {
   id: string;
+  countryId: string;
   cityId: string;
   bankId: string;
   industry: string;
@@ -694,7 +751,7 @@ export interface PlayerMonthlySnapshot {
 export interface PlayerTimelineEvent {
   id: string;
   elapsedMonth: number;
-  type: "identity" | "job" | "salary" | "course" | "skill" | "education" | "travel" | "housing" | "asset";
+  type: "identity" | "job" | "salary" | "course" | "skill" | "education" | "travel" | "housing" | "asset" | "company" | "market";
   title: string;
   detail: string;
 }
@@ -702,7 +759,7 @@ export interface PlayerTimelineEvent {
 export interface PlayerCommandRecord {
   id: string;
   elapsedMonth: number;
-  type: "SET_PROFILE" | "APPLY_JOB" | "ACCEPT_JOB" | "RESIGN_JOB" | "ENROLL_COURSE" | "SET_SAVINGS" | "APPLY_UNIVERSITY" | "ENROLL_UNIVERSITY" | "START_TRAVEL" | "RELOCATE" | "RENT_PROPERTY" | "BUY_PROPERTY" | "BUY_DURABLE" | "SELL_DURABLE";
+  type: "SET_PROFILE" | "APPLY_JOB" | "ACCEPT_JOB" | "RESIGN_JOB" | "ENROLL_COURSE" | "SET_SAVINGS" | "APPLY_UNIVERSITY" | "ENROLL_UNIVERSITY" | "START_TRAVEL" | "RELOCATE" | "RENT_PROPERTY" | "BUY_PROPERTY" | "BUY_DURABLE" | "SELL_DURABLE" | "FOUND_COMPANY" | "RAISE_EQUITY" | "TRANSFER_SHARES" | "DECLARE_DIVIDEND" | "ISSUE_BOND" | "ACQUIRE_COMPANY" | "IPO" | "OPEN_BROKERAGE" | "PLACE_ORDER" | "CANCEL_ORDER";
   payload: Record<string, string | number | boolean>;
 }
 
@@ -734,13 +791,171 @@ export interface PlayerState {
   residenceHistory: Array<{ cityId: string; fromMonth: number; toMonth: number | null }>;
   durableAssetIds: string[];
   propertyIds: string[];
+  brokerageAccountIds: string[];
+}
+
+export interface EquitySecurity {
+  id: string;
+  companyId: string;
+  className: string;
+  currencyId: string;
+  sharesOutstanding: number;
+  votesPerShare: number;
+  status: "private" | "listed" | "cancelled";
+}
+
+export interface EquityHolding {
+  id: string;
+  securityId: string;
+  ownerId: string;
+  shares: number;
+  costBasisCents: number;
+  dividendsReceivedCents: number;
+}
+
+export interface CorporateBond {
+  id: string;
+  issuerCompanyId: string;
+  currencyId: string;
+  faceValueCents: number;
+  couponBps: number;
+  maturityMonth: number;
+  issuedAtMonth: number;
+  outstandingFaceValueCents: number;
+  seniority: "senior" | "subordinated";
+  status: "active" | "repaid" | "defaulted";
+}
+
+export interface BondHolding {
+  id: string;
+  bondId: string;
+  holderId: string;
+  faceValueCents: number;
+  costBasisCents: number;
+  couponsReceivedCents: number;
+}
+
+export interface CorporateBoard {
+  id: string;
+  companyId: string;
+  directorOwnerIds: string[];
+  approvalThresholdBps: number;
+}
+
+export interface CorporateAction {
+  id: string;
+  companyId: string;
+  elapsedMonth: number;
+  type: "founded" | "equity-raise" | "share-transfer" | "dividend" | "bond-issue" | "bond-repaid" | "acquisition" | "ipo" | "bankruptcy";
+  title: string;
+  amountCents: number;
+  relatedEntityIds: string[];
+}
+
+export interface Acquisition {
+  id: string;
+  acquirerCompanyId: string;
+  targetCompanyId: string;
+  offerValueCents: number;
+  debtFinancedCents: number;
+  goodwillCents: number;
+  status: "proposed" | "closed" | "rejected";
+  closedAtMonth: number | null;
+}
+
+export interface Exchange {
+  id: string;
+  name: string;
+  shortName: string;
+  countryId: string;
+  currencyId: string;
+  bankId: string;
+  listedSecurityIds: string[];
+  brokerFeeBps: number;
+  exchangeFeeBps: number;
+}
+
+export interface Listing {
+  id: string;
+  exchangeId: string;
+  companyId: string;
+  securityId: string;
+  ticker: string;
+  currencyId: string;
+  listedAtMonth: number;
+  lastPriceCents: number;
+  previousCloseCents: number;
+}
+
+export interface Broker {
+  id: string;
+  name: string;
+  countryId: string;
+  bankId: string;
+  exchangeIds: string[];
+}
+
+export interface BrokerageAccount {
+  id: string;
+  brokerId: string;
+  ownerId: string;
+  currencyId: string;
+  openedAtMonth: number;
+  status: "active" | "closed";
+}
+
+export interface MarketOrder {
+  id: string;
+  brokerageAccountId: string;
+  securityId: string;
+  side: "buy" | "sell";
+  type: "market" | "limit";
+  quantity: number;
+  remainingQuantity: number;
+  limitPriceCents: number | null;
+  placedAtMonth: number;
+  sequence: number;
+  status: "open" | "partially-filled" | "filled" | "cancelled" | "rejected";
+}
+
+export interface MarketTrade {
+  id: string;
+  securityId: string;
+  exchangeId: string;
+  buyOrderId: string;
+  sellOrderId: string;
+  buyerId: string;
+  sellerId: string;
+  quantity: number;
+  priceCents: number;
+  elapsedMonth: number;
+}
+
+export interface OhlcvBar {
+  securityId: string;
+  elapsedMonth: number;
+  openCents: number;
+  highCents: number;
+  lowCents: number;
+  closeCents: number;
+  volume: number;
+}
+
+export interface MarketIndex {
+  id: string;
+  name: string;
+  exchangeId: string;
+  constituentSecurityIds: string[];
+  methodology: "market-cap";
+  levelBps: number;
+  history: Array<{ elapsedMonth: number; levelBps: number }>;
 }
 
 export type SimulationScenario = "baseline" | "high-demand" | "supply-constraint" | "high-rates" | "bank-liquidity-stress";
 
 export interface WorldState {
-  schemaVersion: 3;
-  saveVersion: 3;
+  schemaVersion: 4;
+  saveVersion: 4;
   seed: string;
   scenario: SimulationScenario;
   clock: SimulationClock;
@@ -753,6 +968,8 @@ export interface WorldState {
   banks: Bank[];
   government: Government;
   centralBank: CentralBank;
+  governments: Government[];
+  centralBanks: CentralBank[];
   loans: Loan[];
   bankFunding: BankFunding[];
   nationalAccounts: NationalAccountsState;
@@ -782,11 +999,35 @@ export interface WorldState {
   nextPropertyId: number;
   nextDurableAssetId: number;
   nextApplicationId: number;
+  equitySecurities: EquitySecurity[];
+  equityHoldings: EquityHolding[];
+  corporateBonds: CorporateBond[];
+  bondHoldings: BondHolding[];
+  corporateBoards: CorporateBoard[];
+  corporateActions: CorporateAction[];
+  acquisitions: Acquisition[];
+  exchanges: Exchange[];
+  listings: Listing[];
+  brokers: Broker[];
+  brokerageAccounts: BrokerageAccount[];
+  marketOrders: MarketOrder[];
+  marketTrades: MarketTrade[];
+  ohlcvBars: OhlcvBar[];
+  marketIndices: MarketIndex[];
+  nextSecurityId: number;
+  nextHoldingId: number;
+  nextBondId: number;
+  nextCorporateActionId: number;
+  nextAcquisitionId: number;
+  nextBrokerageAccountId: number;
+  nextOrderId: number;
+  nextTradeId: number;
+  nextOrderSequence: number;
 }
 
 export interface InvariantResult {
   id: string;
-  section: "Национальные счета" | "Бухгалтерия" | "Товары" | "Деньги" | "Кредит" | "Ликвидность банков" | "Игрок" | "Население" | "География" | "Жильё" | "Образование" | "Производительность";
+  section: "Национальные счета" | "Бухгалтерия" | "Товары" | "Деньги" | "Кредит" | "Ликвидность банков" | "Игрок" | "Население" | "География" | "Жильё" | "Образование" | "Производительность" | "Собственность" | "Рынки";
   title: string;
   ok: boolean;
   detail: string;

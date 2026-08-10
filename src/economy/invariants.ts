@@ -16,7 +16,7 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   results.push(result("Деньги", "deposit-mirror", "Депозиты имеют банковскую сторону", depositAssets === depositLiabilities, `Клиенты / банки: ${(depositAssets / 100).toLocaleString("ru-RU")} ₽`, depositAssets - depositLiabilities));
 
   const reserveAssets = sumAccounts(world, (account) => account.category === "asset" && account.instrument === "reserve" && world.banks.some((bank) => bank.id === account.ownerId));
-  const reserveLiabilities = sumAccounts(world, (account) => account.category === "liability" && account.instrument === "reserve" && account.ownerId === world.centralBank.id);
+  const reserveLiabilities = sumAccounts(world, (account) => account.category === "liability" && account.instrument === "reserve" && world.centralBanks.some((bank) => bank.id === account.ownerId));
   results.push(result("Ликвидность банков", "reserve-mirror", "Резервы сверены с центральным банком", reserveAssets === reserveLiabilities, `Резервы: ${(reserveAssets / 100).toLocaleString("ru-RU")} ₽`, reserveAssets - reserveLiabilities));
 
   const negativeReserves = world.banks.filter((bank) => balanceOf(world, accountIds.bankReserve(bank.id)) < 0);
@@ -100,5 +100,26 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const budgetIssue = world.fidelity.materializedPersonIds.length > world.fidelity.budgets.maxActivePersons;
   results.push(result("Производительность", "fidelity-budget", "Уровни детализации укладываются в бюджет", !budgetIssue, `${world.fidelity.materializedPersonIds.length}/${world.fidelity.budgets.maxActivePersons} материализованных персон`));
   results.push(result("Бухгалтерия", "ledger-archives", "Архивы реестра сбалансированы", !archiveIssue, `${world.ledgerArchives.length} архивных сегментов`));
+
+  const brokenCapTable = world.equitySecurities.find((security) => {
+    const registered = world.equityHoldings.filter((holding) => holding.securityId === security.id).reduce((sum, holding) => sum + holding.shares, 0);
+    return registered !== security.sharesOutstanding || registered < 0;
+  });
+  results.push(result("Собственность", "cap-table", "Реестр акций сходится", !brokenCapTable, brokenCapTable?.id ?? `${world.equitySecurities.length} выпусков сверены`));
+
+  const brokenBond = world.corporateBonds.find((bond) => {
+    const claims = world.bondHoldings.filter((holding) => holding.bondId === bond.id).reduce((sum, holding) => sum + holding.faceValueCents, 0);
+    return claims !== bond.outstandingFaceValueCents || claims < 0;
+  });
+  results.push(result("Собственность", "bond-registry", "Требования по облигациям сходятся", !brokenBond, brokenBond?.id ?? `${world.corporateBonds.length} выпусков сверены`));
+
+  const brokenOrder = world.marketOrders.find((order) => order.quantity <= 0 || order.remainingQuantity < 0 || order.remainingQuantity > order.quantity || (order.type === "limit" && (!order.limitPriceCents || order.limitPriceCents <= 0)));
+  results.push(result("Рынки", "order-book", "Заявки корректны", !brokenOrder, brokenOrder?.id ?? `${world.marketOrders.length} заявок`));
+
+  const brokenTrade = world.marketTrades.find((trade) => trade.quantity <= 0 || trade.priceCents <= 0 || !world.marketOrders.some((order) => order.id === trade.buyOrderId) || !world.marketOrders.some((order) => order.id === trade.sellOrderId));
+  results.push(result("Рынки", "trade-registry", "Сделки связаны с заявками", !brokenTrade, brokenTrade?.id ?? `${world.marketTrades.length} сделок`));
+
+  const brokenScope = world.countries.find((country) => country.companyIds.some((id) => !world.companies.some((company) => company.id === id && company.headquartersCountryId === country.id)) || country.bankIds.some((id) => !world.banks.some((bank) => bank.id === id && bank.countryId === country.id)) || !world.centralBanks.some((bank) => bank.id === country.centralBankId));
+  results.push(result("География", "country-economy-scope", "Экономические контуры стран связаны", !brokenScope, brokenScope?.name ?? `${world.countries.length} локальных контуров`));
   return results;
 }

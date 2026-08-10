@@ -9,20 +9,83 @@ import { acceptJobOffer, applyForJob, setPlayerProfile } from "../src/player/com
 import { playerFinancialSummary, playerPerson } from "../src/player/system.ts";
 import { applyUniversity, buyDurable, enrollUniversity, sellDurable, startTravel } from "../src/player/world-commands.ts";
 import { dematerializePerson, materializePerson } from "../src/world/fidelity.ts";
+import { issueBond, raiseEquity, transferShares } from "../src/corporate/finance.ts";
+import { openBrokerageAccount, placeOrder } from "../src/markets/exchange.ts";
 
 test("фазы 3 и 4 создают масштабный географический мир", () => {
   const world = createWorld();
-  assert.equal(world.schemaVersion, 3);
-  assert.equal(world.saveVersion, 3);
+  assert.equal(world.schemaVersion, 4);
+  assert.equal(world.saveVersion, 4);
   assert.equal(world.households.length, 100);
   assert.equal(world.people.length, 100);
-  assert.equal(world.companies.length, 10);
-  assert.equal(world.countries.length, 10);
-  assert.equal(world.cities.length, 30);
+  assert.equal(world.companies.length, 33);
+  assert.equal(world.countries.length, 11);
+  assert.equal(world.cities.length, 33);
+  assert.equal(world.banks.length, 22);
   assert.ok(world.universities.length >= 10);
   assert.ok(world.universityPrograms.every((program) => program.durationMonths >= 24));
   assert.ok(world.diagnostics.populationRepresented >= 1_000_000);
   assert.ok(world.diagnostics.businessesRepresented >= 10_000);
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("каждая страна имеет локальные компании, банки и денежную власть", () => {
+  const world = createWorld();
+  for (const country of world.countries) {
+    assert.ok(country.companyIds.length >= 3, country.name);
+    assert.ok(country.bankIds.length >= 2, country.name);
+    assert.ok(country.companyIds.every((id) => world.companies.some((company) => company.id === id && company.headquartersCountryId === country.id)));
+    assert.ok(country.bankIds.every((id) => world.banks.some((bank) => bank.id === id && bank.countryId === country.id)));
+    assert.ok(world.centralBanks.some((bank) => bank.id === country.centralBankId && bank.currencyId === country.currencyReference));
+  }
+  const korea = world.countries.find((country) => country.id === "kr")!;
+  assert.ok(korea.cityIds.includes("seoul"));
+  const seoulCompany = world.companies.find((company) => company.headquartersCityId === "seoul")!;
+  assert.ok(seoulCompany);
+  assert.equal(world.ledger.accounts[`${seoulCompany.id}:asset:deposit`].currency, "KRW");
+});
+
+test("первичный и вторичный рынки акций сохраняют таблицу капитализации", () => {
+  const world = createWorld();
+  const company = world.companies[0];
+  const security = world.equitySecurities.find((item) => item.id === company.equitySecurityId)!;
+  const sharesBefore = security.sharesOutstanding;
+  const buyer = "household-002";
+  const primary = raiseEquity(world, company.id, buyer, 100_000, 1_000);
+  assert.equal(primary.ok, true);
+  assert.equal(security.sharesOutstanding, sharesBefore + 100);
+  const secondary = transferShares(world, security.id, buyer, "household-003", 40, 1_100);
+  assert.equal(secondary.ok, true);
+  assert.equal(security.sharesOutstanding, sharesBefore + 100);
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("облигация создаёт зеркальные требования и обязательства", () => {
+  const world = createWorld();
+  const answer = issueBond(world, world.companies[0].id, world.player.householdId, 100_000, 800, 24);
+  assert.equal(answer.ok, true);
+  assert.equal(world.corporateBonds.length, 1);
+  assert.equal(world.bondHoldings[0].faceValueCents, world.corporateBonds[0].outstandingFaceValueCents);
+  assert.ok(world.ledger.transactions.some((transaction) => transaction.kind === "BOND_ISSUE"));
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("цена публичной компании меняется только исполненной сделкой", () => {
+  const world = createWorld();
+  const listing = world.listings.find((item) => item.exchangeId === "exchange-ru")!;
+  const company = world.companies.find((item) => item.id === listing.companyId)!;
+  const sellerId = `population-${company.headquartersCityId}-1`;
+  assert.equal(openBrokerageAccount(world, sellerId).ok, true);
+  assert.equal(openBrokerageAccount(world, world.player.householdId).ok, true);
+  const sellerAccount = world.brokerageAccounts.find((item) => item.ownerId === sellerId)!;
+  const buyerAccount = world.brokerageAccounts.find((item) => item.ownerId === world.player.householdId)!;
+  const before = listing.lastPriceCents;
+  assert.equal(placeOrder(world, sellerAccount.id, listing.securityId, "sell", "limit", 10, before + 25).ok, true);
+  assert.equal(listing.lastPriceCents, before);
+  const buy = placeOrder(world, buyerAccount.id, listing.securityId, "buy", "limit", 10, before + 25);
+  assert.equal(buy.ok, true);
+  assert.equal(world.marketTrades.length, 1);
+  assert.equal(listing.lastPriceCents, before + 25);
   assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
 });
 
@@ -85,6 +148,7 @@ test("переезд между городами оплачивается и м�
   assert.ok(world.player.visitedCityIds.includes("berlin"));
   assert.ok(playerFinancialSummary(world).depositsCents < before);
   assert.ok(world.ledger.transactions.some((transaction) => transaction.kind === "TRAVEL"));
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
 });
 
 test("вторичная продажа актива не добавляет ВВП", () => {

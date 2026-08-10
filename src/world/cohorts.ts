@@ -59,6 +59,7 @@ export function createFirmCohorts(cities: readonly City[], bankIds: readonly str
     const monthlyRevenue = Math.round(employment * city.baseMonthlyWageCents * (1.55 + industryIndex * 0.18) / 10_000);
     return {
       id: `firms-${city.id}-${industryIndex + 1}`,
+      countryId: city.countryId,
       cityId: city.id,
       bankId: bankIds[(cityIndex + industryIndex) % bankIds.length],
       industry,

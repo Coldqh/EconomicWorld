@@ -25,6 +25,17 @@ export const accountIds = {
   materializationEquity: (ownerId: string) => `${ownerId}:equity:materialization`,
   investment: (ownerId: string, companyId = "portfolio") =>
     `${ownerId}:asset:investment:${companyId}`,
+  security: (ownerId: string, securityId: string) => `${ownerId}:asset:security:${securityId}`,
+  contributedEquity: (companyId: string) => `${companyId}:equity:contributed`,
+  dividendIncome: (ownerId: string) => `${ownerId}:income:dividend`,
+  bondAsset: (ownerId: string, bondId: string) => `${ownerId}:asset:bond:${bondId}`,
+  bondLiability: (companyId: string, bondId: string) => `${companyId}:liability:bond:${bondId}`,
+  interestIncome: (ownerId: string) => `${ownerId}:income:bond-interest`,
+  interestExpense: (ownerId: string) => `${ownerId}:expense:bond-interest`,
+  securityGain: (ownerId: string) => `${ownerId}:income:security-gain`,
+  securityLoss: (ownerId: string) => `${ownerId}:expense:security-loss`,
+  acquisitionInvestment: (ownerId: string, companyId: string) => `${ownerId}:asset:investment:acquisition:${companyId}`,
+  goodwill: (ownerId: string, companyId: string) => `${ownerId}:asset:goodwill:${companyId}`,
   loanLiability: (ownerId: string, bankId: string) =>
     `${ownerId}:liability:loan:${bankId}`,
   bankDepositLiability: (bankId: string, depositorId: string) =>
@@ -47,6 +58,8 @@ export const accountIds = {
     `${centralBankId}:asset:central-bank-facility:${bankId}`,
   centralBankFacilityLiability: (bankId: string) =>
     `${bankId}:liability:central-bank-facility`,
+  intercentralReceivable: (centralBankId: string, counterpartyId: string) => `${centralBankId}:asset:intercentral:${counterpartyId}`,
+  intercentralPayable: (centralBankId: string, counterpartyId: string) => `${centralBankId}:liability:intercentral:${counterpartyId}`,
 };
 
 export function createLedger(): LedgerState {
@@ -73,6 +86,9 @@ function instrumentFor(
   if (id.includes(":interbank")) return "interbank";
   if (id.includes(":central-bank-facility")) return "central-bank-facility";
   if (id.includes(":investment")) return "investment";
+  if (id.includes(":security:")) return "security";
+  if (id.includes(":bond:")) return "bond";
+  if (id.includes(":goodwill:")) return "goodwill";
   if (id.includes(":monetary-base")) return "monetary-base";
   if (category === "equity") return "equity";
   if (category === "income") return "income";
@@ -85,6 +101,7 @@ export function ensureAccount(
   ownerId: string,
   name: string,
   category: AccountCategory,
+  currency?: string,
 ): string {
   if (!ledger.accounts[id]) {
     ledger.accounts[id] = {
@@ -93,9 +110,11 @@ export function ensureAccount(
       name,
       category,
       instrument: instrumentFor(category, id),
-      currency: "RUB",
+      currency: currency ?? "RUB",
     };
     ledger.balances[id] = 0;
+  } else if (currency) {
+    ledger.accounts[id].currency = currency;
   }
   return id;
 }
@@ -103,12 +122,13 @@ export function ensureAccount(
 export function ensureEntityAccounts(
   ledger: LedgerState,
   ownerId: string,
+  currency?: string,
 ): void {
-  ensureAccount(ledger, accountIds.deposit(ownerId), ownerId, "Банковский депозит", "asset");
-  ensureAccount(ledger, accountIds.openingEquity(ownerId), ownerId, "Начальный капитал", "equity");
-  ensureAccount(ledger, accountIds.operatingIncome(ownerId), ownerId, "Доходы", "income");
-  ensureAccount(ledger, accountIds.operatingExpense(ownerId), ownerId, "Расходы", "expense");
-  ensureAccount(ledger, accountIds.retainedEarnings(ownerId), ownerId, "Нераспределённая прибыль", "equity");
+  ensureAccount(ledger, accountIds.deposit(ownerId), ownerId, "Банковский депозит", "asset", currency);
+  ensureAccount(ledger, accountIds.openingEquity(ownerId), ownerId, "Начальный капитал", "equity", currency);
+  ensureAccount(ledger, accountIds.operatingIncome(ownerId), ownerId, "Доходы", "income", currency);
+  ensureAccount(ledger, accountIds.operatingExpense(ownerId), ownerId, "Расходы", "expense", currency);
+  ensureAccount(ledger, accountIds.retainedEarnings(ownerId), ownerId, "Нераспределённая прибыль", "equity", currency);
 }
 
 function signedNaturalDelta(account: LedgerAccount, entry: LedgerEntry): number {
@@ -176,15 +196,47 @@ export function findBankIdForEntity(world: WorldState, entityId: string): string
   if (firmCohort) return firmCohort.bankId;
   const university = world.universities.find((item) => item.id === entityId);
   if (university) return university.bankId;
+  const government = world.governments.find((item) => item.id === entityId);
+  if (government) return world.banks.find((bank) => bank.countryId === government.countryId)!.id;
+  const broker = world.brokers.find((item) => item.id === entityId);
+  if (broker) return broker.bankId;
+  const exchange = world.exchanges.find((item) => item.id === entityId);
+  if (exchange) return exchange.bankId;
   const sectorCityId = entityId.includes(":") ? entityId.split(":").at(-1) : undefined;
   if (sectorCityId && world.cities.some((city) => city.id === sectorCityId)) {
-    const cityIndex = world.cities.findIndex((city) => city.id === sectorCityId);
-    return world.banks[Math.max(0, cityIndex) % world.banks.length].id;
+    const city = world.cities.find((item) => item.id === sectorCityId)!;
+    return world.banks.find((bank) => bank.countryId === city.countryId)!.id;
   }
-  if (entityId === world.government.id || entityId === "goods-market" || entityId === "academy-provider") {
-    return world.banks[0].id;
+  if (entityId === "goods-market" || entityId === "academy-provider") {
+    return world.banks.find((bank) => bank.countryId === "ru")?.id ?? world.banks[0].id;
   }
   throw new Error(`Для ${entityId} не назначен коммерческий банк`);
+}
+
+export function centralBankIdForBank(world: WorldState, bankId: string): string {
+  return world.banks.find((bank) => bank.id === bankId)?.centralBankId ?? world.centralBank.id;
+}
+
+function reserveSettlementEntries(world: WorldState, payerBankId: string, recipientBankId: string, amountCents: number): LedgerEntry[] {
+  const payerCentralBankId = centralBankIdForBank(world, payerBankId);
+  const recipientCentralBankId = centralBankIdForBank(world, recipientBankId);
+  const entries: LedgerEntry[] = [
+    { accountId: accountIds.bankReserve(payerBankId), side: "credit", amountCents },
+    { accountId: accountIds.bankReserve(recipientBankId), side: "debit", amountCents },
+    { accountId: accountIds.centralBankReserveLiability(payerCentralBankId, payerBankId), side: "debit", amountCents },
+    { accountId: accountIds.centralBankReserveLiability(recipientCentralBankId, recipientBankId), side: "credit", amountCents },
+  ];
+  if (payerCentralBankId !== recipientCentralBankId) {
+    const receivableId = accountIds.intercentralReceivable(recipientCentralBankId, payerCentralBankId);
+    const payableId = accountIds.intercentralPayable(payerCentralBankId, recipientCentralBankId);
+    ensureAccount(world.ledger, receivableId, recipientCentralBankId, `Межцентробанковское требование к ${payerCentralBankId}`, "asset", "EWU");
+    ensureAccount(world.ledger, payableId, payerCentralBankId, `Межцентробанковское обязательство перед ${recipientCentralBankId}`, "liability", "EWU");
+    entries.push(
+      { accountId: receivableId, side: "debit", amountCents },
+      { accountId: payableId, side: "credit", amountCents },
+    );
+  }
+  return entries;
 }
 
 function bankDepositLiabilities(world: WorldState, bankId: string): number {
@@ -206,7 +258,7 @@ function createFundingRecord(
     borrowerBankId,
     principalCents: amountCents,
     remainingCents: amountCents,
-    annualRateBps: world.centralBank.policyRateBps + (kind === "interbank" ? 180 : 450),
+    annualRateBps: (world.centralBanks.find((bank) => bank.id === centralBankIdForBank(world, borrowerBankId))?.policyRateBps ?? world.centralBank.policyRateBps) + (kind === "interbank" ? 180 : 450),
     issuedAtMonth: world.clock.elapsedMonths,
     kind,
     status: "active",
@@ -220,8 +272,9 @@ export function ensureSettlementLiquidity(
 ): void {
   let shortfall = Math.max(0, requiredCents - balanceOf(world, accountIds.bankReserve(bankId)));
   if (shortfall <= 0) return;
+  const centralBankId = centralBankIdForBank(world, bankId);
   for (const lender of world.banks
-    .filter((bank) => bank.id !== bankId)
+    .filter((bank) => bank.id !== bankId && bank.centralBankId === centralBankId)
     .sort((left, right) => balanceOf(world, accountIds.bankReserve(right.id)) - balanceOf(world, accountIds.bankReserve(left.id)))) {
     const reserve = balanceOf(world, accountIds.bankReserve(lender.id));
     const buffer = Math.floor((bankDepositLiabilities(world, lender.id) * lender.minimumLiquidityRatioBps) / 10_000);
@@ -235,24 +288,24 @@ export function ensureSettlementLiquidity(
       { accountId: accountIds.interbankLiability(bankId, lender.id), side: "credit", amountCents },
       { accountId: accountIds.interbankAsset(lender.id, bankId), side: "debit", amountCents },
       { accountId: accountIds.bankReserve(lender.id), side: "credit", amountCents },
-      { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, lender.id), side: "debit", amountCents },
-      { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, bankId), side: "credit", amountCents },
+      { accountId: accountIds.centralBankReserveLiability(centralBankId, lender.id), side: "debit", amountCents },
+      { accountId: accountIds.centralBankReserveLiability(centralBankId, bankId), side: "credit", amountCents },
     ]);
     createFundingRecord(world, lender.id, bankId, amountCents, "interbank");
     shortfall -= amountCents;
     if (shortfall <= 0) break;
   }
   if (shortfall > 0) {
-    ensureAccount(world.ledger, accountIds.centralBankFacilityAsset(world.centralBank.id, bankId), world.centralBank.id, `Кредит ликвидности ${bankId}`, "asset");
+    ensureAccount(world.ledger, accountIds.centralBankFacilityAsset(centralBankId, bankId), centralBankId, `Кредит ликвидности ${bankId}`, "asset");
     ensureAccount(world.ledger, accountIds.centralBankFacilityLiability(bankId), bankId, "Кредит ликвидности ЦБ", "liability");
     postTransaction(world, "CENTRAL_BANK_FACILITY", `Кредит ликвидности ЦБ для ${bankId}`, [
       { accountId: accountIds.bankReserve(bankId), side: "debit", amountCents: shortfall },
       { accountId: accountIds.centralBankFacilityLiability(bankId), side: "credit", amountCents: shortfall },
-      { accountId: accountIds.centralBankFacilityAsset(world.centralBank.id, bankId), side: "debit", amountCents: shortfall },
-      { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, bankId), side: "credit", amountCents: shortfall },
+      { accountId: accountIds.centralBankFacilityAsset(centralBankId, bankId), side: "debit", amountCents: shortfall },
+      { accountId: accountIds.centralBankReserveLiability(centralBankId, bankId), side: "credit", amountCents: shortfall },
     ]);
-    createFundingRecord(world, world.centralBank.id, bankId, shortfall, "central-bank");
-    emitSimpleEvent(world, "BankLiquidityFunded", "Банк получил ликвидность", `${bankId} привлёк у центрального банка ${(shortfall / 100).toLocaleString("ru-RU")} ₽ для расчётов.`, [bankId, world.centralBank.id], "attention", [], { amountCents: shortfall });
+    createFundingRecord(world, centralBankId, bankId, shortfall, "central-bank");
+    emitSimpleEvent(world, "BankLiquidityFunded", "Банк получил ликвидность", `${bankId} привлёк ликвидность у своего центрального банка.`, [bankId, centralBankId], "attention", [], { amountCents: shortfall });
   }
 }
 
@@ -283,24 +336,22 @@ export function settleDepositPayment(
     { accountId: accountIds.bankDepositLiability(recipientBankId, recipientId), side: "credit", amountCents },
   ];
   if (payerBankId !== recipientBankId) {
-    entries.push(
-      { accountId: accountIds.bankReserve(payerBankId), side: "credit", amountCents },
-      { accountId: accountIds.bankReserve(recipientBankId), side: "debit", amountCents },
-      { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, payerBankId), side: "debit", amountCents },
-      { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, recipientBankId), side: "credit", amountCents },
-    );
+    entries.push(...reserveSettlementEntries(world, payerBankId, recipientBankId, amountCents));
   }
   return postTransaction(world, kind, memo, entries, causeIds);
 }
 
 function ensureBankingAccounts(world: WorldState, entityId: string, bankId: string): void {
-  ensureEntityAccounts(world.ledger, entityId);
+  const centralBankId = centralBankIdForBank(world, bankId);
+  const currency = world.banks.find((bank) => bank.id === bankId)?.baseCurrency ?? "RUB";
+  ensureEntityAccounts(world.ledger, entityId, currency);
   ensureAccount(
     world.ledger,
     accountIds.bankDepositLiability(bankId, entityId),
     bankId,
     `Депозит ${entityId}`,
     "liability",
+    currency,
   );
   ensureAccount(
     world.ledger,
@@ -308,13 +359,15 @@ function ensureBankingAccounts(world: WorldState, entityId: string, bankId: stri
     bankId,
     "Резервы в центральном банке",
     "asset",
+    currency,
   );
   ensureAccount(
     world.ledger,
-    accountIds.centralBankReserveLiability(world.centralBank.id, bankId),
-    world.centralBank.id,
+    accountIds.centralBankReserveLiability(centralBankId, bankId),
+    centralBankId,
     `Резервный счёт ${bankId}`,
     "liability",
+    currency,
   );
 }
 
@@ -324,13 +377,16 @@ export function seedDeposit(
   bankId: string,
   amountCents: number,
 ): void {
+  const centralBankId = centralBankIdForBank(world, bankId);
+  const currency = world.banks.find((bank) => bank.id === bankId)?.baseCurrency ?? "RUB";
   ensureBankingAccounts(world, ownerId, bankId);
   ensureAccount(
     world.ledger,
-    accountIds.centralBankMonetaryAsset(world.centralBank.id),
-    world.centralBank.id,
+    accountIds.centralBankMonetaryAsset(centralBankId),
+    centralBankId,
     "Актив денежной базы",
     "asset",
+    currency,
   );
   postTransaction(world, "GENESIS", `Начальный депозит: ${ownerId}`, [
     { accountId: accountIds.deposit(ownerId), side: "debit", amountCents },
@@ -338,12 +394,12 @@ export function seedDeposit(
     { accountId: accountIds.bankReserve(bankId), side: "debit", amountCents },
     { accountId: accountIds.bankDepositLiability(bankId, ownerId), side: "credit", amountCents },
     {
-      accountId: accountIds.centralBankMonetaryAsset(world.centralBank.id),
+      accountId: accountIds.centralBankMonetaryAsset(centralBankId),
       side: "debit",
       amountCents,
     },
     {
-      accountId: accountIds.centralBankReserveLiability(world.centralBank.id, bankId),
+      accountId: accountIds.centralBankReserveLiability(centralBankId, bankId),
       side: "credit",
       amountCents,
     },
@@ -355,32 +411,36 @@ export function seedBankCapital(
   bankId: string,
   amountCents: number,
 ): void {
-  ensureAccount(world.ledger, accountIds.bankReserve(bankId), bankId, "Резервы в ЦБ", "asset");
-  ensureAccount(world.ledger, accountIds.bankEquity(bankId), bankId, "Капитал банка", "equity");
+  const centralBankId = centralBankIdForBank(world, bankId);
+  const currency = world.banks.find((bank) => bank.id === bankId)?.baseCurrency ?? "RUB";
+  ensureAccount(world.ledger, accountIds.bankReserve(bankId), bankId, "Резервы в ЦБ", "asset", currency);
+  ensureAccount(world.ledger, accountIds.bankEquity(bankId), bankId, "Капитал банка", "equity", currency);
   ensureAccount(
     world.ledger,
-    accountIds.centralBankMonetaryAsset(world.centralBank.id),
-    world.centralBank.id,
+    accountIds.centralBankMonetaryAsset(centralBankId),
+    centralBankId,
     "Актив денежной базы",
     "asset",
+    currency,
   );
   ensureAccount(
     world.ledger,
-    accountIds.centralBankReserveLiability(world.centralBank.id, bankId),
-    world.centralBank.id,
+    accountIds.centralBankReserveLiability(centralBankId, bankId),
+    centralBankId,
     `Резервный счёт ${bankId}`,
     "liability",
+    currency,
   );
   postTransaction(world, "GENESIS", `Регулятивный капитал: ${bankId}`, [
     { accountId: accountIds.bankReserve(bankId), side: "debit", amountCents },
     { accountId: accountIds.bankEquity(bankId), side: "credit", amountCents },
     {
-      accountId: accountIds.centralBankMonetaryAsset(world.centralBank.id),
+      accountId: accountIds.centralBankMonetaryAsset(centralBankId),
       side: "debit",
       amountCents,
     },
     {
-      accountId: accountIds.centralBankReserveLiability(world.centralBank.id, bankId),
+      accountId: accountIds.centralBankReserveLiability(centralBankId, bankId),
       side: "credit",
       amountCents,
     },
@@ -447,10 +507,7 @@ export function reallocateDepositOwnership(
     { accountId: accountIds.bankDepositLiability(toBankId, toId), side: "credit", amountCents },
   ];
   if (fromBankId !== toBankId) entries.push(
-    { accountId: accountIds.bankReserve(fromBankId), side: "credit", amountCents },
-    { accountId: accountIds.bankReserve(toBankId), side: "debit", amountCents },
-    { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, fromBankId), side: "debit", amountCents },
-    { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, toBankId), side: "credit", amountCents },
+    ...reserveSettlementEntries(world, fromBankId, toBankId, amountCents),
   );
   return postTransaction(world, kind, memo, entries);
 }
@@ -483,10 +540,7 @@ export function transferOwnedAsset(
     { accountId: accountIds.bankDepositLiability(sellerBankId, sellerId), side: "credit", amountCents },
   ];
   if (buyerBankId !== sellerBankId) entries.push(
-    { accountId: accountIds.bankReserve(buyerBankId), side: "credit", amountCents },
-    { accountId: accountIds.bankReserve(sellerBankId), side: "debit", amountCents },
-    { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, buyerBankId), side: "debit", amountCents },
-    { accountId: accountIds.centralBankReserveLiability(world.centralBank.id, sellerBankId), side: "credit", amountCents },
+    ...reserveSettlementEntries(world, buyerBankId, sellerBankId, amountCents),
   );
   return postTransaction(world, "USED_ASSET", `Сделка с подержанным активом: ${assetName}`, entries);
 }
@@ -499,8 +553,10 @@ export function seedNonCashAsset(
   amountCents: number,
 ): void {
   if (amountCents <= 0) return;
-  ensureEntityAccounts(world.ledger, ownerId);
-  ensureAccount(world.ledger, accountId, ownerId, name, "asset");
+  const bankId = findBankIdForEntity(world, ownerId);
+  const currency = world.banks.find((bank) => bank.id === bankId)?.baseCurrency ?? "RUB";
+  ensureEntityAccounts(world.ledger, ownerId, currency);
+  ensureAccount(world.ledger, accountId, ownerId, name, "asset", currency);
   postTransaction(world, "INVENTORY_SEED", `Начальная стоимость: ${name}`, [
     { accountId, side: "debit", amountCents },
     { accountId: accountIds.openingEquity(ownerId), side: "credit", amountCents },
@@ -536,20 +592,7 @@ export function capitalContribution(
     { accountId: accountIds.bankDepositLiability(recipientBankId, companyId), side: "credit", amountCents },
   ];
   if (payerBankId !== recipientBankId) {
-    entries.push(
-      { accountId: accountIds.bankReserve(payerBankId), side: "credit", amountCents },
-      { accountId: accountIds.bankReserve(recipientBankId), side: "debit", amountCents },
-      {
-        accountId: accountIds.centralBankReserveLiability(world.centralBank.id, payerBankId),
-        side: "debit",
-        amountCents,
-      },
-      {
-        accountId: accountIds.centralBankReserveLiability(world.centralBank.id, recipientBankId),
-        side: "credit",
-        amountCents,
-      },
-    );
+    entries.push(...reserveSettlementEntries(world, payerBankId, recipientBankId, amountCents));
   }
   return postTransaction(
     world,
