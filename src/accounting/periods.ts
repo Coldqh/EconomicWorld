@@ -29,8 +29,10 @@ export function resetCompanyPeriod(company: Company): void {
 function cashFlowForCompany(world: WorldState, companyId: string): { operating: number; investing: number; financing: number } {
   const flows = { operating: 0, investing: 0, financing: 0 };
   const financingKinds = new Set<TransactionKind>(["LOAN_ISSUED", "LOAN_PRINCIPAL", "CAPITAL_CONTRIBUTION"]);
-  for (const transaction of world.ledger.transactions) {
-    if (transaction.elapsedMonth !== world.clock.elapsedMonths) continue;
+  for (let index = world.ledger.transactions.length - 1; index >= 0; index -= 1) {
+    const transaction = world.ledger.transactions[index];
+    if (transaction.elapsedMonth < world.clock.elapsedMonths) break;
+    if (transaction.elapsedMonth > world.clock.elapsedMonths) continue;
     const depositEntry = transaction.entries.find((entry) => entry.accountId === accountIds.deposit(companyId));
     if (!depositEntry) continue;
     const delta = depositEntry.side === "debit" ? depositEntry.amountCents : -depositEntry.amountCents;

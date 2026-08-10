@@ -2,7 +2,7 @@ import { accountIds, ensureEntityAccounts, seedNonCashAsset } from "../core/ledg
 import type { MetricPoint, WorldState } from "../domain/model.ts";
 import { createWorld } from "../economy/create-world.ts";
 
-type LegacyWorld = Partial<WorldState> & { schemaVersion?: number; saveVersion?: number };
+type LegacyWorld = Omit<Partial<WorldState>, "schemaVersion" | "saveVersion"> & { schemaVersion?: number; saveVersion?: number };
 
 function migrateMetric(metric: Partial<MetricPoint>, world: WorldState): MetricPoint {
   const prices = metric.priceByGoodCents ?? Object.fromEntries(world.goods.map((good) => [good.id, good.basePriceCents]));
@@ -34,20 +34,23 @@ function migrateMetric(metric: Partial<MetricPoint>, world: WorldState): MetricP
     productionByGoodMilliUnits: metric.productionByGoodMilliUnits ?? Object.fromEntries(world.goods.map((good) => [good.id, 0])),
     salesByGoodMilliUnits: metric.salesByGoodMilliUnits ?? Object.fromEntries(world.goods.map((good) => [good.id, 0])),
     companyMetrics: (metric.companyMetrics ?? []).map((item) => ({ ...item, cogsCents: item.cogsCents ?? 0, netIncomeCents: item.netIncomeCents ?? item.revenueCents - item.expenseCents })),
+    marketConcentrationBpsByGood: metric.marketConcentrationBpsByGood ?? Object.fromEntries(world.goods.map((good) => [good.id, 0])),
+    priceElasticityBpsByGood: metric.priceElasticityBpsByGood ?? Object.fromEntries(world.goods.map((good) => [good.id, 0])),
+    marketShareBpsByCompany: metric.marketShareBpsByCompany ?? Object.fromEntries(world.companies.map((company) => [company.id, 0])),
   };
 }
 
 export function migrateWorldState(raw: unknown): WorldState {
   const legacy = structuredClone(raw) as LegacyWorld;
-  if (legacy.schemaVersion === 2 && legacy.saveVersion === 2) return legacy as WorldState;
+  if (legacy.schemaVersion === 3 && legacy.saveVersion === 3) return legacy as WorldState;
   const template = createWorld();
   const world = {
     ...template,
     ...legacy,
-    schemaVersion: 2 as const,
-    saveVersion: 2 as const,
+    schemaVersion: 3 as const,
+    saveVersion: 3 as const,
     goods: template.goods.map((good) => ({ ...good, ...(legacy.goods?.find((item) => item.id === good.id) ?? {}), essential: good.essential })),
-    people: template.people,
+    people: template.people.map((base) => ({ ...base, ...(legacy.people?.find((item) => item.id === base.id) ?? {}) })),
     households: template.households.map((base) => ({ ...base, ...(legacy.households?.find((item) => item.id === base.id) ?? {}), personIds: base.personIds, savingsPreferenceBps: (legacy.households?.find((item) => item.id === base.id) as Partial<typeof base> | undefined)?.savingsPreferenceBps ?? base.savingsPreferenceBps, preferenceWeightsBps: base.preferenceWeightsBps, preferredSellerByGoodId: {} })),
     companies: template.companies.map((base) => {
       const old = legacy.companies?.find((item) => item.id === base.id) as Partial<typeof base> | undefined;
@@ -61,7 +64,7 @@ export function migrateWorldState(raw: unknown): WorldState {
     bankFunding: legacy.bankFunding ?? [],
     nationalAccounts: legacy.nationalAccounts ?? template.nationalAccounts,
     occupations: legacy.occupations ?? template.occupations,
-    player: legacy.player ?? template.player,
+    player: { ...template.player, ...(legacy.player ?? {}) },
     nextFundingId: legacy.nextFundingId ?? 1,
   } as WorldState;
   world.metricsHistory = (legacy.metricsHistory ?? []).map((metric) => migrateMetric(metric, world));

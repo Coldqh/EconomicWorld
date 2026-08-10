@@ -29,7 +29,7 @@ export function setPlayerProfile(world: WorldState, name: string, profileId: str
   const person = playerPerson(world);
   const household = playerHousehold(world);
   const profiles: Record<string, { age: number; education: typeof person.educationLevel; gains: Partial<Record<SkillId, number>> }> = {
-    student: { age: 19, education: "secondary", gains: { economics: 450, statistics: 350 } },
+    student: { age: 19, education: "secondary", gains: { economics: 1_100, statistics: 950 } },
     office: { age: 21, education: "secondary", gains: { communication: 550, accounting: 300 } },
     analyst: { age: 22, education: "bachelor", gains: { economics: 700, finance: 650, statistics: 600, dataAnalysis: 500 } },
     developer: { age: 21, education: "secondary", gains: { programming: 900, dataAnalysis: 500, statistics: 300 } },
@@ -48,7 +48,7 @@ export function setPlayerProfile(world: WorldState, name: string, profileId: str
 
 export function availableOccupations(world: WorldState, companyId: string): Occupation[] {
   const company = world.companies.find((item) => item.id === companyId);
-  if (!company?.active) return [];
+  if (!company?.active || company.cityId !== world.player.currentCityId) return [];
   const base = company.goodId === "services" ? ["admin", "analyst", "developer"] : ["worker", "analyst"];
   if (company.employees.length >= 8) base.push("manager");
   return world.occupations.filter((occupation) => base.includes(occupation.id));
@@ -59,6 +59,7 @@ export function applyForJob(world: WorldState, companyId: string, occupationId: 
   const company = world.companies.find((item) => item.id === companyId);
   const occupation = world.occupations.find((item) => item.id === occupationId);
   if (!company?.active || !occupation) return { accepted: false, reason: "Вакансия недоступна." };
+  if (company.cityId !== world.player.currentCityId) return { accepted: false, reason: "Вакансия находится в другом городе." };
   if (household.employerId) return { accepted: false, reason: "Сначала завершите текущий трудовой договор." };
   recordCommand(world, "APPLY_JOB", { companyId, occupationId });
   const score = occupationScore(world, occupation);

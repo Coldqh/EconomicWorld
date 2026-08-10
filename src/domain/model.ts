@@ -18,6 +18,9 @@ export interface LedgerAccount {
     | "productive-capital"
     | "interbank"
     | "central-bank-facility"
+    | "property"
+    | "durable"
+    | "cohort-capital"
     | "monetary-base";
   currency: "RUB";
 }
@@ -52,7 +55,18 @@ export type TransactionKind =
   | "ACCOUNTING_CLOSE"
   | "INTERBANK_LOAN"
   | "CENTRAL_BANK_FACILITY"
-  | "EDUCATION";
+  | "EDUCATION"
+  | "UNIVERSITY_TUITION"
+  | "COHORT_INCOME"
+  | "COHORT_CONSUMPTION"
+  | "MATERIALIZATION"
+  | "DEMATERIALIZATION"
+  | "TRAVEL"
+  | "RENT"
+  | "PROPERTY_PURCHASE"
+  | "DURABLE_PURCHASE"
+  | "USED_ASSET"
+  | "LOGISTICS";
 
 export interface LedgerTransaction {
   id: string;
@@ -68,6 +82,16 @@ export interface LedgerState {
   balances: Record<string, number>;
   transactions: LedgerTransaction[];
   nextTransactionId: number;
+}
+
+export interface LedgerArchiveSegment {
+  id: string;
+  fromMonth: number;
+  toMonth: number;
+  transactionCount: number;
+  debitCents: number;
+  creditCents: number;
+  kindCounts: Partial<Record<TransactionKind, number>>;
 }
 
 export interface SimulationClock {
@@ -102,7 +126,22 @@ export type EventType =
   | "SalaryChanged"
   | "CourseEnrolled"
   | "CourseCompleted"
-  | "SkillChanged";
+  | "SkillChanged"
+  | "UniversityApplied"
+  | "UniversityAdmitted"
+  | "UniversityRejected"
+  | "UniversityEnrolled"
+  | "UniversityGraduated"
+  | "TravelStarted"
+  | "TravelCompleted"
+  | "PlayerRelocated"
+  | "PropertyRented"
+  | "PropertyPurchased"
+  | "DurablePurchased"
+  | "DurableResold"
+  | "PersonMaterialized"
+  | "PersonDematerialized"
+  | "CohortMigrated";
 
 export interface DomainEvent {
   id: string;
@@ -134,7 +173,7 @@ export interface GoodsMovement {
   fromId: string;
   toId: string;
   quantityMilliUnits: number;
-  reason: "GENESIS" | "PRODUCTION" | "INPUT" | "CONSUMPTION" | "CAPITAL" | "LIQUIDATION";
+  reason: "GENESIS" | "PRODUCTION" | "INPUT" | "CONSUMPTION" | "CAPITAL" | "LIQUIDATION" | "TRANSPORT" | "USED";
   causeIds: string[];
 }
 
@@ -153,11 +192,15 @@ export interface Person {
   householdId: string;
   displayName: string;
   ageAtStart: number;
-  educationLevel: "basic" | "secondary" | "bachelor";
+  educationLevel: "basic" | "secondary" | "bachelor" | "master" | "doctorate";
   skills: Record<SkillId, number>;
   practicalExperience: Record<SkillId, number>;
   reputationBps: number;
   occupationId: string | null;
+  cityId: string;
+  fidelityTier: 0 | 1 | 2;
+  sourceCohortId: string | null;
+  important: boolean;
 }
 
 export interface Household {
@@ -180,7 +223,13 @@ export interface Household {
   expectedInflationBps: number;
   consumptionMilliUnits: Record<string, number>;
   foundedCompanyIds: string[];
+  cityId: string;
+  utilityPreferencesBps: Record<ConsumptionCategory, number>;
+  lastDisposableIncomeCents: number;
+  lastSpendingByCategoryCents: Record<ConsumptionCategory, number>;
 }
+
+export type ConsumptionCategory = "food" | "housing" | "energy" | "transport" | "services" | "goods" | "education" | "entertainment" | "luxury";
 
 export interface ProductiveCapital {
   acquisitionCostCents: number;
@@ -250,6 +299,17 @@ export interface Company {
   foundedAtMonth: number;
   closedAtMonth: number | null;
   closureReason: string | null;
+  cityId: string;
+  productId: string;
+  technologyBps: number;
+  managementBps: number;
+  learningByDoingBps: number;
+  qualityBps: number;
+  brandReputationBps: number;
+  marketShareBps: number;
+  marginalCostCents: number;
+  capacityUtilizationBps: number;
+  occupationFamilyNeeds: Record<string, number>;
 }
 
 export interface Bank {
@@ -343,6 +403,9 @@ export interface MetricPoint {
   productionByGoodMilliUnits: Record<string, number>;
   salesByGoodMilliUnits: Record<string, number>;
   companyMetrics: CompanyMetric[];
+  marketConcentrationBpsByGood: Record<string, number>;
+  priceElasticityBpsByGood: Record<string, number>;
+  marketShareBpsByCompany: Record<string, number>;
 }
 
 export interface CurrentAccountingPeriod {
@@ -368,6 +431,7 @@ export interface Occupation {
   productivityMultiplierBps: number;
   minimumExperienceMonths: number;
   nextOccupationIds: string[];
+  family: "production" | "engineering" | "software" | "finance" | "management" | "sales" | "services" | "research" | "education";
 }
 
 export interface JobOffer {
@@ -387,6 +451,233 @@ export interface CourseEnrollment {
   status: "active" | "completed";
 }
 
+export interface Country {
+  id: string;
+  name: string;
+  currencyReference: string;
+  legalProfile: string;
+  taxContext: string;
+  cityIds: string[];
+}
+
+export interface City {
+  id: string;
+  countryId: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  population: number;
+  baseMonthlyWageCents: number;
+  transportCostPerKmCents: number;
+  logisticsCapacityMilliUnits: number;
+  localPriceByGoodCents: Record<string, number>;
+  medianIncomeCents: number;
+  employmentBps: number;
+  costOfLivingCents: number;
+  housingVacancyBps: number;
+  majorIndustries: string[];
+  universityIds: string[];
+}
+
+export type TransportMode = "air" | "rail" | "road";
+
+export interface TravelOption {
+  originCityId: string;
+  destinationCityId: string;
+  mode: TransportMode;
+  distanceKm: number;
+  durationDays: number;
+  priceCents: number;
+  providerId: string;
+}
+
+export interface PlayerTravelPlan extends TravelOption {
+  startedAtMonth: number;
+  remainingDays: number;
+  relocation: boolean;
+}
+
+export interface UniversityProgram {
+  id: string;
+  universityId: string;
+  name: string;
+  degree: "bachelor" | "master" | "doctorate";
+  durationMonths: number;
+  tuitionPerYearCents: number;
+  capacity: number;
+  occupiedSeats: number;
+  minimumEducation: Person["educationLevel"];
+  requiredSkills: Partial<Record<SkillId, number>>;
+  skillOutcomes: Partial<Record<SkillId, number>>;
+  specialization: string;
+}
+
+export interface University {
+  id: string;
+  name: string;
+  shortName: string;
+  type: "university" | "institute";
+  cityId: string;
+  bankId: string;
+  reputationBps: number;
+  teachingQualityBps: number;
+  programIds: string[];
+  studentPopulation: number;
+}
+
+export interface UniversityApplication {
+  id: string;
+  universityId: string;
+  programId: string;
+  submittedAtMonth: number;
+  scoreBps: number;
+  status: "admitted" | "rejected" | "enrolled";
+  reason: string;
+}
+
+export interface UniversityEnrollment {
+  universityId: string;
+  programId: string;
+  startedAtMonth: number;
+  completedMonths: number;
+  durationMonths: number;
+  nextTuitionMonth: number;
+  status: "active" | "completed" | "paused";
+}
+
+export interface HousingCohort {
+  id: string;
+  cityId: string;
+  type: "rental-apartment" | "owned-apartment" | "house" | "luxury-apartment" | "villa";
+  qualityBps: number;
+  averageSizeSqm: number;
+  totalUnits: number;
+  availableUnits: number;
+  monthlyRentCents: number;
+  salePriceCents: number;
+  constructionCostCents: number;
+  ownerSectorId: string;
+}
+
+export interface OwnershipRecord {
+  ownerId: string;
+  acquiredAtMonth: number;
+  priceCents: number;
+}
+
+export interface PropertyInstance {
+  id: string;
+  sourceCohortId: string;
+  cityId: string;
+  type: HousingCohort["type"];
+  sizeSqm: number;
+  qualityBps: number;
+  conditionBps: number;
+  purchasePriceCents: number;
+  currentValueCents: number;
+  ownerId: string;
+  tenantId: string | null;
+  monthlyRentCents: number;
+  maintenanceCents: number;
+  ownershipHistory: OwnershipRecord[];
+}
+
+export interface ProductDefinition {
+  id: string;
+  category: "phone" | "computer" | "furniture" | "car" | "watch";
+  name: string;
+  brand: string;
+  priceCents: number;
+  qualityBps: number;
+  durabilityMonths: number;
+  prestigeBps: number;
+  operatingCostCents: number;
+  energyEfficiencyBps: number;
+  originCountryId: string;
+  sellerId: string;
+}
+
+export interface DurableAsset {
+  id: string;
+  productId: string;
+  ownerId: string;
+  sellerId: string;
+  purchasedAtMonth: number;
+  purchasePriceCents: number;
+  ageMonths: number;
+  conditionBps: number;
+  maintenanceCents: number;
+  resaleValueCents: number;
+  ownershipHistory: OwnershipRecord[];
+}
+
+export interface PopulationCohort {
+  id: string;
+  countryId: string;
+  cityId: string;
+  bankId: string;
+  ageBand: "18-24" | "25-34" | "35-49" | "50-64" | "65+";
+  education: Person["educationLevel"];
+  occupationFamily: Occupation["family"];
+  incomeBand: "low" | "middle" | "high";
+  householdType: "single" | "couple" | "family";
+  populationCount: number;
+  employedCount: number;
+  averageMonthlyIncomeCents: number;
+  wealthDistribution: { medianCents: number; p90Cents: number };
+  skillDistribution: Record<SkillId, { mean: number; spread: number }>;
+  consumptionPreferencesBps: Record<ConsumptionCategory, number>;
+  housingDistributionBps: Record<string, number>;
+  bankingDistributionBps: Record<string, number>;
+  lastConsumptionCents: number;
+  lastIncomeCents: number;
+}
+
+export interface FirmCohort {
+  id: string;
+  cityId: string;
+  bankId: string;
+  industry: string;
+  sizeBucket: "micro" | "small" | "medium";
+  firmCount: number;
+  employment: number;
+  revenueCents: number;
+  capitalCents: number;
+  debtCents: number;
+  productionMilliUnits: number;
+  inventoryMilliUnits: number;
+  profitsCents: number;
+  productivityBps: number;
+}
+
+export interface FidelityState {
+  tierByEntityId: Record<string, 0 | 1 | 2 | 3>;
+  relevanceByEntityId: Record<string, number>;
+  materializedPersonIds: string[];
+  budgets: {
+    maxNamedPersons: number;
+    maxActivePersons: number;
+    maxFullCompanies: number;
+    maxActiveProperties: number;
+  };
+  activeCityIds: string[];
+}
+
+export interface WorldDiagnostics {
+  populationRepresented: number;
+  businessesRepresented: number;
+  highFidelityPersons: number;
+  materializedPersons: number;
+  explicitFirms: number;
+  firmCohorts: number;
+  materializedProperties: number;
+  housingUnitsRepresented: number;
+  ledgerHotTransactions: number;
+  ledgerArchivedTransactions: number;
+  estimatedSaveBytes: number;
+  deterministicWorkUnits: number;
+}
+
 export interface PlayerMonthlySnapshot {
   elapsedMonth: number;
   age: number;
@@ -403,7 +694,7 @@ export interface PlayerMonthlySnapshot {
 export interface PlayerTimelineEvent {
   id: string;
   elapsedMonth: number;
-  type: "identity" | "job" | "salary" | "course" | "skill";
+  type: "identity" | "job" | "salary" | "course" | "skill" | "education" | "travel" | "housing" | "asset";
   title: string;
   detail: string;
 }
@@ -411,7 +702,7 @@ export interface PlayerTimelineEvent {
 export interface PlayerCommandRecord {
   id: string;
   elapsedMonth: number;
-  type: "SET_PROFILE" | "APPLY_JOB" | "ACCEPT_JOB" | "RESIGN_JOB" | "ENROLL_COURSE" | "SET_SAVINGS";
+  type: "SET_PROFILE" | "APPLY_JOB" | "ACCEPT_JOB" | "RESIGN_JOB" | "ENROLL_COURSE" | "SET_SAVINGS" | "APPLY_UNIVERSITY" | "ENROLL_UNIVERSITY" | "START_TRAVEL" | "RELOCATE" | "RENT_PROPERTY" | "BUY_PROPERTY" | "BUY_DURABLE" | "SELL_DURABLE";
   payload: Record<string, string | number | boolean>;
 }
 
@@ -431,13 +722,25 @@ export interface PlayerState {
   commandLog: PlayerCommandRecord[];
   nextCommandId: number;
   nextTimelineId: number;
+  currentCityId: string;
+  residencePropertyId: string | null;
+  activeTravel: PlayerTravelPlan | null;
+  universityApplications: UniversityApplication[];
+  activeUniversityEnrollment: UniversityEnrollment | null;
+  completedProgramIds: string[];
+  educationHistory: Array<{ universityId: string; programId: string; startedAtMonth: number; completedAtMonth: number | null }>;
+  visitedCityIds: string[];
+  visitedCountryIds: string[];
+  residenceHistory: Array<{ cityId: string; fromMonth: number; toMonth: number | null }>;
+  durableAssetIds: string[];
+  propertyIds: string[];
 }
 
 export type SimulationScenario = "baseline" | "high-demand" | "supply-constraint" | "high-rates" | "bank-liquidity-stress";
 
 export interface WorldState {
-  schemaVersion: 2;
-  saveVersion: 2;
+  schemaVersion: 3;
+  saveVersion: 3;
   seed: string;
   scenario: SimulationScenario;
   clock: SimulationClock;
@@ -462,11 +765,28 @@ export interface WorldState {
   nextLoanId: number;
   nextFundingId: number;
   nextCompanyId: number;
+  countries: Country[];
+  cities: City[];
+  universities: University[];
+  universityPrograms: UniversityProgram[];
+  housingCohorts: HousingCohort[];
+  properties: PropertyInstance[];
+  products: ProductDefinition[];
+  durableAssets: DurableAsset[];
+  populationCohorts: PopulationCohort[];
+  firmCohorts: FirmCohort[];
+  fidelity: FidelityState;
+  ledgerArchives: LedgerArchiveSegment[];
+  diagnostics: WorldDiagnostics;
+  nextMaterializedPersonId: number;
+  nextPropertyId: number;
+  nextDurableAssetId: number;
+  nextApplicationId: number;
 }
 
 export interface InvariantResult {
   id: string;
-  section: "Национальные счета" | "Бухгалтерия" | "Товары" | "Деньги" | "Кредит" | "Ликвидность банков" | "Игрок";
+  section: "Национальные счета" | "Бухгалтерия" | "Товары" | "Деньги" | "Кредит" | "Ликвидность банков" | "Игрок" | "Население" | "География" | "Жильё" | "Образование" | "Производительность";
   title: string;
   ok: boolean;
   detail: string;

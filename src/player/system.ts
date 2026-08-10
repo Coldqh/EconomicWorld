@@ -45,8 +45,10 @@ export function playerNetWorthCents(world: WorldState): number {
 export function playerMonthCashFlow(world: WorldState, elapsedMonth = world.clock.elapsedMonths): { income: number; expenses: number } {
   let income = 0;
   let expenses = 0;
-  for (const transaction of world.ledger.transactions) {
-    if (transaction.elapsedMonth !== elapsedMonth) continue;
+  for (let index = world.ledger.transactions.length - 1; index >= 0; index -= 1) {
+    const transaction = world.ledger.transactions[index];
+    if (transaction.elapsedMonth < elapsedMonth) break;
+    if (transaction.elapsedMonth > elapsedMonth) continue;
     const entry = transaction.entries.find((item) => item.accountId === accountIds.deposit(world.player.householdId));
     if (!entry) continue;
     if (entry.side === "debit" && transaction.kind !== "LOAN_ISSUED" && transaction.kind !== "GENESIS") income += entry.amountCents;

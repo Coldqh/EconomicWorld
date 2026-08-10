@@ -27,7 +27,7 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const contracts = world.loans.filter((loan) => loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
   results.push(result("Кредит", "loan-mirror", "Кредитор, должник и договор совпадают", loanAssets === loanLiabilities && loanAssets === contracts, `Основной долг: ${(contracts / 100).toLocaleString("ru-RU")} ₽`, loanAssets - contracts));
 
-  const owners = [...world.households.map((item) => item.id), ...world.companies.map((item) => item.id), ...world.banks.map((item) => item.id), world.government.id, world.centralBank.id, "academy-provider"];
+  const owners = [...new Set(Object.values(world.ledger.accounts).map((account) => account.ownerId))];
   let brokenBook = "";
   let bookDifference = 0;
   for (const ownerId of owners) {
@@ -37,7 +37,7 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   }
   results.push(result("Бухгалтерия", "accounting-equation", "Балансовые уравнения выполняются", !brokenBook, brokenBook ? `Не сходится книга ${brokenBook}` : `${owners.length} книг прошли проверку`, bookDifference));
 
-  const monetaryOwners = [...world.households.map((item) => item.id), ...world.companies.map((item) => item.id), world.government.id, "academy-provider"];
+  const monetaryOwners = [...new Set(Object.values(world.ledger.accounts).filter((account) => account.category === "asset" && account.instrument === "deposit").map((account) => account.ownerId))];
   const negativeDeposits = monetaryOwners.filter((id) => balanceOf(world, accountIds.deposit(id)) < 0);
   results.push(result("Деньги", "non-negative-money", "Нет неразрешённого овердрафта", negativeDeposits.length === 0, negativeDeposits.length ? negativeDeposits.join(", ") : "Все депозитные счета неотрицательны"));
 
@@ -76,5 +76,29 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const tolerance = latest ? gdpReconciliationTolerance(latest) : 100;
   const gap = latest?.gdpReconciliationGapCents ?? 0;
   results.push(result("Национальные счета", "gdp-reconciliation", "ВВП согласован двумя методами", Math.abs(gap) <= tolerance, `Расхождение: ${(gap / 100).toLocaleString("ru-RU")} ₽`, gap));
+
+  const representedPopulation = world.populationCohorts.reduce((sum, cohort) => sum + cohort.populationCount, 0) + world.people.length;
+  const invalidPopulation = world.populationCohorts.find((cohort) => cohort.populationCount < 0 || cohort.employedCount < 0 || cohort.employedCount > cohort.populationCount);
+  results.push(result("Население", "population-cohorts", "Когорты населения согласованы", !invalidPopulation && representedPopulation >= 1_000_000, `${representedPopulation.toLocaleString("ru-RU")} жителей`));
+
+  const representedFirms = world.firmCohorts.reduce((sum, cohort) => sum + cohort.firmCount, 0) + world.companies.length;
+  results.push(result("Производительность", "firm-cohorts", "Агрегированные фирмы учтены", representedFirms >= 10_000 && world.firmCohorts.every((cohort) => cohort.firmCount >= 0 && cohort.inventoryMilliUnits >= 0), `${representedFirms.toLocaleString("ru-RU")} фирм`));
+
+  const brokenCity = world.cities.find((city) => !world.countries.some((country) => country.id === city.countryId) || city.costOfLivingCents <= 0 || city.population < 0);
+  const brokenCountry = world.countries.find((country) => country.cityIds.some((id) => !world.cities.some((city) => city.id === id)));
+  results.push(result("География", "world-references", "Страны и города связаны", !brokenCity && !brokenCountry && world.countries.length >= 10 && world.cities.length >= 30, `${world.countries.length} стран · ${world.cities.length} городов`));
+
+  const brokenHousing = world.housingCohorts.find((cohort) => cohort.availableUnits < 0 || cohort.availableUnits > cohort.totalUnits || cohort.monthlyRentCents <= 0 || cohort.salePriceCents <= 0);
+  const brokenProperty = world.properties.find((property) => !world.housingCohorts.some((cohort) => cohort.id === property.sourceCohortId) || !world.cities.some((city) => city.id === property.cityId));
+  results.push(result("Жильё", "housing-stock", "Жилищный фонд согласован", !brokenHousing && !brokenProperty, `${world.housingCohorts.reduce((sum, cohort) => sum + cohort.totalUnits, 0).toLocaleString("ru-RU")} объектов`));
+
+  const brokenProgram = world.universityPrograms.find((program) => !world.universities.some((university) => university.id === program.universityId) || program.occupiedSeats < 0 || program.occupiedSeats > program.capacity || program.durationMonths < 12);
+  const brokenUniversity = world.universities.find((university) => !world.cities.some((city) => city.id === university.cityId) || university.programIds.some((id) => !world.universityPrograms.some((program) => program.id === id)));
+  results.push(result("Образование", "universities", "Вузы, программы и места согласованы", !brokenProgram && !brokenUniversity, `${world.universities.length} вузов · ${world.universityPrograms.length} программ`));
+
+  const archiveIssue = world.ledgerArchives.find((archive) => archive.debitCents !== archive.creditCents);
+  const budgetIssue = world.fidelity.materializedPersonIds.length > world.fidelity.budgets.maxActivePersons;
+  results.push(result("Производительность", "fidelity-budget", "Уровни детализации укладываются в бюджет", !budgetIssue, `${world.fidelity.materializedPersonIds.length}/${world.fidelity.budgets.maxActivePersons} материализованных персон`));
+  results.push(result("Бухгалтерия", "ledger-archives", "Архивы реестра сбалансированы", !archiveIssue, `${world.ledgerArchives.length} архивных сегментов`));
   return results;
 }

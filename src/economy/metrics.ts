@@ -31,6 +31,26 @@ export function collectMetrics(world: WorldState): MetricPoint {
   const loanStockCents = world.loans.filter((loan) => loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
   const national = calculateNationalAccounts(world);
   const realGdpGrowthBps = previous?.realGdpCents ? Math.round(((national.realGdpCents - previous.realGdpCents) * 10_000) / previous.realGdpCents) : 0;
+  const marketShareBpsByCompany: Record<string, number> = {};
+  const marketConcentrationBpsByGood: Record<string, number> = {};
+  const priceElasticityBpsByGood: Record<string, number> = {};
+  for (const good of world.goods) {
+    const sellers = world.companies.filter((company) => company.active && company.goodId === good.id);
+    const totalSales = sellers.reduce((sum, company) => sum + company.lastSalesMilliUnits, 0);
+    let hhi = 0;
+    for (const company of sellers) {
+      const share = totalSales > 0 ? Math.round(company.lastSalesMilliUnits * 10_000 / totalSales) : Math.round(10_000 / Math.max(1, sellers.length));
+      marketShareBpsByCompany[company.id] = share;
+      company.marketShareBps = share;
+      hhi += share * share;
+    }
+    marketConcentrationBpsByGood[good.id] = Math.round(hhi / 10_000);
+    const oldPrice = previous?.priceByGoodCents[good.id] ?? priceByGoodCents[good.id];
+    const oldQuantity = previous?.salesByGoodMilliUnits[good.id] ?? salesByGoodMilliUnits[good.id];
+    const priceChangeBps = oldPrice ? Math.round((priceByGoodCents[good.id] - oldPrice) * 10_000 / oldPrice) : 0;
+    const quantityChangeBps = oldQuantity ? Math.round((salesByGoodMilliUnits[good.id] - oldQuantity) * 10_000 / oldQuantity) : 0;
+    priceElasticityBpsByGood[good.id] = priceChangeBps ? Math.min(50_000, Math.round(Math.abs(quantityChangeBps * 10_000 / priceChangeBps))) : 0;
+  }
   return {
     elapsedMonth: world.clock.elapsedMonths,
     nominalGdpCents: national.valueAddedCents,
@@ -66,6 +86,9 @@ export function collectMetrics(world: WorldState): MetricPoint {
       productionMilliUnits: company.lastProductionMilliUnits,
       salesMilliUnits: company.lastSalesMilliUnits,
     })),
+    marketConcentrationBpsByGood,
+    priceElasticityBpsByGood,
+    marketShareBpsByCompany,
   };
 }
 
