@@ -1,566 +1,217 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatSimulationDate } from "../core/clock.ts";
-import { depositOf, entityBook } from "../core/ledger.ts";
+import { accountIds, balanceOf, depositOf, entityBook } from "../core/ledger.ts";
+import { ACADEMY_COURSES } from "../education/catalog.ts";
 import { createWorld } from "../economy/create-world.ts";
 import { checkInvariants } from "../economy/invariants.ts";
 import { latestMetrics } from "../economy/metrics.ts";
 import { runMonths, stepMonth } from "../economy/simulation.ts";
 import { bankCapitalRatioBps } from "../finance/credit.ts";
-import type {
-  DomainEvent,
-  LedgerAccount,
-  LedgerTransaction,
-  MetricPoint,
-  WorldState,
-} from "../domain/model.ts";
+import { bankLiquidityRatioBps } from "../finance/liquidity.ts";
+import type { LedgerTransaction, MetricPoint, TransactionKind, WorldState } from "../domain/model.ts";
 import { SaveRepository, type SaveManifest } from "../persistence/save-repository.ts";
+import { acceptJobOffer, applyForJob, availableOccupations, enrollPlayerCourse, resignPlayerJob, setPlayerProfile, setPlayerSavingsTarget } from "../player/commands.ts";
+import { playerFinancialSummary, playerHousehold, playerPerson, SKILL_LABELS, tracePlayerMoney } from "../player/system.ts";
 import { BootSequence } from "./BootSequence.tsx";
-import {
-  BalanceVisual,
-  DeltaSparkline,
-  DistributionPlot,
-  LineAreaChart,
-  MarketBars,
-} from "./charts.tsx";
-import {
-  AnimatedChartContainer,
-  AnimatedNumber,
-  DataPulse,
-  LiveIndicator,
-  PageTransition,
-  Reveal,
-  SimulationTransition,
-  Stagger,
-} from "./motion.tsx";
+import { DeltaSparkline, LineAreaChart, MarketBars } from "./charts.tsx";
 
-type View = "overview" | "economy" | "institutions" | "ledger" | "diagnostics";
-type Tone = "neutral" | "positive" | "attention" | "info";
+type View = "life" | "career" | "academy" | "finances" | "economy" | "banks" | "ledger" | "control";
 
-const NAV_ITEMS: Array<{ id: View; label: string; short: string; mark: string }> = [
-  { id: "overview", label: "Пульт мира", short: "Мир", mark: "01" },
-  { id: "economy", label: "Реальная экономика", short: "Рынки", mark: "02" },
-  { id: "institutions", label: "Агенты и банки", short: "Агенты", mark: "03" },
-  { id: "ledger", label: "Global Ledger", short: "Ledger", mark: "04" },
-  { id: "diagnostics", label: "Диагностика", short: "Контроль", mark: "05" },
+const NAV: Array<{ id: View; label: string; short: string }> = [
+  { id: "life", label: "Моя жизнь", short: "Жизнь" },
+  { id: "career", label: "Карьера", short: "Карьера" },
+  { id: "academy", label: "Академия", short: "Учёба" },
+  { id: "finances", label: "Мои финансы", short: "Финансы" },
+  { id: "economy", label: "Экономика", short: "Экономика" },
+  { id: "banks", label: "Банки", short: "Банки" },
+  { id: "ledger", label: "Общий реестр", short: "Реестр" },
+  { id: "control", label: "Контроль", short: "Контроль" },
 ];
 
-const money = new Intl.NumberFormat("ru-RU", {
-  style: "currency",
-  currency: "RUB",
-  maximumFractionDigits: 0,
-});
+const TX_LABELS: Record<TransactionKind, string> = {
+  GENESIS: "Начальный баланс", TRANSFER: "Перевод", WAGE: "Зарплата", INCOME_TAX: "Налог на доход", SALES_TAX: "Налог с продаж", CORPORATE_TAX: "Налог на прибыль", SOCIAL_TRANSFER: "Социальная выплата", GOODS_CLEARING: "Покупка товара", INPUT_PURCHASE: "Закупка сырья", CAPITAL_CONTRIBUTION: "Вклад в капитал", LOAN_ISSUED: "Выдача кредита", LOAN_INTEREST: "Проценты по кредиту", LOAN_PRINCIPAL: "Погашение кредита", LOAN_DEFAULT: "Дефолт", INVENTORY_SEED: "Начальные запасы", INVENTORY_TRANSFER: "Передача запасов", COGS: "Себестоимость продаж", PRODUCTION: "Производство", DEPRECIATION: "Амортизация", CAPITAL_INVESTMENT: "Капитальные вложения", ACCOUNTING_CLOSE: "Закрытие периода", INTERBANK_LOAN: "Межбанковский кредит", CENTRAL_BANK_FACILITY: "Кредит центрального банка", EDUCATION: "Оплата обучения",
+};
+
+const rubles = new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB", maximumFractionDigits: 0 });
 const number = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 });
-
-function formatMoney(cents: number): string {
-  return money.format(cents / 100);
-}
-
-function compactMoney(cents: number): string {
-  const rubles = cents / 100;
-  if (Math.abs(rubles) >= 1_000_000_000) return `${number.format(rubles / 1_000_000_000)} млрд ₽`;
-  if (Math.abs(rubles) >= 1_000_000) return `${number.format(rubles / 1_000_000)} млн ₽`;
-  if (Math.abs(rubles) >= 1_000) return `${number.format(rubles / 1_000)} тыс. ₽`;
-  return formatMoney(cents);
-}
-
-function percent(bps: number): string {
-  return `${(bps / 100).toFixed(1)}%`;
-}
-
-function deltaPercent(current: number, previous: number): string {
-  if (!previous) return "—";
-  const delta = ((current - previous) / Math.abs(previous)) * 100;
-  return `${delta >= 0 ? "+" : ""}${delta.toFixed(1)}%`;
-}
-
-function monthLabel(point: MetricPoint): string {
-  return `M${point.elapsedMonth + 1}`;
-}
-
-function Kpi({
-  label,
-  value,
-  format,
-  meta,
-  tone = "neutral",
-  history,
-  why,
-}: {
-  label: string;
-  value: number;
-  format: (value: number) => string;
-  meta: string;
-  tone?: Tone;
-  history: number[];
-  why: string;
-}) {
-  return (
-    <article className={`kpi kpi-${tone}`}>
-      <header><span>{label}</span><WhyDisclosure text={why} /></header>
-      <DataPulse value={value}><AnimatedNumber className="kpi-value" value={value} format={format} /></DataPulse>
-      <footer><span>{meta}</span><DeltaSparkline values={history} accent={tone === "attention" ? "amber" : tone === "info" ? "cyan" : "mint"} ariaLabel={`Динамика: ${label}`} /></footer>
-    </article>
-  );
-}
-
-function WhyDisclosure({ text }: { text: string }) {
-  return (
-    <details className="why-disclosure">
-      <summary>WHY?</summary>
-      <div>{text}</div>
-    </details>
-  );
-}
-
-function EventItem({ event, world }: { event: DomainEvent; world: WorldState }) {
-  const actors = event.actorIds.map((id) => entityLabel(world, id)).join(" · ");
-  return (
-    <details className={`event-item severity-${event.severity}`}>
-      <summary>
-        <span className="event-dot" />
-        <span><b>{event.title}</b><small>{event.type} · M{event.elapsedMonth + 1}</small></span>
-        <i>+</i>
-      </summary>
-      <div className="event-detail">
-        <p>{event.detail}</p>
-        {actors && <span>ENTITY · {actors}</span>}
-        {event.causeIds.length > 0 && <span>CAUSE · {event.causeIds.join(", ")}</span>}
-      </div>
-    </details>
-  );
-}
+const money = (cents: number) => rubles.format(cents / 100);
+const compactMoney = (cents: number) => {
+  const value = cents / 100;
+  if (Math.abs(value) >= 1_000_000_000) return `${number.format(value / 1_000_000_000)} млрд ₽`;
+  if (Math.abs(value) >= 1_000_000) return `${number.format(value / 1_000_000)} млн ₽`;
+  if (Math.abs(value) >= 1_000) return `${number.format(value / 1_000)} тыс. ₽`;
+  return money(cents);
+};
+const percent = (bps: number) => `${(bps / 100).toFixed(1)}%`;
+const monthLabel = (point: MetricPoint) => `${point.elapsedMonth + 1}м`;
 
 function entityLabel(world: WorldState, id: string): string {
-  return world.households.find((item) => item.id === id)?.displayName
+  return world.people.find((item) => item.id === id)?.displayName
+    ?? world.households.find((item) => item.id === id)?.displayName
     ?? world.companies.find((item) => item.id === id)?.name
     ?? world.banks.find((item) => item.id === id)?.name
-    ?? (id === world.government.id ? "Правительство" : undefined)
-    ?? (id === world.centralBank.id ? world.centralBank.name : undefined)
-    ?? (id === "goods-market" ? "Товарный рынок" : id);
+    ?? (id === world.government.id ? "Правительство" : id === world.centralBank.id ? world.centralBank.name : id === "academy-provider" ? "Академия" : id);
 }
 
-function Overview({ world, metrics, running }: { world: WorldState; metrics: MetricPoint; running: boolean }) {
+function Section({ title, meta }: { title: string; meta?: string }) {
+  return <header className="section-heading"><h1>{title}</h1>{meta && <span>{meta}</span>}</header>;
+}
+
+function WhyButton({ title, text, open }: { title: string; text: string; open: (title: string, text: string) => void }) {
+  return <button className="why-button" type="button" onClick={() => open(title, text)}>Почему?</button>;
+}
+
+function WhyModal({ value, close }: { value: { title: string; text: string } | null; close: () => void }) {
+  useEffect(() => {
+    if (!value) return;
+    const handler = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [value, close]);
+  if (!value) return null;
+  return <div className="modal-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><section className="why-modal" role="dialog" aria-modal="true" aria-labelledby="why-title"><header><h2 id="why-title">{value.title}</h2><button onClick={close} aria-label="Закрыть">×</button></header><p>{value.text}</p><button className="primary" onClick={close}>Понятно</button></section></div>;
+}
+
+function Kpi({ label, value, note, values, why, open }: { label: string; value: string; note?: string; values?: number[]; why?: string; open: (title: string, text: string) => void }) {
+  return <article className="kpi"><header><span>{label}</span>{why && <WhyButton title={label} text={why} open={open} />}</header><strong>{value}</strong><footer><small>{note ?? ""}</small>{values && <DeltaSparkline values={values} accent="mint" ariaLabel={`Динамика: ${label}`} />}</footer></article>;
+}
+
+function MyLife({ world, openWhy }: { world: WorldState; openWhy: (title: string, text: string) => void }) {
+  const summary = playerFinancialSummary(world);
+  const person = playerPerson(world);
+  const household = playerHousehold(world);
+  const company = world.companies.find((item) => item.id === household.employerId);
+  const occupation = world.occupations.find((item) => item.id === person.occupationId);
+  const history = world.player.monthlyHistory.slice(-24);
+  return <>
+    <Section title="Моя жизнь" meta={`${summary.age} лет · ${formatSimulationDate(world.clock)}`} />
+    <section className="hero-state"><div><span>Текущий статус</span><h2>{occupation?.name ?? "Ищу работу"}</h2><p>{company?.name ?? "Нет работодателя"}</p></div><div className="hero-balance"><span>Капитал</span><strong>{compactMoney(summary.netWorthCents)}</strong></div></section>
+    <section className="kpi-grid four"><Kpi label="Деньги" value={compactMoney(summary.depositsCents)} note="На банковском счёте" values={history.map((item) => item.netWorthCents)} open={openWhy} why="Остаток на депозитном счёте вашего домохозяйства. Каждое изменение можно найти в общем реестре." /><Kpi label="Доход за месяц" value={compactMoney(summary.incomeCents)} note={company?.name ?? "Нет зарплаты"} open={openWhy} /><Kpi label="Расходы за месяц" value={compactMoney(summary.expensesCents)} note={`Цель накоплений ${percent(world.player.savingsTargetBps)}`} open={openWhy} /><Kpi label="Долг" value={compactMoney(summary.debtCents)} note={summary.debtCents ? "Есть обязательства" : "Нет кредитов"} open={openWhy} /></section>
+    <section className="two-column"><article className="panel"><header className="panel-title"><h2>Капитал по месяцам</h2><WhyButton title="Капитал" text="Активы вашего домохозяйства за вычетом обязательств. Доход сам по себе не равен росту капитала: часть денег расходуется." open={openWhy} /></header><LineAreaChart values={history.map((item) => item.netWorthCents)} labels={history.map((item) => `${item.elapsedMonth + 1}м`)} format={compactMoney} ariaLabel="Капитал игрока" /></article><article className="panel"><header className="panel-title"><h2>История</h2><span>{world.player.timeline.length}</span></header><div className="timeline">{world.player.timeline.slice(-8).reverse().map((item) => <div key={item.id}><i /><span><b>{item.title}</b><small>{item.detail} · {item.elapsedMonth + 1}м</small></span></div>)}{!world.player.timeline.length && <p className="empty">События появятся после первого решения.</p>}</div></article></section>
+  </>;
+}
+
+function Career({ world, commit, notify, openWhy }: { world: WorldState; commit: () => void; notify: (text: string) => void; openWhy: (title: string, text: string) => void }) {
+  const person = playerPerson(world);
+  const household = playerHousehold(world);
+  const employer = world.companies.find((item) => item.id === household.employerId);
+  const occupation = world.occupations.find((item) => item.id === person.occupationId);
+  const vacancies = world.companies.filter((item) => item.active).flatMap((company) => availableOccupations(world, company.id).slice(0, 2).map((job) => ({ company, job })));
+  const apply = (companyId: string, occupationId: string) => { const answer = applyForJob(world, companyId, occupationId); commit(); notify(answer.reason); };
+  return <><Section title="Карьера" meta={employer ? `${occupation?.name} · ${employer.name}` : "Доступен поиск работы"} />
+    <section className="career-current panel"><div><span>Трудовой статус</span><h2>{occupation?.name ?? "Без работы"}</h2><p>{employer ? `${employer.name} · ${money(employer.wageCents)} в месяц` : "Выберите вакансию и отправьте заявку."}</p></div>{employer && <button className="danger" onClick={() => { resignPlayerJob(world); commit(); notify("Трудовой договор завершён"); }}>Уволиться</button>}{world.player.pendingJobOffer && <button className="primary" onClick={() => { const ok = acceptJobOffer(world); commit(); notify(ok ? "Предложение принято" : "Предложение недоступно"); }}>Принять предложение</button>}</section>
+    <article className="panel"><header className="panel-title"><h2>Вакансии</h2><WhyButton title="Решение работодателя" text="Работодатель проверяет навыки, практический опыт, конкуренцию кандидатов и способность компании платить зарплату. Результат не определяется опытом или случайным числом." open={openWhy} /></header><div className="responsive-table"><table><thead><tr><th>Должность</th><th>Компания</th><th>Зарплата</th><th>Ключевые навыки</th><th /></tr></thead><tbody>{vacancies.map(({ company, job }) => <tr key={`${company.id}-${job.id}`}><td><b>{job.name}</b><small>Уровень {job.level}</small></td><td>{company.name}</td><td>{money(Math.round(company.wageCents * (0.88 + job.level * 0.11)))}</td><td>{Object.keys(job.requiredSkills).map((skill) => SKILL_LABELS[skill as keyof typeof SKILL_LABELS]).join(", ")}</td><td><button disabled={Boolean(household.employerId)} onClick={() => apply(company.id, job.id)}>Подать заявку</button></td></tr>)}</tbody></table></div></article>
+    <article className="panel skills-panel"><header className="panel-title"><h2>Навыки</h2><span>0–100</span></header><div className="skill-grid">{Object.entries(person.skills).map(([id, value]) => <div key={id}><span>{SKILL_LABELS[id as keyof typeof SKILL_LABELS]}</span><strong>{number.format(value / 100)}</strong><i><b style={{ width: `${Math.min(100, value / 100)}%` }} /></i></div>)}</div></article>
+  </>;
+}
+
+function AcademyLab({ world }: { world: WorldState }) {
+  const [revenue, setRevenue] = useState(100);
+  const [costs, setCosts] = useState(70);
+  const profit = revenue - costs;
+  const latest = latestMetrics(world);
+  return <article className="panel lab"><header className="panel-title"><h2>Лаборатория: прибыль</h2><span>Данные мира: инфляция {percent(latest.annualInflationBps)}</span></header><label>Выручка<input type="range" min="0" max="200" value={revenue} onChange={(event) => setRevenue(Number(event.target.value))} /><b>{revenue}</b></label><label>Расходы<input type="range" min="0" max="200" value={costs} onChange={(event) => setCosts(Number(event.target.value))} /><b>{costs}</b></label><div className="lab-result"><span>Прибыль</span><strong className={profit < 0 ? "negative" : "positive"}>{profit}</strong></div></article>;
+}
+
+function Academy({ world, commit, notify, openWhy }: { world: WorldState; commit: () => void; notify: (text: string) => void; openWhy: (title: string, text: string) => void }) {
+  return <><Section title="Академия" meta={`${world.player.completedCourseIds.length}/${ACADEMY_COURSES.length} курсов`} /><section className="course-grid">{ACADEMY_COURSES.map((course) => {
+    const done = world.player.completedCourseIds.includes(course.id);
+    const active = world.player.activeEnrollment?.courseId === course.id;
+    const blocked = course.prerequisiteCourseIds.some((id) => !world.player.completedCourseIds.includes(id));
+    return <article className={`panel course ${active ? "active" : ""}`} key={course.id}><header><span>{done ? "Завершён" : active ? "Изучается" : `${course.durationMonths} мес.`}</span><h2>{course.title}</h2></header><dl><div><dt>Стоимость</dt><dd>{money(course.costCents)}</dd></div><div><dt>Уроков</dt><dd>{course.lessons.length}</dd></div></dl><ul>{course.lessons.map((lesson) => <li key={lesson.id}>{lesson.title}</li>)}</ul><footer><WhyButton title={course.title} text={course.lessons.map((lesson) => lesson.summary).join(" ")} open={openWhy} /><button disabled={done || active || blocked || Boolean(world.player.activeEnrollment)} onClick={() => { const answer = enrollPlayerCourse(world, course.id); commit(); notify(answer.reason); }}>{done ? "Пройден" : active ? `${world.player.activeEnrollment?.completedMonths}/${course.durationMonths} мес.` : blocked ? "Нужен предыдущий курс" : "Начать курс"}</button></footer></article>;
+  })}</section><AcademyLab world={world} /></>;
+}
+
+function MyFinances({ world, commit, openWhy }: { world: WorldState; commit: () => void; openWhy: (title: string, text: string) => void }) {
+  const summary = playerFinancialSummary(world);
+  const transactions = tracePlayerMoney(world);
+  const history = world.player.monthlyHistory.slice(-24);
+  return <><Section title="Мои финансы" meta={`Счёт в ${world.banks.find((item) => item.id === playerHousehold(world).bankId)?.name}`} /><section className="kpi-grid four"><Kpi label="Доход" value={compactMoney(summary.incomeCents)} note="Последний месяц" values={history.map((item) => item.incomeCents)} open={openWhy} /><Kpi label="Расходы" value={compactMoney(summary.expensesCents)} note="Последний месяц" values={history.map((item) => item.expensesCents)} open={openWhy} /><Kpi label="Сбережения" value={compactMoney(summary.savingsCents)} note={percent(summary.savingsRateBps)} values={history.map((item) => item.savingsCents)} open={openWhy} why="Доход минус фактические списания с депозитного счёта за месяц." /><Kpi label="Чистый капитал" value={compactMoney(summary.netWorthCents)} note={`Долг ${compactMoney(summary.debtCents)}`} values={history.map((item) => item.netWorthCents)} open={openWhy} /></section><article className="panel savings-control"><div><h2>Цель накоплений</h2><p>Определяет долю дохода, которую домохозяйство старается не тратить.</p></div><label><input type="range" min="500" max="8000" step="100" value={world.player.savingsTargetBps} onChange={(event) => { setPlayerSavingsTarget(world, Number(event.target.value)); commit(); }} /><strong>{percent(world.player.savingsTargetBps)}</strong></label></article><article className="panel"><header className="panel-title"><h2>Операции по счёту</h2><WhyButton title="Источник данных" text="Список собран из двойных проводок общего реестра. Здесь нет отдельного игрового кошелька или искусственного баланса." open={openWhy} /></header><TransactionRows transactions={transactions.slice(0, 40)} /></article></>;
+}
+
+function Economy({ world, openWhy }: { world: WorldState; openWhy: (title: string, text: string) => void }) {
+  const metrics = latestMetrics(world);
   const history = world.metricsHistory.slice(-36);
-  const previous = history.at(-2) ?? metrics;
-  const events = world.events
-    .filter((event) => event.type !== "MonthClosed" && event.type !== "EmployeeHired")
-    .slice(-8)
-    .reverse();
-  const latestEvents = events.length ? events : world.events.slice(-8).reverse();
-
-  return (
-    <>
-      <section className="world-status-bar">
-        <div><LiveIndicator running={running} /><span>SEED {world.seed}</span></div>
-        <div><span>{world.households.length} HOUSEHOLDS</span><span>{metrics.activeCompanies} FIRMS</span><span>{world.banks.length} BANKS</span><span>{world.ledger.transactions.length.toLocaleString("ru-RU")} TX</span></div>
-      </section>
-
-      <section className="kpi-grid">
-        <Kpi label="GDP / MONTH" value={metrics.nominalGdpCents} format={compactMoney} meta={deltaPercent(metrics.nominalGdpCents, previous.nominalGdpCents)} tone="positive" history={history.map((item) => item.nominalGdpCents)} why="Сумма фактической выручки компаний за последний закрытый месяц." />
-        <Kpi label="INFLATION / Y" value={metrics.annualInflationBps} format={percent} meta={`CPI ${number.format(metrics.cpiBps / 100)}`} tone={metrics.annualInflationBps > 550 ? "attention" : "neutral"} history={history.map((item) => item.annualInflationBps)} why="Изменение взвешенного индекса фактических цен к уровню 12 месяцев назад." />
-        <Kpi label="UNEMPLOYMENT" value={metrics.unemploymentBps} format={percent} meta={`${metrics.employedHouseholds}/${world.households.length} employed`} tone={metrics.unemploymentBps > 1500 ? "attention" : "info"} history={history.map((item) => item.unemploymentBps)} why="Доля домохозяйств без действующей связи с работодателем." />
-        <Kpi label="DEPOSIT MONEY" value={metrics.depositMoneyCents} format={compactMoney} meta={`LOANS ${compactMoney(metrics.loanStockCents)}`} history={history.map((item) => item.depositMoneyCents)} why="Сумма клиентских депозитных активов, зеркально отражённых в обязательствах банков." />
-      </section>
-
-      <section className="dashboard-grid">
-        <Reveal>
-          <article className="panel pulse-panel">
-            <header className="panel-header">
-              <div><span className="eyebrow">ECONOMIC PULSE</span><h1>GDP</h1></div>
-              <div className="panel-metric"><span>LAST MONTH</span><strong>{compactMoney(metrics.nominalGdpCents)}</strong></div>
-            </header>
-            <AnimatedChartContainer>
-              <LineAreaChart values={history.map((item) => item.nominalGdpCents)} labels={history.map(monthLabel)} format={compactMoney} ariaLabel="ВВП по месяцам" />
-            </AnimatedChartContainer>
-            <div className="signal-grid">
-              <Signal label="EMPLOYMENT" value={percent(10_000 - metrics.unemploymentBps)} values={history.map((item) => 10_000 - item.unemploymentBps)} accent="cyan" />
-              <Signal label="LOAN BOOK" value={compactMoney(metrics.loanStockCents)} values={history.map((item) => item.loanStockCents)} accent="amber" />
-              <Signal label="MONEY" value={compactMoney(metrics.depositMoneyCents)} values={history.map((item) => item.depositMoneyCents)} accent="violet" />
-            </div>
-          </article>
-        </Reveal>
-
-        <Reveal delay={80}>
-          <article className="panel causal-panel">
-            <header className="panel-header"><div><span className="eyebrow">CAUSAL FEED</span><h2>EVENTS</h2></div><span className="count-badge">{world.events.length}</span></header>
-            <div className="event-list">
-              {latestEvents.map((event) => <EventItem key={event.id} event={event} world={world} />)}
-            </div>
-          </article>
-        </Reveal>
-      </section>
-    </>
-  );
+  return <><Section title="Экономика" meta={`${world.households.length} домохозяйств · ${metrics.activeCompanies} компаний`} /><section className="kpi-grid four"><Kpi label="ВВП" value={compactMoney(metrics.nominalGdpCents)} note={`Реальный ${compactMoney(metrics.realGdpCents)}`} values={history.map((item) => item.nominalGdpCents)} open={openWhy} why="ВВП по добавленной стоимости: выпуск компаний за вычетом промежуточного потребления. Он сверяется с потреблением, инвестициями, госрасходами и изменением запасов." /><Kpi label="Инфляция" value={percent(metrics.annualInflationBps)} note={`ИПЦ ${number.format(metrics.cpiBps / 100)}`} values={history.map((item) => item.annualInflationBps)} open={openWhy} /><Kpi label="Безработица" value={percent(metrics.unemploymentBps)} note={`${metrics.employedHouseholds} заняты`} values={history.map((item) => item.unemploymentBps)} open={openWhy} /><Kpi label="Ключевая ставка" value={percent(metrics.policyRateBps)} note={`Цель инфляции ${percent(world.centralBank.inflationTargetBps)}`} values={history.map((item) => item.policyRateBps)} open={openWhy} /></section><section className="two-column"><article className="panel"><header className="panel-title"><h2>Номинальный ВВП</h2><span>По месяцам</span></header><LineAreaChart values={history.map((item) => item.nominalGdpCents)} labels={history.map(monthLabel)} format={compactMoney} ariaLabel="Номинальный ВВП" /></article><article className="panel national-accounts"><header className="panel-title"><h2>Использование ВВП</h2><WhyButton title="Сверка ВВП" text={`Метод добавленной стоимости и метод расходов расходятся на ${money(metrics.gdpReconciliationGapCents)}.`} open={openWhy} /></header><dl><div><dt>Потребление</dt><dd>{compactMoney(metrics.householdConsumptionCents)}</dd></div><div><dt>Инвестиции</dt><dd>{compactMoney(metrics.capitalFormationCents)}</dd></div><div><dt>Государство</dt><dd>{compactMoney(metrics.governmentConsumptionCents)}</dd></div><div><dt>Запасы</dt><dd>{compactMoney(metrics.inventoryChangeCents)}</dd></div><div className="total"><dt>ВВП</dt><dd>{compactMoney(metrics.gdpExpenditureCents)}</dd></div></dl></article></section><section className="market-grid">{world.goods.map((good) => { const producers = world.companies.filter((company) => company.active && company.goodId === good.id); const inventory = producers.reduce((sum, company) => sum + company.inventoryMilliUnits, 0); return <article className="market-card" key={good.id}><header><h2>{good.shortName}</h2><strong>{money(metrics.priceByGoodCents[good.id])}</strong></header><MarketBars production={metrics.productionByGoodMilliUnits[good.id]} sales={metrics.salesByGoodMilliUnits[good.id]} /><dl><div><dt>Производство</dt><dd>{number.format(metrics.productionByGoodMilliUnits[good.id] / 1_000)}</dd></div><div><dt>Продажи</dt><dd>{number.format(metrics.salesByGoodMilliUnits[good.id] / 1_000)}</dd></div><div><dt>Запасы</dt><dd>{number.format(inventory / 1_000)}</dd></div></dl></article>; })}</section><CompanyTable world={world} /></>;
 }
 
-function Signal({ label, value, values, accent }: { label: string; value: string; values: number[]; accent: "cyan" | "amber" | "violet" }) {
-  return (
-    <div className="signal">
-      <span>{label}</span><strong>{value}</strong>
-      <DeltaSparkline values={values} accent={accent} ariaLabel={`Динамика ${label}`} />
-    </div>
-  );
+function CompanyTable({ world }: { world: WorldState }) {
+  return <article className="panel"><header className="panel-title"><h2>Компании</h2><span>{world.companies.filter((item) => item.active).length} работают</span></header><div className="responsive-table"><table><thead><tr><th>Компания</th><th>Рынок</th><th>Статус</th><th>Штат</th><th>Деньги</th><th>Выручка</th><th>Прибыль</th></tr></thead><tbody>{world.companies.map((company) => { const report = company.financialReports.at(-1); return <tr key={company.id}><td><b>{company.name}</b><small>{company.id}</small></td><td>{world.goods.find((item) => item.id === company.goodId)?.shortName}</td><td><span className={`pill ${company.active && !company.distressMonths ? "ok" : "warn"}`}>{company.active ? company.distressMonths ? "Риск" : "Работает" : "Закрыта"}</span></td><td>{company.employees.length}</td><td>{compactMoney(depositOf(world, company.id))}</td><td>{compactMoney(company.lastGrossRevenueCents)}</td><td>{compactMoney(report?.netIncomeCents ?? 0)}</td></tr>; })}</tbody></table></div></article>;
 }
 
-function Economy({ world, metrics }: { world: WorldState; metrics: MetricPoint }) {
-  const history = world.metricsHistory.slice(-36);
-  const production = Object.values(metrics.productionByGoodMilliUnits).reduce((sum, value) => sum + value, 0);
-  const sales = Object.values(metrics.salesByGoodMilliUnits).reduce((sum, value) => sum + value, 0);
-  const inventories = world.companies.reduce((sum, company) => sum + company.inventoryMilliUnits, 0);
-
-  return (
-    <>
-      <SectionTitle index="02" title="REAL ECONOMY" stats={[`${world.goods.length} MARKETS`, `${metrics.activeCompanies} ACTIVE FIRMS`]} />
-      <section className="economy-strip">
-        <CompactMetric label="GDP" value={compactMoney(metrics.nominalGdpCents)} />
-        <CompactMetric label="PRODUCTION" value={number.format(production / 1_000)} />
-        <CompactMetric label="CONSUMPTION" value={number.format(sales / 1_000)} />
-        <CompactMetric label="EMPLOYMENT" value={percent(10_000 - metrics.unemploymentBps)} />
-        <CompactMetric label="INVENTORIES" value={number.format(inventories / 1_000)} />
-        <CompactMetric label="PRICES / CPI" value={number.format(metrics.cpiBps / 100)} />
-      </section>
-
-      <section className="economy-charts">
-        <article className="panel compact-chart">
-          <header className="panel-header"><div><span className="eyebrow">OUTPUT</span><h2>GDP</h2></div><WhyDisclosure text="Фактические продажи компаний; наведите курсор для значения конкретного месяца." /></header>
-          <LineAreaChart values={history.map((item) => item.nominalGdpCents)} labels={history.map(monthLabel)} format={compactMoney} ariaLabel="Выпуск экономики" />
-        </article>
-        <article className="panel compact-chart">
-          <header className="panel-header"><div><span className="eyebrow">LABOR</span><h2>EMPLOYMENT</h2></div><WhyDisclosure text="Доля домохозяйств с действующим работодателем." /></header>
-          <LineAreaChart values={history.map((item) => 10_000 - item.unemploymentBps)} labels={history.map(monthLabel)} format={percent} accent="cyan" ariaLabel="Занятость" />
-        </article>
-      </section>
-
-      <section className="goods-grid">
-        {world.goods.map((good, index) => {
-          const producers = world.companies.filter((company) => company.active && company.goodId === good.id);
-          const inventory = producers.reduce((sum, company) => sum + company.inventoryMilliUnits, 0);
-          const output = metrics.productionByGoodMilliUnits[good.id] ?? 0;
-          const sold = metrics.salesByGoodMilliUnits[good.id] ?? 0;
-          return (
-            <Stagger key={good.id} index={index}>
-              <article className="good-card">
-                <header><span>{String(index + 1).padStart(2, "0")}</span><b>{good.shortName}</b></header>
-                <AnimatedNumber className="good-price" value={metrics.priceByGoodCents[good.id] ?? good.basePriceCents} format={formatMoney} />
-                <MarketBars production={output} sales={sold} />
-                <dl><div><dt>Production</dt><dd>{number.format(output / 1_000)}</dd></div><div><dt>Sales</dt><dd>{number.format(sold / 1_000)}</dd></div><div><dt>Inventory</dt><dd>{number.format(inventory / 1_000)}</dd></div></dl>
-                <WhyDisclosure text={Object.keys(good.recipe).length ? `Inputs: ${Object.keys(good.recipe).map((id) => world.goods.find((item) => item.id === id)?.shortName).join(" + ")} + labor.` : "Input: skilled labor."} />
-              </article>
-            </Stagger>
-          );
-        })}
-      </section>
-
-      <CompanyTable world={world} metrics={metrics} />
-    </>
-  );
-}
-
-function CompactMetric({ label, value }: { label: string; value: string }) {
-  return <div><span>{label}</span><strong>{value}</strong></div>;
-}
-
-function SectionTitle({ index, title, stats }: { index: string; title: string; stats: string[] }) {
-  return (
-    <section className="section-title">
-      <div><span>{index}</span><h1>{title}</h1></div>
-      <div>{stats.map((stat) => <span key={stat}>{stat}</span>)}</div>
-    </section>
-  );
-}
-
-function CompanyTable({ world, metrics }: { world: WorldState; metrics: MetricPoint }) {
-  return (
-    <article className="panel table-panel">
-      <header className="panel-header"><div><span className="eyebrow">FIRMS</span><h2>OPERATIONS</h2></div><span className="data-badge">{metrics.activeCompanies} ACTIVE</span></header>
-      <div className="responsive-table">
-        <table>
-          <thead><tr><th>Компания</th><th>Рынок</th><th>Статус</th><th>Штат</th><th>Депозит</th><th>Долг</th><th>Продажи</th><th>Запас</th></tr></thead>
-          <tbody>
-            {world.companies.map((company) => {
-              const debt = world.loans.filter((loan) => loan.borrowerId === company.id && loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
-              return (
-                <tr key={company.id} className={!company.active ? "row-muted" : undefined}>
-                  <td><strong>{company.name}</strong><small>{company.id}</small></td>
-                  <td>{world.goods.find((good) => good.id === company.goodId)?.shortName}</td>
-                  <td><span className={`status-pill ${company.active ? company.distressMonths ? "status-warn" : "status-ok" : "status-off"}`}>{company.active ? company.distressMonths ? "PRESSURE" : "ACTIVE" : "CLOSED"}</span></td>
-                  <td>{company.employees.length}</td><td>{compactMoney(depositOf(world, company.id))}</td><td>{compactMoney(debt)}</td><td>{number.format(company.lastSalesMilliUnits / 1_000)}</td><td>{number.format(company.inventoryMilliUnits / 1_000)}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </article>
-  );
-}
-
-function accountTotal(world: WorldState, ownerId: string, predicate: (account: LedgerAccount) => boolean): number {
-  return Object.values(world.ledger.accounts).filter((account) => account.ownerId === ownerId && predicate(account)).reduce((sum, account) => sum + (world.ledger.balances[account.id] ?? 0), 0);
-}
-
-function Institutions({ world, metrics }: { world: WorldState; metrics: MetricPoint }) {
-  const [selectedBankId, setSelectedBankId] = useState(world.banks[0]?.id ?? "");
-  const governmentBook = entityBook(world, world.government.id);
-  const selectedLoans = world.loans.filter((loan) => loan.lenderBankId === selectedBankId && loan.status === "active");
-  const deposits = world.households.map((household) => depositOf(world, household.id));
-
-  return (
-    <>
-      <SectionTitle index="03" title="BANKS / AGENTS" stats={[`${world.banks.length} BANKS`, `${world.loans.filter((loan) => loan.status === "active").length} ACTIVE LOANS`]} />
-      <section className="institution-grid">
-        {world.banks.map((bank) => {
-          const book = entityBook(world, bank.id);
-          const liquidity = accountTotal(world, bank.id, (account) => account.category === "asset" && account.instrument === "reserve");
-          const depositsTotal = accountTotal(world, bank.id, (account) => account.category === "liability" && account.instrument === "deposit");
-          const loanBook = world.loans.filter((loan) => loan.lenderBankId === bank.id && loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
-          return (
-            <article className={`panel institution-card ${selectedBankId === bank.id ? "selected" : ""}`} key={bank.id} onClick={() => setSelectedBankId(bank.id)}>
-              <header><div><span className="eyebrow">BANK · {bank.id}</span><h2>{bank.name}</h2></div><span className={bankCapitalRatioBps(world, bank.id) >= bank.minimumCapitalRatioBps ? "health-ok" : "health-risk"}>{percent(bankCapitalRatioBps(world, bank.id))}</span></header>
-              <BalanceVisual assets={book.assets} liabilities={book.liabilities} capital={book.capital} />
-              <dl className="balance-list"><div><dt>Assets</dt><dd>{compactMoney(book.assets)}</dd></div><div><dt>Liabilities</dt><dd>{compactMoney(book.liabilities)}</dd></div><div><dt>Equity</dt><dd>{compactMoney(book.capital)}</dd></div><div><dt>Liquidity</dt><dd>{compactMoney(liquidity)}</dd></div><div><dt>Loan Book</dt><dd>{compactMoney(loanBook)}</dd></div><div><dt>Deposits</dt><dd>{compactMoney(depositsTotal)}</dd></div></dl>
-              <WhyDisclosure text={`Minimum capital ratio ${percent(bank.minimumCapitalRatioBps)}. Assets = liabilities + capital: ${book.assets === book.liabilities + book.capital ? "verified" : "violation"}.`} />
-            </article>
-          );
-        })}
-      </section>
-
-      <section className="institution-secondary">
-        <article className="panel policy-card">
-          <header className="panel-header"><div><span className="eyebrow">CENTRAL BANK</span><h2>{world.centralBank.name}</h2></div><WhyDisclosure text="Ставка пересматривается раз в год по фактической инфляции и занятости." /></header>
-          <div className="policy-numbers"><CompactMetric label="POLICY RATE" value={percent(world.centralBank.policyRateBps)} /><CompactMetric label="INFLATION TARGET" value={percent(world.centralBank.inflationTargetBps)} /><CompactMetric label="CPI" value={number.format(metrics.cpiBps / 100)} /></div>
-        </article>
-        <article className="panel government-card">
-          <header className="panel-header"><div><span className="eyebrow">GOVERNMENT</span><h2>FISCAL ACCOUNT</h2></div></header>
-          <dl className="balance-list"><div><dt>Cash</dt><dd>{compactMoney(depositOf(world, world.government.id))}</dd></div><div><dt>Revenue</dt><dd>{compactMoney(governmentBook.income)}</dd></div><div><dt>Spending</dt><dd>{compactMoney(governmentBook.expenses)}</dd></div><div><dt>Balance</dt><dd>{compactMoney(governmentBook.income - governmentBook.expenses)}</dd></div></dl>
-        </article>
-      </section>
-
-      <section className="agent-grid">
-        <article className="panel distribution-card">
-          <header className="panel-header"><div><span className="eyebrow">HOUSEHOLDS</span><h2>DEPOSIT DISTRIBUTION</h2></div><span className="data-badge">{world.households.length} AGENTS</span></header>
-          <DistributionPlot values={deposits} />
-          <div className="quartile-grid">{[0, 1, 2, 3].map((quartile) => {
-            const sorted = [...deposits].sort((a, b) => a - b);
-            const size = Math.ceil(sorted.length / 4);
-            const group = sorted.slice(quartile * size, (quartile + 1) * size);
-            const average = group.reduce((sum, value) => sum + value, 0) / Math.max(1, group.length);
-            return <CompactMetric key={quartile} label={`Q${quartile + 1} AVG`} value={compactMoney(average)} />;
-          })}</div>
-        </article>
-        <article className="panel loan-card">
-          <header className="panel-header"><div><span className="eyebrow">{entityLabel(world, selectedBankId)}</span><h2>LOAN BOOK</h2></div><span className="count-badge">{selectedLoans.length}</span></header>
-          <div className="loan-list">{selectedLoans.slice(0, 8).map((loan) => <div key={loan.id}><span><b>{entityLabel(world, loan.borrowerId)}</b><small>{loan.id} · {loan.remainingMonths}M</small></span><strong>{compactMoney(loan.remainingPrincipalCents)}</strong><i>{percent(loan.annualRateBps)}</i></div>)}{selectedLoans.length === 0 && <p className="empty-state">Нет активных кредитов.</p>}</div>
-        </article>
-      </section>
-    </>
-  );
+function Banks({ world, openWhy }: { world: WorldState; openWhy: (title: string, text: string) => void }) {
+  return <><Section title="Банки" meta={`${world.loans.filter((item) => item.status === "active").length} активных кредитов`} /><section className="bank-grid">{world.banks.map((bank) => { const book = entityBook(world, bank.id); const reserves = balanceOf(world, accountIds.bankReserve(bank.id)); const deposits = Object.values(world.ledger.accounts).filter((account) => account.ownerId === bank.id && account.category === "liability" && account.instrument === "deposit").reduce((sum, account) => sum + balanceOf(world, account.id), 0); const loans = world.loans.filter((loan) => loan.lenderBankId === bank.id && loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0); return <article className="panel bank-card" key={bank.id}><header><div><span>Коммерческий банк</span><h2>{bank.name}</h2></div><WhyButton title={bank.name} text="Капитал поглощает убытки, а ликвидность нужна для межбанковских расчётов. Это разные ограничения кредитования." open={openWhy} /></header><dl><div><dt>Капитал</dt><dd>{compactMoney(book.capital)}</dd></div><div><dt>Норматив капитала</dt><dd>{percent(bankCapitalRatioBps(world, bank.id))}</dd></div><div><dt>Ликвидность</dt><dd>{compactMoney(reserves)}</dd></div><div><dt>Коэффициент ликвидности</dt><dd>{percent(bankLiquidityRatioBps(world, bank.id))}</dd></div><div><dt>Депозиты</dt><dd>{compactMoney(deposits)}</dd></div><div><dt>Кредитный портфель</dt><dd>{compactMoney(loans)}</dd></div></dl></article>; })}</section><article className="panel policy"><header className="panel-title"><h2>Центральный банк</h2><span>{world.centralBank.name}</span></header><div><Kpi label="Ключевая ставка" value={percent(world.centralBank.policyRateBps)} note="Пересмотр раз в квартал" open={openWhy} /><Kpi label="Цель инфляции" value={percent(world.centralBank.inflationTargetBps)} note="Годовой темп" open={openWhy} /><Kpi label="Кредиты ликвидности" value={world.bankFunding.filter((item) => item.kind === "central-bank" && item.status === "active").length.toString()} note="Активные договоры" open={openWhy} /></div></article></>;
 }
 
 function transactionAmount(transaction: LedgerTransaction): number {
   return Math.max(0, ...transaction.entries.map((entry) => entry.amountCents));
 }
 
-function transactionRoute(world: WorldState, transaction: LedgerTransaction): { source: string; destination: string } {
-  const depositEntries = transaction.entries.map((entry) => ({ entry, account: world.ledger.accounts[entry.accountId] })).filter(({ account }) => account?.category === "asset" && account.instrument === "deposit");
-  const source = depositEntries.find(({ entry }) => entry.side === "credit")?.account.ownerId;
-  const destination = depositEntries.find(({ entry }) => entry.side === "debit")?.account.ownerId;
-  if (source || destination) return { source: entityLabel(world, source ?? transaction.kind), destination: entityLabel(world, destination ?? transaction.kind) };
-  const debit = world.ledger.accounts[transaction.entries.find((entry) => entry.side === "debit")?.accountId ?? ""];
-  const credit = world.ledger.accounts[transaction.entries.find((entry) => entry.side === "credit")?.accountId ?? ""];
-  return { source: entityLabel(world, credit?.ownerId ?? transaction.kind), destination: entityLabel(world, debit?.ownerId ?? transaction.kind) };
+function TransactionRows({ transactions, select, selectedId }: { transactions: LedgerTransaction[]; select?: (id: string) => void; selectedId?: string }) {
+  if (!transactions.length) return <p className="empty">Операций пока нет.</p>;
+  return <div className="transaction-rows">{transactions.map((transaction) => <button className={selectedId === transaction.id ? "selected" : ""} key={transaction.id} onClick={() => select?.(transaction.id)}><span><b>{TX_LABELS[transaction.kind]}</b><small>{transaction.memo} · {transaction.elapsedMonth + 1}м</small></span><strong>{compactMoney(transactionAmount(transaction))}</strong></button>)}</div>;
 }
 
-function TraceFlow({ world, transaction }: { world: WorldState; transaction: LedgerTransaction }) {
-  const route = transactionRoute(world, transaction);
-  return (
-    <div className="trace-flow">
-      <div><span>SOURCE</span><strong>{route.source}</strong></div>
-      <div className="trace-transfer"><i /><span>{compactMoney(transactionAmount(transaction))}</span><i /></div>
-      <div><span>DESTINATION</span><strong>{route.destination}</strong></div>
-    </div>
-  );
-}
-
-function LedgerView({ world }: { world: WorldState }) {
+function Ledger({ world, openWhy }: { world: WorldState; openWhy: (title: string, text: string) => void }) {
   const [query, setQuery] = useState("");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const filtered = world.ledger.transactions.filter((transaction) => `${transaction.id} ${transaction.kind} ${transaction.memo}`.toLowerCase().includes(query.toLowerCase())).slice(-120).reverse();
-  const selected = world.ledger.transactions.find((transaction) => transaction.id === selectedId) ?? filtered[0];
-  const entryCount = world.ledger.transactions.reduce((sum, transaction) => sum + transaction.entries.length, 0);
-  return (
-    <>
-      <SectionTitle index="04" title="GLOBAL LEDGER" stats={[`${world.ledger.transactions.length.toLocaleString("ru-RU")} TRANSACTIONS`, `${entryCount.toLocaleString("ru-RU")} ENTRIES`]} />
-      <div className="ledger-layout">
-        <article className="panel transaction-list-panel">
-          <label className="search-field"><span>FILTER</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="ID / TYPE / CAUSE" /></label>
-          <div className="transaction-list">{filtered.map((transaction) => {
-            const route = transactionRoute(world, transaction);
-            return <button key={transaction.id} onClick={() => setSelectedId(transaction.id)} className={selected?.id === transaction.id ? "selected" : ""}><span><b>{transaction.kind}</b><small>{route.source} → {route.destination}</small><small>{transaction.id} · M{transaction.elapsedMonth + 1}</small></span><strong>{compactMoney(transactionAmount(transaction))}</strong></button>;
-          })}{filtered.length === 0 && <p className="empty-state">Совпадений нет.</p>}</div>
-        </article>
-        <article className="panel transaction-detail">
-          {selected ? <>
-            <header><div><span className="eyebrow">{selected.id} · M{selected.elapsedMonth + 1}</span><h2>{selected.kind}</h2></div><strong>{formatMoney(transactionAmount(selected))}</strong></header>
-            <TraceFlow world={world} transaction={selected} />
-            <WhyDisclosure text={selected.memo} />
-            <div className="entry-grid entry-head"><span>ACCOUNT</span><span>DEBIT</span><span>CREDIT</span></div>
-            {selected.entries.map((entry, index) => {
-              const account = world.ledger.accounts[entry.accountId];
-              return <div className="entry-grid" key={`${entry.accountId}-${index}`}><span><b>{account?.name}</b><small>{entityLabel(world, account?.ownerId ?? "")} · {entry.accountId}</small></span><span>{entry.side === "debit" ? formatMoney(entry.amountCents) : "—"}</span><span>{entry.side === "credit" ? formatMoney(entry.amountCents) : "—"}</span></div>;
-            })}
-            <footer><span>BALANCED</span><strong>{formatMoney(transactionAmount(selected))}</strong></footer>
-          </> : <p className="empty-state">Операции появятся после первого месяца.</p>}
-        </article>
-      </div>
-    </>
-  );
+  const filtered = world.ledger.transactions.filter((transaction) => `${transaction.id} ${TX_LABELS[transaction.kind]} ${transaction.memo}`.toLowerCase().includes(query.toLowerCase())).slice(-150).reverse();
+  const [selectedId, setSelectedId] = useState<string | undefined>();
+  const selected = world.ledger.transactions.find((item) => item.id === selectedId) ?? filtered[0];
+  return <><Section title="Общий реестр" meta={`${world.ledger.transactions.length.toLocaleString("ru-RU")} операций`} /><div className="ledger-grid"><article className="panel ledger-list"><label className="search"><span>Поиск</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Номер, тип или назначение" /></label><TransactionRows transactions={filtered} select={setSelectedId} selectedId={selected?.id} /></article><article className="panel transaction-detail">{selected ? <><header><div><span>{selected.id} · {selected.elapsedMonth + 1} месяц</span><h2>{TX_LABELS[selected.kind]}</h2></div><strong>{money(transactionAmount(selected))}</strong></header><button className="memo" onClick={() => openWhy(TX_LABELS[selected.kind], selected.memo)}>Причина операции</button><div className="entry-head"><span>Счёт</span><span>Дебет</span><span>Кредит</span></div>{selected.entries.map((entry, index) => { const account = world.ledger.accounts[entry.accountId]; return <div className="entry-row" key={`${entry.accountId}-${index}`}><span><b>{account?.name}</b><small>{entityLabel(world, account?.ownerId ?? "")}</small></span><span>{entry.side === "debit" ? money(entry.amountCents) : "—"}</span><span>{entry.side === "credit" ? money(entry.amountCents) : "—"}</span></div>; })}<footer>Проводка сбалансирована</footer></> : <p className="empty">Операций пока нет.</p>}</article></div></>;
 }
 
-function Diagnostics({ world }: { world: WorldState }) {
-  const invariants = useMemo(() => checkInvariants(world), [world]);
-  const passed = invariants.filter((item) => item.ok).length;
-  const entryCount = world.ledger.transactions.reduce((sum, transaction) => sum + transaction.entries.length, 0);
-  return (
-    <>
-      <SectionTitle index="05" title="CONTROL" stats={[`${passed}/${invariants.length} PASS`, `${world.clock.elapsedMonths} MONTHS`]} />
-      <section className="control-strip"><CompactMetric label="DOMAIN EVENTS" value={world.events.length.toLocaleString("ru-RU")} /><CompactMetric label="GOODS MOVEMENTS" value={world.goodsMovements.length.toLocaleString("ru-RU")} /><CompactMetric label="LEDGER ENTRIES" value={entryCount.toLocaleString("ru-RU")} /><CompactMetric label="ACTIVE LOANS" value={world.loans.filter((loan) => loan.status === "active").length.toLocaleString("ru-RU")} /></section>
-      <section className="diagnostic-grid">{invariants.map((item, index) => <Stagger key={item.id} index={index}><article className={`invariant-card ${item.ok ? "pass" : "fail"}`}><span className="check-mark">{item.ok ? "PASS" : "FAIL"}</span><div><strong>{item.title}</strong><p>{item.detail}</p><small>{item.id}</small></div></article></Stagger>)}</section>
-    </>
-  );
+function Control({ world }: { world: WorldState }) {
+  const invariants = checkInvariants(world);
+  const events = world.events.filter((event) => event.type !== "MonthClosed" && event.type !== "AccountingPeriodClosed").slice(-12).reverse();
+  return <><Section title="Контроль" meta={`${invariants.filter((item) => item.ok).length}/${invariants.length} проверок пройдено`} /><section className="invariant-grid">{invariants.map((item) => <article className={`invariant ${item.ok ? "pass" : "fail"}`} key={item.id}><span>{item.ok ? "Норма" : "Ошибка"}</span><div><small>{item.section}</small><h2>{item.title}</h2><p>{item.detail}</p></div></article>)}</section><article className="panel"><header className="panel-title"><h2>Причинные события</h2><span>{world.events.length}</span></header><div className="event-grid">{events.map((event) => <article key={event.id}><i className={event.severity} /><span><b>{event.title}</b><small>{event.detail}</small></span><time>{event.elapsedMonth + 1}м</time></article>)}</div></article></>;
 }
 
-function initialBootVisibility(): boolean {
-  try {
-    return sessionStorage.getItem("economic-world-booted") !== "1";
-  } catch {
-    return true;
-  }
+function Onboarding({ world, complete }: { world: WorldState; complete: (name: string, profile: string) => void }) {
+  const [name, setName] = useState(playerPerson(world).displayName === "Игрок" ? "" : playerPerson(world).displayName);
+  const [profile, setProfile] = useState("student");
+  return <div className="modal-layer onboarding-layer"><section className="onboarding" role="dialog" aria-modal="true"><span>ECONOMIC WORLD</span><h1>Начало экономической жизни</h1><label>Имя<input value={name} onChange={(event) => setName(event.target.value)} placeholder="Игрок" /></label><fieldset><legend>Начальный профиль</legend>{[["student", "Студент", "19 лет · базовые экономика и статистика"], ["office", "Офисный сотрудник", "21 год · коммуникация и бухгалтерия"], ["analyst", "Начинающий аналитик", "22 года · высшее образование"], ["developer", "Разработчик", "21 год · программирование и данные"]].map(([id, title, note]) => <label className={profile === id ? "selected" : ""} key={id}><input type="radio" name="profile" value={id} checked={profile === id} onChange={() => setProfile(id)} /><span><b>{title}</b><small>{note}</small></span></label>)}</fieldset><button className="primary" onClick={() => complete(name, profile)}>Войти в мир</button></section></div>;
 }
+
+function initialBoot(): boolean { try { return sessionStorage.getItem("economic-world-booted-v2") !== "1"; } catch { return true; } }
+function initialOnboarding(): boolean { try { return localStorage.getItem("economic-world-onboarded-v2") !== "1"; } catch { return true; } }
 
 export function App() {
   const [world, setWorld] = useState<WorldState>(() => createWorld());
   const worldRef = useRef(world);
-  const [view, setView] = useState<View>("overview");
-  const [isPlaying, setIsPlaying] = useState(false);
+  const [view, setView] = useState<View>("life");
+  const [showBoot, setShowBoot] = useState(initialBoot);
+  const [showOnboarding, setShowOnboarding] = useState(initialOnboarding);
+  const [why, setWhy] = useState<{ title: string; text: string } | null>(null);
+  const [notice, setNotice] = useState("Готово");
+  const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [notice, setNotice] = useState("READY");
   const [saves, setSaves] = useState<SaveManifest[]>([]);
-  const [showBoot, setShowBoot] = useState(initialBootVisibility);
-  const [starting, setStarting] = useState(false);
   const repository = useMemo(() => new SaveRepository(), []);
-  const metrics = latestMetrics(world);
-  const passing = useMemo(() => checkInvariants(world).every((item) => item.ok), [world]);
+  const commit = useCallback(() => { setWorld({ ...worldRef.current }); }, []);
+  const completeBoot = useCallback(() => { try { sessionStorage.setItem("economic-world-booted-v2", "1"); } catch { /* недоступно */ } setShowBoot(false); }, []);
+  const openWhy = useCallback((title: string, text: string) => setWhy({ title, text }), []);
 
-  const commit = (next: WorldState) => {
-    worldRef.current = next;
-    setWorld({ ...next });
-  };
-
-  const completeBoot = useCallback(() => {
-    try { sessionStorage.setItem("economic-world-booted", "1"); } catch { /* session storage may be unavailable */ }
-    setShowBoot(false);
-  }, []);
-
-  useEffect(() => {
-    repository.list().then(setSaves).catch(() => setSaves([]));
-  }, [repository]);
-
-  useEffect(() => {
-    if (!isPlaying || busy) return;
-    const timer = window.setInterval(() => {
-      const next = worldRef.current;
-      runMonths(next, speed);
-      commit(next);
-    }, 1_000);
-    return () => window.clearInterval(timer);
-  }, [isPlaying, speed, busy]);
-
-  const toggleSimulation = () => {
-    if (!isPlaying) {
-      setStarting(true);
-      window.setTimeout(() => setStarting(false), 820);
-    }
-    setIsPlaying((value) => !value);
-  };
+  useEffect(() => { repository.list().then(setSaves).catch(() => setSaves([])); }, [repository]);
+  useEffect(() => { if (!playing || busy) return; const timer = window.setInterval(() => { runMonths(worldRef.current, speed); commit(); }, 1_000); return () => window.clearInterval(timer); }, [playing, busy, speed, commit]);
 
   const advance = async (months: number) => {
     if (busy) return;
-    setBusy(true);
-    setIsPlaying(false);
-    setProgress(0);
-    const next = worldRef.current;
-    const chunk = months > 24 ? 6 : months;
-    for (let completed = 0; completed < months; completed += chunk) {
-      const amount = Math.min(chunk, months - completed);
-      runMonths(next, amount);
-      setProgress(Math.min(100, Math.round(((completed + amount) * 100) / months)));
-      commit(next);
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
-    }
-    setBusy(false);
-    setProgress(100);
-    setNotice(`${months}M · ${next.ledger.transactions.length.toLocaleString("ru-RU")} TX`);
-    if (months >= 12) repository.save(next, "Автосохранение", "autosave").then(() => repository.list().then(setSaves)).catch(() => undefined);
+    setBusy(true); setPlaying(false); setProgress(0);
+    for (let done = 0; done < months; done += 3) { const count = Math.min(3, months - done); runMonths(worldRef.current, count); setProgress(Math.round(((done + count) * 100) / months)); commit(); await new Promise<void>((resolve) => window.setTimeout(resolve, 0)); }
+    setBusy(false); setNotice(`Выполнено: ${months} мес.`);
   };
+  const save = async () => { setBusy(true); try { await repository.save(worldRef.current, "Ручное сохранение", "manual"); setSaves(await repository.list()); setNotice("Мир сохранён"); } finally { setBusy(false); } };
+  const load = async () => { const target = saves[0]; if (!target) return; setBusy(true); try { worldRef.current = await repository.load(target.id); commit(); setNotice("Сохранение загружено"); } finally { setBusy(false); } };
+  const reset = () => { if (!window.confirm("Создать новый мир?")) return; worldRef.current = createWorld(); commit(); setPlaying(false); setShowOnboarding(true); setNotice("Новый мир создан"); };
+  const profile = (name: string, profileId: string) => { setPlayerProfile(worldRef.current, name, profileId); commit(); try { localStorage.setItem("economic-world-onboarded-v2", "1"); } catch { /* недоступно */ } setShowOnboarding(false); };
+  const passing = useMemo(() => checkInvariants(world).every((item) => item.ok), [world]);
 
-  const saveWorld = async () => {
-    if (busy) return;
-    setBusy(true);
-    setNotice("SAVING");
-    try {
-      const manifest = await repository.save(worldRef.current, "Ручное сохранение", "manual");
-      setSaves(await repository.list());
-      setNotice(`SAVED · ${manifest.transactionCount.toLocaleString("ru-RU")} TX`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const loadWorld = async () => {
-    const target = saves[0];
-    if (!target) { setNotice("NO SAVES"); return; }
-    setNotice("LOADING");
-    setBusy(true);
-    try { const loaded = await repository.load(target.id); commit(loaded); setNotice(`LOADED · ${target.label}`); }
-    finally { setBusy(false); }
-  };
-
-  const resetWorld = () => {
-    if (!window.confirm("Создать новый мир? Несохранённое состояние будет потеряно.")) return;
-    const next = createWorld();
-    commit(next);
-    setIsPlaying(false);
-    setNotice("NEW WORLD · READY");
-  };
-
-  return (
-    <>
-      {showBoot && <BootSequence onComplete={completeBoot} />}
-      <div className={`app-shell ${starting ? "is-starting" : ""}`}>
-        <SimulationTransition active={starting} />
-        <aside className="sidebar">
-          <div className="brand"><span className="brand-mark">EW</span><div><strong>ECONOMIC WORLD</strong><span>WORLD ENGINE · α 0.1</span></div></div>
-          <nav>{NAV_ITEMS.map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => setView(item.id)}><span className="nav-mark">{item.mark}</span>{item.label}</button>)}</nav>
-          <div className="sidebar-status"><span>SYSTEM</span><div><i className={passing ? "ok" : "fail"} />{passing ? "BALANCED" : "VIOLATION"}</div><small>{notice}</small></div>
-        </aside>
-        <div className="workspace">
-          <header className="topbar">
-            <div className="date-block"><span>SIMULATION DATE</span><DataPulse value={world.clock.elapsedMonths}><strong key={world.clock.elapsedMonths}>{formatSimulationDate(world.clock)}</strong></DataPulse></div>
-            <div className="sim-controls">
-              <button onClick={() => { stepMonth(worldRef.current); commit(worldRef.current); setNotice("+1M"); }} disabled={busy} aria-label="Один месяц">+1M</button>
-              <button className={`play-button ${isPlaying ? "playing" : ""}`} onClick={toggleSimulation} disabled={busy}>{isPlaying ? "PAUSE" : "START"}</button>
-              <select aria-label="Скорость симуляции" value={speed} onChange={(event) => setSpeed(Number(event.target.value))}><option value={1}>1M / SEC</option><option value={3}>3M / SEC</option><option value={12}>1Y / SEC</option></select>
-            </div>
-            <div className="save-controls"><button onClick={saveWorld} disabled={busy}>SAVE</button><button onClick={loadWorld} disabled={busy || saves.length === 0}>LOAD</button><button className="reset-button" onClick={resetWorld} disabled={busy}>NEW WORLD</button></div>
-          </header>
-          <div className="batchbar"><span>{busy ? notice === "SAVING" || notice === "LOADING" ? notice : `CALCULATING · ${progress}%` : notice}</span><div><button onClick={() => advance(12)} disabled={busy}>+1 YEAR</button><button className="primary-batch" onClick={() => advance(240)} disabled={busy}>RUN 20 YEARS</button></div>{busy && notice !== "SAVING" && notice !== "LOADING" && <i style={{ width: `${progress}%` }} />}</div>
-          <main><PageTransition key={view}>{view === "overview" && <Overview world={world} metrics={metrics} running={isPlaying} />}{view === "economy" && <Economy world={world} metrics={metrics} />}{view === "institutions" && <Institutions world={world} metrics={metrics} />}{view === "ledger" && <LedgerView world={world} />}{view === "diagnostics" && <Diagnostics world={world} />}</PageTransition></main>
-        </div>
-        <nav className="mobile-nav">{NAV_ITEMS.map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => setView(item.id)}><span>{item.mark}</span><small>{item.short}</small></button>)}</nav>
-      </div>
-    </>
-  );
+  return <>
+    {showBoot && <BootSequence onComplete={completeBoot} />}
+    {!showBoot && showOnboarding && <Onboarding world={world} complete={profile} />}
+    <WhyModal value={why} close={() => setWhy(null)} />
+    <div className="app-shell"><aside className="sidebar"><div className="brand"><span>EW</span><div><b>ECONOMIC WORLD</b><small>Экономическая система</small></div></div><nav>{NAV.map((item, index) => <button className={view === item.id ? "active" : ""} key={item.id} onClick={() => setView(item.id)}><span>{String(index + 1).padStart(2, "0")}</span>{item.label}</button>)}</nav><footer><i className={passing ? "ok" : "fail"} /><span>{passing ? "Система в норме" : "Есть нарушение"}</span></footer></aside><div className="workspace"><header className="topbar"><div className="date"><span>Дата мира</span><strong>{formatSimulationDate(world.clock)}</strong></div><div className="simulation-controls"><button onClick={() => { stepMonth(worldRef.current); commit(); setNotice("Выполнен 1 месяц"); }} disabled={busy}>+1 месяц</button><button className="primary" onClick={() => setPlaying((value) => !value)} disabled={busy}>{playing ? "Пауза" : "Запуск"}</button><select value={speed} onChange={(event) => setSpeed(Number(event.target.value))} aria-label="Скорость"><option value="1">1 мес./с</option><option value="3">3 мес./с</option><option value="12">12 мес./с</option></select></div><div className="world-actions"><button onClick={save} disabled={busy}>Сохранить</button><button onClick={load} disabled={busy || !saves.length}>Загрузить</button><button onClick={reset} disabled={busy}>Новый мир</button></div></header><div className="quick-run"><span>{busy ? `Расчёт · ${progress}%` : notice}</span><div><button onClick={() => advance(12)} disabled={busy}>+1 год</button><button onClick={() => advance(240)} disabled={busy}>+20 лет</button></div>{busy && <i style={{ width: `${progress}%` }} />}</div><main>{view === "life" && <MyLife world={world} openWhy={openWhy} />}{view === "career" && <Career world={world} commit={commit} notify={setNotice} openWhy={openWhy} />}{view === "academy" && <Academy world={world} commit={commit} notify={setNotice} openWhy={openWhy} />}{view === "finances" && <MyFinances world={world} commit={commit} openWhy={openWhy} />}{view === "economy" && <Economy world={world} openWhy={openWhy} />}{view === "banks" && <Banks world={world} openWhy={openWhy} />}{view === "ledger" && <Ledger world={world} openWhy={openWhy} />}{view === "control" && <Control world={world} />}</main></div><nav className="mobile-nav">{NAV.map((item) => <button className={view === item.id ? "active" : ""} key={item.id} onClick={() => setView(item.id)}>{item.short}</button>)}</nav></div>
+  </>;
 }

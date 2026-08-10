@@ -4,9 +4,10 @@ import type {
   LedgerTransaction,
   WorldState,
 } from "../domain/model.ts";
+import { migrateWorldState } from "./migrations.ts";
 
 const DB_NAME = "economic-world";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const SEGMENT_SIZE = 1_000;
 
 export interface SaveManifest {
@@ -14,6 +15,7 @@ export interface SaveManifest {
   label: string;
   savedAtIso: string;
   schemaVersion: number;
+  saveVersion: number;
   elapsedMonths: number;
   transactionCount: number;
   eventCount: number;
@@ -100,6 +102,7 @@ export class SaveRepository {
       label,
       savedAtIso: new Date().toISOString(),
       schemaVersion: world.schemaVersion,
+      saveVersion: world.saveVersion,
       elapsedMonths: world.clock.elapsedMonths,
       transactionCount: world.ledger.transactions.length,
       eventCount: world.events.length,
@@ -186,6 +189,6 @@ export class SaveRepository {
     snapshot.ledger.transactions = transactions;
     snapshot.events = events;
     snapshot.goodsMovements = goodsMovements;
-    return snapshot;
+    return migrateWorldState(snapshot);
   }
 }

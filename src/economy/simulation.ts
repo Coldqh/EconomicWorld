@@ -1,26 +1,22 @@
-import { currentDate, isQuarterEnd, isYearEnd } from "../core/clock.ts";
+import { beginNationalAccountingMonth } from "../accounting/national-accounts.ts";
+import { closeMonthlyAccounting, resetCompanyPeriod } from "../accounting/periods.ts";
+import { formatSimulationDate, isQuarterEnd, isYearEnd } from "../core/clock.ts";
 import { emitSimpleEvent, recordGoodsMovement } from "../core/events.ts";
 import {
+  accountIds,
   capitalContribution,
   depositOf,
+  ensureAccount,
+  postTransaction,
+  settleDepositPayment,
   transferDeposit,
 } from "../core/ledger.ts";
-import type {
-  Company,
-  GoodDefinition,
-  Household,
-  WorldState,
-} from "../domain/model.ts";
-import {
-  defaultBorrowerLoans,
-  issueLoan,
-  settleBorrowerLoansFromCash,
-  serviceLoans,
-} from "../finance/credit.ts";
+import type { Company, GoodDefinition, Household, LedgerEntry, WorldState } from "../domain/model.ts";
+import { defaultBorrowerLoans, issueLoan, settleBorrowerLoansFromCash, serviceLoans } from "../finance/credit.ts";
+import { recordPlayerMonth } from "../player/system.ts";
 import { collectMetrics } from "./metrics.ts";
 
-const clamp = (value: number, minimum: number, maximum: number): number =>
-  Math.min(maximum, Math.max(minimum, value));
+const clamp = (value: number, minimum: number, maximum: number): number => Math.min(maximum, Math.max(minimum, value));
 
 function activeCompanies(world: WorldState): Company[] {
   return world.companies.filter((company) => company.active);
@@ -36,167 +32,82 @@ function companyById(world: WorldState, id: string): Company | undefined {
   return world.companies.find((company) => company.id === id);
 }
 
-function resetMonthlyCompanyState(world: WorldState): void {
-  for (const company of world.companies) {
-    company.lastProductionMilliUnits = 0;
-    company.lastSalesMilliUnits = 0;
-    company.lastGrossRevenueCents = 0;
-    company.lastOperatingExpenseCents = 0;
-  }
-}
-
 function leaveCompany(world: WorldState, household: Household, reason: string): void {
   if (!household.employerId) return;
-  const employer = companyById(world, household.employerId);
-  if (employer) {
-    employer.employees = employer.employees.filter((id) => id !== household.id);
-  }
   const formerEmployerId = household.employerId;
+  const employer = companyById(world, formerEmployerId);
+  if (employer) employer.employees = employer.employees.filter((id) => id !== household.id);
   household.employerId = null;
   household.monthsUnemployed = 0;
-  emitSimpleEvent(
-    world,
-    "EmployeeLeft",
-    "Рабочее место закрыто",
-    `${household.displayName}: ${reason}.`,
-    [household.id, formerEmployerId],
-    "attention",
-  );
+  const person = world.people.find((item) => item.householdId === household.id);
+  if (person) person.occupationId = null;
+  emitSimpleEvent(world, "EmployeeLeft", "Трудовой договор завершён", `${household.displayName}: ${reason}.`, [household.id, formerEmployerId], "attention");
 }
 
 function runLabourMarket(world: WorldState): void {
-  for (const household of world.households) {
-    if (!household.employerId) household.monthsUnemployed += 1;
-  }
-
+  for (const household of world.households) if (!household.employerId) household.monthsUnemployed += 1;
   if (isQuarterEnd(world.clock)) {
     for (const company of activeCompanies(world)) {
-      const inventoryPressure = company.inventoryMilliUnits / Math.max(1, company.capacityMilliUnits);
-      if ((company.distressMonths >= 2 || inventoryPressure > 2.4) && company.employees.length > 3) {
-        const workerId = [...company.employees].sort((leftId, rightId) => {
-          const left = world.households.find((item) => item.id === leftId)!;
-          const right = world.households.find((item) => item.id === rightId)!;
-          return left.productivityBps - right.productivityBps;
-        })[0];
-        const worker = world.households.find((item) => item.id === workerId)!;
-        leaveCompany(world, worker, `${company.name} сократила штат из-за давления на ликвидность или запасов`);
-      }
+      if (company.distressMonths < 2 && company.inventoryMilliUnits < company.capacityMilliUnits * 2.2) continue;
+      const worker = company.employees
+        .filter((id) => id !== world.player.householdId)
+        .map((id) => world.households.find((item) => item.id === id)!)
+        .sort((left, right) => left.productivityBps - right.productivityBps)[0];
+      if (worker && company.employees.length > 3) leaveCompany(world, worker, `${company.name} сократила штат`);
     }
   }
-
   const unemployed = world.households
-    .filter((household) => !household.employerId)
-    .sort(
-      (left, right) =>
-        right.monthsUnemployed - left.monthsUnemployed ||
-        right.skillBps + right.productivityBps - (left.skillBps + left.productivityBps),
-    );
+    .filter((household) => !household.employerId && household.id !== world.player.householdId)
+    .sort((left, right) => right.monthsUnemployed - left.monthsUnemployed || right.skillBps + right.productivityBps - left.skillBps - left.productivityBps);
   const employers = activeCompanies(world)
     .filter((company) => company.distressMonths < 2)
-    .map((company) => {
-      const desiredEmployees = clamp(
-        Math.ceil((company.capacityMilliUnits / 1_000) * (10_000 / company.productivityBps) / 45),
-        4,
-        12,
-      );
-      return { company, vacancies: Math.max(0, desiredEmployees - company.employees.length) };
-    })
+    .map((company) => ({ company, vacancies: Math.max(0, clamp(Math.ceil(company.capacityMilliUnits / 55_000), 4, 12) - company.employees.length) }))
     .filter((item) => item.vacancies > 0)
     .sort((left, right) => right.company.wageCents - left.company.wageCents);
-
   for (const employer of employers) {
     while (employer.vacancies > 0) {
-      const candidateIndex = unemployed.findIndex(
-        (household) => employer.company.wageCents >= household.reservationWageCents,
-      );
+      const candidateIndex = unemployed.findIndex((household) => employer.company.wageCents >= household.reservationWageCents);
       if (candidateIndex < 0) break;
       const household = unemployed.splice(candidateIndex, 1)[0];
       household.employerId = employer.company.id;
       household.monthsUnemployed = 0;
       employer.company.employees.push(household.id);
       employer.vacancies -= 1;
-      emitSimpleEvent(
-        world,
-        "EmployeeHired",
-        "Заключён трудовой договор",
-        `${employer.company.name} наняла ${household.displayName} за ${(employer.company.wageCents / 100).toLocaleString("ru-RU")} ₽ в месяц.`,
-        [employer.company.id, household.id],
-        "positive",
-      );
+      emitSimpleEvent(world, "EmployeeHired", "Заключён трудовой договор", `${employer.company.name} · ${household.displayName}`, [employer.company.id, household.id], "positive", [], { wageCents: employer.company.wageCents });
     }
   }
 }
 
 function companyDebt(world: WorldState, companyId: string): number {
-  return world.loans
-    .filter((loan) => loan.borrowerId === companyId && loan.status === "active")
-    .reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
+  return world.loans.filter((loan) => loan.borrowerId === companyId && loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
 }
 
 function fundPayrollIfNeeded(world: WorldState, company: Company, payrollCents: number): void {
-  const deposit = depositOf(world, company.id);
-  const liquidityTarget = Math.round(payrollCents * 1.35);
-  if (deposit >= liquidityTarget || payrollCents === 0) return;
-  const revenueCapacity = Math.max(
-    company.lastGrossRevenueCents * 6,
-    company.capacityMilliUnits * Math.max(1, company.priceCents) * 3,
-  );
-  const existingDebt = companyDebt(world, company.id);
-  if (existingDebt > 0) return;
-  if (existingDebt > revenueCapacity * 0.9) return;
-  const request = clamp(liquidityTarget - deposit + payrollCents * 2, 200_000_00, 2_500_000_00);
-  issueLoan(
-    world,
-    company.bankId,
-    company.id,
-    request,
-    60,
-    clamp(1_000 - Math.floor(company.productivityBps / 20), 250, 850),
-  );
+  const target = Math.round(payrollCents * 1.25);
+  if (payrollCents <= 0 || depositOf(world, company.id) >= target || companyDebt(world, company.id) > 0) return;
+  const request = clamp(target - depositOf(world, company.id) + payrollCents, 200_000_00, 2_500_000_00);
+  issueLoan(world, company.bankId, company.id, request, 60, clamp(900 - Math.floor(company.productivityBps / 24), 220, 800));
 }
 
 function payWagesAndTaxes(world: WorldState): void {
   for (const company of activeCompanies(world)) {
-    const payrollCents = company.wageCents * company.employees.length;
-    fundPayrollIfNeeded(world, company, payrollCents);
-    if (depositOf(world, company.id) < payrollCents) {
+    const payroll = company.wageCents * company.employees.length;
+    fundPayrollIfNeeded(world, company, payroll);
+    if (depositOf(world, company.id) < payroll) {
       company.missedPayrollMonths += 1;
-      emitSimpleEvent(
-        world,
-        "CompanyDistressed",
-        "Фирме не хватает ликвидности",
-        `${company.name} не может полностью профинансировать фонд оплаты труда.`,
-        [company.id, company.bankId],
-        company.missedPayrollMonths >= 2 ? "critical" : "attention",
-        [],
-        { payrollCents, depositCents: depositOf(world, company.id) },
-      );
+      emitSimpleEvent(world, "CompanyDistressed", "Недостаточно денег на зарплаты", company.name, [company.id, company.bankId], company.missedPayrollMonths >= 2 ? "critical" : "attention", [], { payrollCents: payroll, depositCents: depositOf(world, company.id) });
       continue;
     }
     company.missedPayrollMonths = 0;
     for (const householdId of [...company.employees]) {
       const household = world.households.find((item) => item.id === householdId);
       if (!household) continue;
-      const wageTxId = transferDeposit(
-        world,
-        company.id,
-        household.id,
-        company.wageCents,
-        "WAGE",
-        `Зарплата: ${company.name} → ${household.displayName}`,
-      );
-      if (!wageTxId) continue;
+      const wageTx = transferDeposit(world, company.id, household.id, company.wageCents, "WAGE", `Зарплата: ${company.name} → ${household.displayName}`);
+      if (!wageTx) continue;
+      company.lastWagesCents += company.wageCents;
       company.lastOperatingExpenseCents += company.wageCents;
-      const taxCents = Math.round((company.wageCents * world.government.incomeTaxBps) / 10_000);
-      transferDeposit(
-        world,
-        household.id,
-        world.government.id,
-        taxCents,
-        "INCOME_TAX",
-        `НДФЛ: ${household.displayName}`,
-        [wageTxId],
-      );
+      const tax = Math.round((company.wageCents * world.government.incomeTaxBps) / 10_000);
+      transferDeposit(world, household.id, world.government.id, tax, "INCOME_TAX", `Налог на доход: ${household.displayName}`, [wageTx]);
     }
   }
 }
@@ -204,640 +115,318 @@ function payWagesAndTaxes(world: WorldState): void {
 function paySocialTransfers(world: WorldState): void {
   for (const household of world.households) {
     if (household.employerId || household.monthsUnemployed < 1) continue;
-    if (depositOf(world, world.government.id) < world.government.monthlyUnemploymentBenefitCents) break;
-    transferDeposit(
-      world,
-      world.government.id,
-      household.id,
-      world.government.monthlyUnemploymentBenefitCents,
-      "SOCIAL_TRANSFER",
-      `Пособие по безработице: ${household.displayName}`,
-    );
+    const amount = world.government.monthlyUnemploymentBenefitCents;
+    if (depositOf(world, world.government.id) < amount) break;
+    transferDeposit(world, world.government.id, household.id, amount, "SOCIAL_TRANSFER", `Пособие: ${household.displayName}`);
   }
 }
 
-function averageMarketPrice(world: WorldState, goodId: string): number {
-  const suppliers = activeCompanies(world).filter((company) => company.goodId === goodId);
-  if (suppliers.length === 0) return goodById(world, goodId).basePriceCents;
-  return Math.round(
-    suppliers.reduce((sum, supplier) => sum + supplier.priceCents, 0) / suppliers.length,
-  );
+function suppliersFor(world: WorldState, goodId: string): Company[] {
+  return activeCompanies(world).filter((company) => company.goodId === goodId && company.inventoryMilliUnits > 0).sort((left, right) => left.priceCents - right.priceCents || left.id.localeCompare(right.id));
 }
 
-function procureInputs(world: WorldState, outputGoodIds: string[]): void {
-  for (const buyer of activeCompanies(world).filter((company) => outputGoodIds.includes(company.goodId))) {
+function consumeSellerInventory(world: WorldState, seller: Company, quantity: number, reason: "INPUT" | "CONSUMPTION" | "CAPITAL", destinationId: string, causeIds: string[]): number {
+  quantity = Math.min(quantity, seller.inventoryMilliUnits);
+  if (quantity <= 0) return 0;
+  const value = seller.inventoryMilliUnits > 0 ? Math.min(seller.inventoryValueCents, Math.round((seller.inventoryValueCents * quantity) / seller.inventoryMilliUnits)) : 0;
+  if (value > 0) {
+    ensureAccount(world.ledger, accountIds.cogsExpense(seller.id), seller.id, "Себестоимость продаж", "expense");
+    ensureAccount(world.ledger, accountIds.finishedInventory(seller.id), seller.id, "Готовая продукция", "asset");
+    postTransaction(world, "COGS", `Себестоимость: ${seller.name}`, [
+      { accountId: accountIds.cogsExpense(seller.id), side: "debit", amountCents: value },
+      { accountId: accountIds.finishedInventory(seller.id), side: "credit", amountCents: value },
+    ], causeIds);
+    seller.inventoryValueCents -= value;
+    seller.lastCogsCents += value;
+    seller.lastOperatingExpenseCents += value;
+  }
+  seller.inventoryMilliUnits -= quantity;
+  seller.lastSalesMilliUnits += quantity;
+  recordGoodsMovement(world, { goodId: seller.goodId, fromId: seller.id, toId: destinationId, quantityMilliUnits: quantity, reason, causeIds });
+  return quantity;
+}
+
+function procureInputs(world: WorldState): void {
+  for (const buyer of activeCompanies(world)) {
     const good = goodById(world, buyer.goodId);
-    for (const [inputId, ratio] of Object.entries(good.recipe)) {
-      const targetInput = Math.ceil(buyer.capacityMilliUnits * ratio * 1.4);
-      let needed = Math.max(0, targetInput - (buyer.inputInventoryMilliUnits[inputId] ?? 0));
-      const suppliers = activeCompanies(world)
-        .filter((company) => company.goodId === inputId && company.id !== buyer.id)
-        .sort((left, right) => left.priceCents - right.priceCents || left.id.localeCompare(right.id));
-      for (const supplier of suppliers) {
-        if (needed <= 0 || supplier.inventoryMilliUnits <= 0) break;
-        const payrollBuffer = buyer.wageCents * buyer.employees.length * 2;
-        const procurementCash = Math.max(0, depositOf(world, buyer.id) - payrollBuffer);
-        const affordableMilliUnits = Math.floor(
-          (procurementCash * 1_000) / Math.max(1, supplier.priceCents),
-        );
-        const quantity = Math.min(needed, supplier.inventoryMilliUnits, affordableMilliUnits);
-        const amountCents = Math.floor((quantity * supplier.priceCents) / 1_000);
-        if (quantity <= 0 || amountCents <= 0) continue;
-        const txId = transferDeposit(
-          world,
-          buyer.id,
-          supplier.id,
-          amountCents,
-          "INPUT_PURCHASE",
-          `${buyer.name} закупает ${goodById(world, inputId).shortName} у ${supplier.name}`,
-        );
-        if (!txId) break;
-        buyer.inputInventoryMilliUnits[inputId] =
-          (buyer.inputInventoryMilliUnits[inputId] ?? 0) + quantity;
-        supplier.inventoryMilliUnits -= quantity;
-        supplier.lastSalesMilliUnits += quantity;
-        supplier.lastGrossRevenueCents += amountCents;
-        buyer.lastOperatingExpenseCents += amountCents;
-        needed -= quantity;
-        recordGoodsMovement(world, {
-          goodId: inputId,
-          fromId: supplier.id,
-          toId: buyer.id,
-          quantityMilliUnits: quantity,
-          reason: "INPUT",
-          causeIds: [txId],
-        });
+    const plannedOutput = Math.min(buyer.capacityMilliUnits, Math.round((buyer.employees.length * 48_000 * buyer.productivityBps) / 10_000));
+    for (const [inputId, coefficient] of Object.entries(good.recipe)) {
+      const desired = Math.ceil(plannedOutput * coefficient * 1.2);
+      let need = Math.max(0, desired - (buyer.inputInventoryMilliUnits[inputId] ?? 0));
+      for (const seller of suppliersFor(world, inputId)) {
+        if (need <= 0 || depositOf(world, buyer.id) < seller.priceCents) break;
+        const quantity = Math.min(need, seller.inventoryMilliUnits, Math.floor((depositOf(world, buyer.id) * 1_000) / seller.priceCents));
+        const cost = Math.floor((quantity * seller.priceCents) / 1_000);
+        if (quantity <= 0 || cost <= 0) continue;
+        const inputAccount = accountIds.inputInventory(buyer.id, inputId);
+        ensureAccount(world.ledger, inputAccount, buyer.id, `Сырьё: ${goodById(world, inputId).name}`, "asset");
+        const tx = settleDepositPayment(world, buyer.id, seller.id, cost, "INPUT_PURCHASE", `${buyer.name} купила ${goodById(world, inputId).shortName}`, inputAccount, accountIds.operatingIncome(seller.id));
+        if (!tx) break;
+        const moved = consumeSellerInventory(world, seller, quantity, "INPUT", buyer.id, [tx]);
+        buyer.inputInventoryMilliUnits[inputId] = (buyer.inputInventoryMilliUnits[inputId] ?? 0) + moved;
+        buyer.inputInventoryValueCents[inputId] = (buyer.inputInventoryValueCents[inputId] ?? 0) + cost;
+        seller.lastGrossRevenueCents += cost;
+        need -= moved;
       }
     }
   }
 }
 
-function produceGoods(world: WorldState, goodIds: string[]): void {
-  for (const company of activeCompanies(world).filter((item) => goodIds.includes(item.goodId))) {
+function produceGoods(world: WorldState): void {
+  for (const company of activeCompanies(world)) {
     const good = goodById(world, company.goodId);
-    const laborFactorBps = clamp(Math.round((company.employees.length * 10_000) / 8), 0, 11_500);
-    let possibleOutput = Math.floor(
-      (company.capacityMilliUnits * company.productivityBps * laborFactorBps) / 100_000_000,
-    );
-    const targetInventory = Math.max(
-      Math.floor(company.capacityMilliUnits * 0.7),
-      Math.floor(company.lastSalesMilliUnits * 1.45),
-    );
-    const desiredOutput = Math.max(
-      Math.floor(company.capacityMilliUnits * 0.18),
-      targetInventory - company.inventoryMilliUnits,
-    );
-    possibleOutput = Math.min(possibleOutput, Math.max(0, desiredOutput));
-    for (const [inputId, ratio] of Object.entries(good.recipe)) {
-      const available = company.inputInventoryMilliUnits[inputId] ?? 0;
-      possibleOutput = Math.min(possibleOutput, Math.floor(available / ratio));
-    }
-    const output = Math.max(0, possibleOutput);
+    let output = Math.min(company.capacityMilliUnits, Math.round((company.employees.length * 48_000 * company.productivityBps) / 10_000));
+    for (const [inputId, coefficient] of Object.entries(good.recipe)) output = Math.min(output, Math.floor((company.inputInventoryMilliUnits[inputId] ?? 0) / coefficient));
+    output = Math.max(0, output);
     if (output <= 0) continue;
-    for (const [inputId, ratio] of Object.entries(good.recipe)) {
-      const used = Math.min(
-        company.inputInventoryMilliUnits[inputId] ?? 0,
-        Math.ceil(output * ratio),
-      );
-      company.inputInventoryMilliUnits[inputId] -= used;
-      if (used > 0) {
-        recordGoodsMovement(world, {
-          goodId: inputId,
-          fromId: company.id,
-          toId: `production:${company.id}`,
-          quantityMilliUnits: used,
-          reason: "INPUT",
-          causeIds: [],
-        });
-      }
+    const credits: LedgerEntry[] = [];
+    let consumedValue = 0;
+    for (const [inputId, coefficient] of Object.entries(good.recipe)) {
+      const used = Math.min(company.inputInventoryMilliUnits[inputId] ?? 0, Math.ceil(output * coefficient));
+      const stock = company.inputInventoryMilliUnits[inputId] ?? 0;
+      const stockValue = company.inputInventoryValueCents[inputId] ?? 0;
+      const value = stock > 0 ? Math.min(stockValue, Math.round((stockValue * used) / stock)) : 0;
+      company.inputInventoryMilliUnits[inputId] = stock - used;
+      company.inputInventoryValueCents[inputId] = stockValue - value;
+      consumedValue += value;
+      company.lastIntermediateConsumptionCents += value;
+      company.lastIntermediateConsumptionBaseCents += Math.round((used * goodById(world, inputId).basePriceCents) / 1_000);
+      if (value > 0) credits.push({ accountId: accountIds.inputInventory(company.id, inputId), side: "credit", amountCents: value });
+    }
+    if (consumedValue > 0) {
+      ensureAccount(world.ledger, accountIds.finishedInventory(company.id), company.id, "Готовая продукция", "asset");
+      postTransaction(world, "PRODUCTION", `Выпуск: ${company.name}`, [{ accountId: accountIds.finishedInventory(company.id), side: "debit", amountCents: consumedValue }, ...credits]);
+      company.inventoryValueCents += consumedValue;
     }
     company.inventoryMilliUnits += output;
     company.lastProductionMilliUnits = output;
-    recordGoodsMovement(world, {
-      goodId: company.goodId,
-      fromId: `production:${company.id}`,
-      toId: company.id,
-      quantityMilliUnits: output,
-      reason: "PRODUCTION",
-      causeIds: [],
-    });
+    recordGoodsMovement(world, { goodId: company.goodId, fromId: company.id, toId: company.id, quantityMilliUnits: output, reason: "PRODUCTION", causeIds: [] });
   }
 }
 
-interface HouseholdBudget {
-  household: Household;
-  cents: number;
+function householdBudget(world: WorldState, household: Household): number {
+  const cash = depositOf(world, household.id);
+  const monthlyIncome = household.employerId ? companyById(world, household.employerId)?.wageCents ?? 0 : world.government.monthlyUnemploymentBenefitCents;
+  const desiredReserve = Math.round(monthlyIncome * (1.2 + household.liquidityPreferenceBps / 5_000));
+  const spendableStock = Math.max(0, cash - desiredReserve);
+  const propensity = household.id === world.player.householdId ? world.player.consumptionBudgetBps : household.consumptionPropensityBps;
+  const expectedInflationEffect = clamp(10_000 + household.expectedInflationBps * 0.3, 9_000, 11_500);
+  return Math.min(Math.round(cash * 0.22), Math.round(((monthlyIncome * propensity) / 10_000 + spendableStock * 0.06) * expectedInflationEffect / 10_000));
 }
 
-function householdBudgets(world: WorldState): HouseholdBudget[] {
-  return world.households.map((household) => {
-    const employer = household.employerId ? companyById(world, household.employerId) : undefined;
-    const grossIncome = employer?.wageCents ?? world.government.monthlyUnemploymentBenefitCents;
-    const disposableIncome = Math.floor(
-      (grossIncome * (10_000 - world.government.incomeTaxBps)) / 10_000,
-    );
-    const regular = Math.floor((disposableIncome * household.consumptionPropensityBps) / 10_000);
-    const savingsDraw = Math.max(0, depositOf(world, household.id) - 80_000_00);
-    const desired = Math.max(9_500_00, regular + Math.floor(savingsDraw * 0.012));
-    return {
-      household,
-      cents: Math.max(0, Math.min(desired, depositOf(world, household.id))),
-    };
-  });
+function chooseSeller(world: WorldState, household: Household, goodId: string): Company | undefined {
+  const suppliers = suppliersFor(world, goodId);
+  if (!suppliers.length) return undefined;
+  const preferred = household.preferredSellerByGoodId[goodId];
+  return [...suppliers].sort((left, right) => {
+    const leftLoyalty = left.id === preferred ? 900 : 0;
+    const rightLoyalty = right.id === preferred ? 900 : 0;
+    const leftScore = Math.round((left.priceCents * household.priceSensitivityBps) / 10_000) - leftLoyalty + Math.round((left.inventoryMilliUnits / Math.max(1, left.capacityMilliUnits)) * -100);
+    const rightScore = Math.round((right.priceCents * household.priceSensitivityBps) / 10_000) - rightLoyalty + Math.round((right.inventoryMilliUnits / Math.max(1, right.capacityMilliUnits)) * -100);
+    return leftScore - rightScore || left.id.localeCompare(right.id);
+  })[0];
 }
 
-function allocateIntegerTotal(total: number, weights: number[]): number[] {
-  const allocations: number[] = [];
-  let remaining = total;
-  let remainingWeight = weights.reduce((sum, weight) => sum + weight, 0);
-  for (let index = 0; index < weights.length; index += 1) {
-    const weight = weights[index];
-    const allocation =
-      index === weights.length - 1
-        ? remaining
-        : Math.floor((remaining * weight) / Math.max(1, remainingWeight));
-    allocations.push(allocation);
-    remaining -= allocation;
-    remainingWeight -= weight;
+function sellFinalGood(world: WorldState, payerId: string, seller: Company, budget: number, reason: "CONSUMPTION" | "CAPITAL", destinationId: string): number {
+  const quantity = Math.min(seller.inventoryMilliUnits, Math.floor((budget * 1_000) / Math.max(1, seller.priceCents)));
+  const gross = Math.floor((quantity * seller.priceCents) / 1_000);
+  if (quantity <= 0 || gross <= 0) return 0;
+  const kind = reason === "CAPITAL" ? "CAPITAL_INVESTMENT" : "GOODS_CLEARING";
+  const payerAccount = reason === "CAPITAL" ? accountIds.productiveCapital(payerId) : accountIds.operatingExpense(payerId);
+  ensureAccount(world.ledger, payerAccount, payerId, reason === "CAPITAL" ? "Производственный капитал" : "Потребление", reason === "CAPITAL" ? "asset" : "expense");
+  const destinationName = world.households.find((item) => item.id === destinationId)?.displayName
+    ?? world.companies.find((item) => item.id === destinationId)?.name
+    ?? (destinationId === world.government.id ? "Правительство" : destinationId);
+  const tx = settleDepositPayment(world, payerId, seller.id, gross, kind, `${destinationName} ← ${seller.name}`, payerAccount, accountIds.operatingIncome(seller.id));
+  if (!tx) return 0;
+  const moved = consumeSellerInventory(world, seller, quantity, reason, destinationId, [tx]);
+  seller.lastGrossRevenueCents += gross;
+  if (payerId === world.government.id) seller.lastGovernmentSalesCents += gross;
+  else if (reason === "CONSUMPTION") seller.lastHouseholdSalesCents += gross;
+  const salesTax = Math.min(depositOf(world, seller.id), Math.round((gross * world.government.salesTaxBps) / 10_000));
+  if (salesTax > 0) {
+    const taxTx = transferDeposit(world, seller.id, world.government.id, salesTax, "SALES_TAX", `Налог с продаж: ${seller.name}`, [tx]);
+    if (taxTx) { seller.lastTaxCents += salesTax; seller.lastOperatingExpenseCents += salesTax; }
   }
-  return allocations;
+  return moved > 0 ? gross : 0;
 }
 
-function clearGoodsMarket(world: WorldState): void {
-  const budgets = householdBudgets(world);
-  const householdBudget = budgets.reduce((sum, item) => sum + item.cents, 0);
-  const governmentBudget = Math.min(450_000_00, depositOf(world, world.government.id));
-  const totalBudget = householdBudget + governmentBudget;
-  const grossRevenueByCompany = new Map<string, number>();
-  const salesByCompany = new Map<string, number>();
-
-  for (const good of world.goods) {
-    const goodBudget = Math.floor((totalBudget * good.consumptionWeightBps) / 10_000);
-    const suppliers = activeCompanies(world).filter(
-      (company) => company.goodId === good.id && company.inventoryMilliUnits > 0,
-    );
-    if (suppliers.length === 0) {
-      emitSimpleEvent(
-        world,
-        "MarketShortage",
-        `Дефицит: ${good.shortName}`,
-        `На рынке нет доступного запаса товара «${good.name}».`,
-        [],
-        "critical",
-        [],
-        { unmetDemandCents: goodBudget },
-      );
-      continue;
-    }
-    const competitiveness = suppliers.map((supplier) =>
-      Math.max(1, Math.floor((good.basePriceCents * 10_000) / supplier.priceCents)),
-    );
-    const budgetShares = allocateIntegerTotal(goodBudget, competitiveness);
-    let unfilledBudget = 0;
-    suppliers.forEach((supplier, index) => {
-      const desiredQuantity = Math.floor((budgetShares[index] * 1_000) / supplier.priceCents);
-      const sold = Math.min(supplier.inventoryMilliUnits, desiredQuantity);
-      const gross = Math.floor((sold * supplier.priceCents) / 1_000);
-      supplier.inventoryMilliUnits -= sold;
-      supplier.lastSalesMilliUnits += sold;
-      salesByCompany.set(supplier.id, (salesByCompany.get(supplier.id) ?? 0) + sold);
-      grossRevenueByCompany.set(supplier.id, (grossRevenueByCompany.get(supplier.id) ?? 0) + gross);
-      unfilledBudget += budgetShares[index] - gross;
-      if (sold > 0) {
-        recordGoodsMovement(world, {
-          goodId: good.id,
-          fromId: supplier.id,
-          toId: "household-sector",
-          quantityMilliUnits: sold,
-          reason: "CONSUMPTION",
-          causeIds: [],
-        });
+function clearHouseholdMarket(world: WorldState): void {
+  for (const household of world.households) {
+    const totalBudget = householdBudget(world, household);
+    if (totalBudget <= 0) continue;
+    for (const good of world.goods) {
+      let budget = Math.round((totalBudget * (household.preferenceWeightsBps[good.id] ?? good.consumptionWeightBps)) / 10_000);
+      if (good.essential) budget = Math.max(budget, Math.round((totalBudget * household.essentialBudgetBps * good.consumptionWeightBps) / 100_000_000));
+      budget = Math.min(budget, depositOf(world, household.id));
+      const seller = chooseSeller(world, household, good.id);
+      if (!seller || budget <= 0) continue;
+      const before = seller.lastSalesMilliUnits;
+      const spent = sellFinalGood(world, household.id, seller, budget, "CONSUMPTION", household.id);
+      const quantity = seller.lastSalesMilliUnits - before;
+      if (spent > 0) {
+        household.consumptionMilliUnits[good.id] = (household.consumptionMilliUnits[good.id] ?? 0) + quantity;
+        household.preferredSellerByGoodId[good.id] = seller.id;
+        world.nationalAccounts.current.householdConsumptionCents += spent;
+        world.nationalAccounts.current.householdConsumptionByGoodCents[good.id] += spent;
       }
-    });
-    if (unfilledBudget > goodBudget * 0.18) {
-      emitSimpleEvent(
-        world,
-        "MarketShortage",
-        `Предложение не покрывает спрос: ${good.shortName}`,
-        `Неудовлетворённый спрос составил ${Math.round((unfilledBudget * 100) / Math.max(1, goodBudget))}% месячного бюджета.`,
-        suppliers.map((supplier) => supplier.id),
-        "attention",
-        [],
-        { unmetDemandCents: unfilledBudget },
-      );
     }
   }
+}
 
-  const totalGross = [...grossRevenueByCompany.values()].reduce((sum, value) => sum + value, 0);
-  if (totalGross <= 0 || totalBudget <= 0) return;
-  const householdShare = Math.min(
-    totalGross,
-    Math.floor((totalGross * householdBudget) / Math.max(1, totalBudget)),
-  );
-  const governmentShare = totalGross - householdShare;
-  const householdPayments = allocateIntegerTotal(
-    householdShare,
-    budgets.map((item) => item.cents),
-  );
-  budgets.forEach((item, index) => {
-    const amount = householdPayments[index];
-    if (amount <= 0) return;
-    transferDeposit(
-      world,
-      item.household.id,
-      "goods-market",
-      amount,
-      "GOODS_CLEARING",
-      `Потребительская корзина: ${item.household.displayName}`,
-    );
-  });
-  if (governmentShare > 0) {
-    transferDeposit(
-      world,
-      world.government.id,
-      "goods-market",
-      governmentShare,
-      "GOODS_CLEARING",
-      "Публичные закупки энергии, материалов, товаров и услуг",
-    );
+function governmentPurchases(world: WorldState): void {
+  const budget = Math.min(depositOf(world, world.government.id) / 80, 1_800_000_00);
+  for (const goodId of ["services", "goods"] as const) {
+    const seller = suppliersFor(world, goodId)[0];
+    if (!seller) continue;
+    const spent = sellFinalGood(world, world.government.id, seller, Math.floor(budget / 2), "CONSUMPTION", world.government.id);
+    world.nationalAccounts.current.governmentConsumptionCents += spent;
+    world.nationalAccounts.current.governmentConsumptionByGoodCents[goodId] += spent;
   }
+}
 
-  let totalTax = 0;
+function depreciateCapital(world: WorldState): void {
   for (const company of activeCompanies(world)) {
-    const gross = grossRevenueByCompany.get(company.id) ?? 0;
-    if (gross <= 0) continue;
-    const salesTax = Math.floor(
-      (gross * world.government.salesTaxBps) / (10_000 + world.government.salesTaxBps),
-    );
-    const netRevenue = gross - salesTax;
-    const txId = transferDeposit(
-      world,
-      "goods-market",
-      company.id,
-      netRevenue,
-      "GOODS_CLEARING",
-      `Клиринг продаж: ${company.name}`,
-    );
-    if (txId) {
-      company.lastGrossRevenueCents += netRevenue;
-      totalTax += salesTax;
-    }
-  }
-  if (totalTax > 0) {
-    transferDeposit(
-      world,
-      "goods-market",
-      world.government.id,
-      totalTax,
-      "SALES_TAX",
-      "Перечисление налога с продаж после клиринга",
-    );
-  }
-
-  for (const good of world.goods) {
-    const sold = activeCompanies(world)
-      .filter((company) => company.goodId === good.id)
-      .reduce((sum, company) => sum + (salesByCompany.get(company.id) ?? 0), 0);
-    const householdSold = Math.floor(
-      (sold * householdBudget) / Math.max(1, totalBudget),
-    );
-    const householdAllocations = allocateIntegerTotal(
-      householdSold,
-      budgets.map((item) => item.cents),
-    );
-    budgets.forEach((item, index) => {
-      item.household.consumptionMilliUnits[good.id] += householdAllocations[index];
-    });
+    const capital = company.productiveCapital;
+    const depreciation = Math.min(capital.bookValueCents, Math.max(1, Math.round(capital.acquisitionCostCents / capital.usefulLifeMonths)));
+    if (depreciation <= 0) continue;
+    ensureAccount(world.ledger, accountIds.depreciationExpense(company.id), company.id, "Амортизация", "expense");
+    ensureAccount(world.ledger, accountIds.productiveCapital(company.id), company.id, "Производственный капитал", "asset");
+    postTransaction(world, "DEPRECIATION", `Амортизация: ${company.name}`, [
+      { accountId: accountIds.depreciationExpense(company.id), side: "debit", amountCents: depreciation },
+      { accountId: accountIds.productiveCapital(company.id), side: "credit", amountCents: depreciation },
+    ]);
+    capital.bookValueCents -= depreciation;
+    capital.accumulatedDepreciationCents += depreciation;
+    company.lastDepreciationCents += depreciation;
+    company.lastOperatingExpenseCents += depreciation;
   }
 }
 
-function updatePricesAndWages(world: WorldState): void {
+function investInCapital(world: WorldState): void {
+  if (!isQuarterEnd(world.clock)) return;
+  for (const buyer of activeCompanies(world)) {
+    const utilization = buyer.lastProductionMilliUnits / Math.max(1, buyer.capacityMilliUnits);
+    const cashBuffer = buyer.wageCents * Math.max(3, buyer.employees.length) * 2;
+    if (utilization < 0.78 || depositOf(world, buyer.id) < cashBuffer) continue;
+    const seller = suppliersFor(world, "goods").find((item) => item.id !== buyer.id);
+    if (!seller) continue;
+    const budget = Math.min(Math.round(depositOf(world, buyer.id) * 0.06), 1_200_000_00);
+    const spent = sellFinalGood(world, buyer.id, seller, budget, "CAPITAL", buyer.id);
+    if (spent <= 0) continue;
+    buyer.productiveCapital.acquisitionCostCents += spent;
+    buyer.productiveCapital.bookValueCents += spent;
+    const addedCapacity = Math.max(2_000, Math.round((spent * 1_000) / goodById(world, "goods").basePriceCents * 2.5));
+    buyer.productiveCapital.capacityMilliUnits += addedCapacity;
+    buyer.capacityMilliUnits += addedCapacity;
+    buyer.lastCapitalInvestmentCents += spent;
+    world.nationalAccounts.current.capitalFormationCents += spent;
+    emitSimpleEvent(world, "CapitalInvested", "Производственный капитал увеличен", buyer.name, [buyer.id, seller.id], "positive", [], { amountCents: spent, addedCapacityMilliUnits: addedCapacity });
+  }
+}
+
+function updatePricesAndExpectations(world: WorldState): void {
   for (const company of activeCompanies(world)) {
-    const good = goodById(world, company.goodId);
-    const outputUnits = Math.max(1, company.lastProductionMilliUnits / 1_000);
-    const laborUnitCost = Math.round(
-      (company.wageCents * company.employees.length) / outputUnits,
-    );
-    const inputUnitCost = Object.entries(good.recipe).reduce(
-      (sum, [inputId, ratio]) => sum + averageMarketPrice(world, inputId) * ratio,
-      0,
-    );
-    const costFloor = Math.max(
-      Math.round(good.basePriceCents * 0.55),
-      Math.round((laborUnitCost + inputUnitCost) * 1.06),
-    );
-    const demandPressure =
-      (company.lastSalesMilliUnits - company.lastProductionMilliUnits) /
-      Math.max(1_000, company.lastProductionMilliUnits);
-    const inventoryCoverage =
-      company.inventoryMilliUnits / Math.max(1_000, company.lastSalesMilliUnits);
-    let adjustmentBps = Math.round(clamp(demandPressure, -1, 1) * 230);
-    if (inventoryCoverage < 0.4) adjustmentBps += 180;
-    if (inventoryCoverage > 2.1) adjustmentBps -= 160;
-    adjustmentBps = clamp(adjustmentBps, -450, 550);
-    const previousPrice = company.priceCents;
-    company.priceCents = Math.max(
-      costFloor,
-      Math.round((company.priceCents * (10_000 + adjustmentBps)) / 10_000),
-    );
-    company.priceCents = clamp(
-      company.priceCents,
-      Math.floor(previousPrice * 0.94),
-      Math.ceil(previousPrice * 1.06),
-    );
-    const priceChangeBps = Math.round(
-      ((company.priceCents - previousPrice) * 10_000) / previousPrice,
-    );
-    if (Math.abs(priceChangeBps) >= 150) {
-      emitSimpleEvent(
-        world,
-        "PriceChanged",
-        `${company.name} изменила цену`,
-        `Цена «${good.shortName}» ${priceChangeBps > 0 ? "выросла" : "снизилась"} на ${Math.abs(priceChangeBps / 100).toFixed(1)}% из-за издержек, продаж и запасов.`,
-        [company.id],
-        priceChangeBps > 0 ? "attention" : "info",
-        [],
-        { previousPriceCents: previousPrice, priceCents: company.priceCents },
-      );
-    }
-
-    if (isQuarterEnd(world.clock)) {
-      const desiredEmployees = clamp(
-        Math.ceil((company.capacityMilliUnits / 1_000) * (10_000 / company.productivityBps) / 45),
-        4,
-        12,
-      );
-      const wageAdjustmentBps =
-        company.employees.length < desiredEmployees ? 180 : company.distressMonths > 0 ? -100 : 40;
-      company.wageCents = Math.max(
-        22_000_00,
-        Math.round((company.wageCents * (10_000 + wageAdjustmentBps)) / 10_000),
-      );
-    }
+    const previous = company.priceCents;
+    const salesRatio = company.lastSalesMilliUnits / Math.max(1, company.lastProductionMilliUnits + company.inventoryMilliUnits);
+    const stockRatio = company.inventoryMilliUnits / Math.max(1, company.capacityMilliUnits);
+    const unitCost = company.lastSalesMilliUnits > 0 ? (company.lastCogsCents + company.lastWagesCents + company.lastDepreciationCents) * 1_000 / company.lastSalesMilliUnits : previous * 0.72;
+    const costPressureBps = clamp(Math.round((unitCost * 10_000) / Math.max(1, previous)) - 7_200, -300, 500);
+    const demandPressureBps = clamp(Math.round((salesRatio - 0.45) * 1_100), -180, 280);
+    const inventoryPressureBps = clamp(Math.round((0.9 - stockRatio) * 260), -220, 220);
+    const changeBps = clamp(costPressureBps + demandPressureBps + inventoryPressureBps, -280, 420);
+    company.priceCents = Math.max(Math.round(goodById(world, company.goodId).basePriceCents * 0.45), Math.round(previous * (10_000 + changeBps) / 10_000));
+    if (Math.abs(company.priceCents - previous) / previous >= 0.015) emitSimpleEvent(world, "PriceChanged", "Цена изменена", company.name, [company.id], changeBps > 0 ? "attention" : "info", [], { previousPriceCents: previous, priceCents: company.priceCents, costPressureBps, demandPressureBps, inventoryPressureBps });
   }
+  const latestInflation = world.metricsHistory.at(-1)?.annualInflationBps ?? world.centralBank.inflationTargetBps;
+  for (const household of world.households) household.expectedInflationBps = Math.round(household.expectedInflationBps * 0.76 + latestInflation * 0.24);
+  if (isQuarterEnd(world.clock)) for (const company of activeCompanies(world)) company.wageCents = Math.max(20_000_00, Math.round(company.wageCents * (10_000 + clamp(Math.round((latestInflation - world.centralBank.inflationTargetBps) / 4), -100, 180)) / 10_000));
 }
 
-function updateDistress(world: WorldState): void {
-  for (const company of activeCompanies(world)) {
-    const payroll = company.wageCents * company.employees.length;
-    const weakOperations =
-      company.lastOperatingExpenseCents > 0 &&
-      company.lastGrossRevenueCents < company.lastOperatingExpenseCents * 0.62;
-    const thinLiquidity = depositOf(world, company.id) < payroll * 0.45;
-    const missedLoan = world.loans.some(
-      (loan) =>
-        loan.borrowerId === company.id && loan.status === "active" && loan.missedPayments >= 2,
-    );
-    if (company.missedPayrollMonths > 0 || (weakOperations && thinLiquidity) || missedLoan) {
-      company.distressMonths += 1;
-    } else {
-      company.distressMonths = Math.max(0, company.distressMonths - 1);
-    }
+function updateDistressAndBankruptcies(world: WorldState): void {
+  for (const company of [...activeCompanies(world)]) {
+    const loss = company.lastGrossRevenueCents - company.lastCogsCents - company.lastWagesCents - company.lastDepreciationCents - company.lastInterestCents - company.lastTaxCents;
+    company.distressMonths = loss < 0 && depositOf(world, company.id) < company.wageCents * Math.max(2, company.employees.length) ? company.distressMonths + 1 : Math.max(0, company.distressMonths - 1);
+    if (company.distressMonths < 12 && company.missedPayrollMonths < 6) continue;
+    const event = emitSimpleEvent(world, "CompanyBankrupt", "Компания прекратила работу", company.name, [company.id, company.bankId], "critical", [], { lossCents: loss });
+    for (const id of [...company.employees]) { const household = world.households.find((item) => item.id === id); if (household) leaveCompany(world, household, "банкротство работодателя"); }
+    settleBorrowerLoansFromCash(world, company.id, [event]);
+    defaultBorrowerLoans(world, company.id, [event]);
+    company.active = false;
+    company.closedAtMonth = world.clock.elapsedMonths;
+    company.closureReason = "Недостаток ликвидности и устойчивая убыточность";
   }
-}
-
-function bankruptCompany(world: WorldState, company: Company): void {
-  const causeIds = world.events
-    .filter((event) => event.actorIds.includes(company.id))
-    .slice(-4)
-    .map((event) => event.id);
-  const bankruptcyEvent = emitSimpleEvent(
-    world,
-    "CompanyBankrupt",
-    `${company.name} прекратила деятельность`,
-    `Нехватка ликвидности и пропущенные обязательства привели к закрытию. Кредиторы признают убытки.`,
-    [company.id, company.bankId],
-    "critical",
-    causeIds,
-    { depositCents: depositOf(world, company.id), distressMonths: company.distressMonths },
-  );
-  for (const householdId of [...company.employees]) {
-    const household = world.households.find((item) => item.id === householdId);
-    if (household) leaveCompany(world, household, `${company.name} прекратила деятельность`);
-  }
-  if (company.inventoryMilliUnits > 0) {
-    recordGoodsMovement(world, {
-      goodId: company.goodId,
-      fromId: company.id,
-      toId: "liquidation-loss",
-      quantityMilliUnits: company.inventoryMilliUnits,
-      reason: "LIQUIDATION",
-      causeIds: [bankruptcyEvent],
-    });
-    company.inventoryMilliUnits = 0;
-  }
-  settleBorrowerLoansFromCash(world, company.id, [bankruptcyEvent]);
-  defaultBorrowerLoans(world, company.id, [bankruptcyEvent]);
-  company.active = false;
-  company.closedAtMonth = world.clock.elapsedMonths;
-  company.closureReason = "Неплатёжеспособность";
-}
-
-function processBankruptcies(world: WorldState): void {
-  for (const company of activeCompanies(world)) {
-    const severeLoanArrears = world.loans.some(
-      (loan) => loan.borrowerId === company.id && loan.status === "active" && loan.missedPayments >= 3,
-    );
-    if (company.distressMonths >= 7 || company.missedPayrollMonths >= 4 || severeLoanArrears) {
-      bankruptCompany(world, company);
-    }
-  }
-}
-
-function foundCompanyIfNeeded(world: WorldState): void {
-  if (!isQuarterEnd(world.clock) || activeCompanies(world).length >= 10) return;
-  const marketGap = world.goods
-    .map((good) => {
-      const suppliers = activeCompanies(world).filter((company) => company.goodId === good.id);
-      const price = suppliers.length
-        ? suppliers.reduce((sum, supplier) => sum + supplier.priceCents, 0) / suppliers.length
-        : good.basePriceCents * 2;
-      return {
-        good,
-        score:
-          price / good.basePriceCents +
-          Math.max(0, 2 - suppliers.length) * 12 -
-          suppliers.length * 0.35,
-      };
-    })
-    .sort((left, right) => right.score - left.score)[0];
-  const founder = [...world.households].sort(
-    (left, right) => depositOf(world, right.id) - depositOf(world, left.id) || left.id.localeCompare(right.id),
-  )[0];
-  if (!founder || depositOf(world, founder.id) < 40_000_00) return;
-  const sequence = world.nextCompanyId++;
-  const company: Company = {
-    id: `company-${String(sequence).padStart(3, "0")}`,
-    name: `${marketGap.good.shortName} · Новая ${sequence}`,
-    goodId: marketGap.good.id,
-    ownerHouseholdId: founder.id,
-    bankId: founder.bankId,
-    active: true,
-    employees: [],
-    wageCents: Math.max(founder.reservationWageCents, 31_000_00),
-    priceCents: Math.round(marketGap.good.basePriceCents * 1.08),
-    capacityMilliUnits:
-      ({ food: 340_000, energy: 380_000, materials: 220_000, goods: 125_000, services: 190_000 }[
-        marketGap.good.id
-      ] ?? 180_000) +
-      (sequence % 4) * 10_000,
-    productivityBps: 8_700 + (founder.skillBps % 2_000),
-    inventoryMilliUnits: 12_000,
-    inputInventoryMilliUnits: Object.fromEntries(world.goods.map((good) => [good.id, 0])),
-    lastProductionMilliUnits: 0,
-    lastSalesMilliUnits: 0,
-    lastGrossRevenueCents: 0,
-    lastOperatingExpenseCents: 0,
-    distressMonths: 0,
-    missedPayrollMonths: 0,
-    foundedAtMonth: world.clock.elapsedMonths,
-    closedAtMonth: null,
-    closureReason: null,
-  };
-  world.companies.push(company);
-  const contribution = Math.min(
-    900_000_00,
-    Math.max(30_000_00, Math.floor(depositOf(world, founder.id) * 0.3)),
-  );
-  const contributionTx = capitalContribution(world, founder.id, company.id, contribution);
-  founder.foundedCompanyIds.push(company.id);
-  recordGoodsMovement(world, {
-    goodId: company.goodId,
-    fromId: "founder-inventory",
-    toId: company.id,
-    quantityMilliUnits: company.inventoryMilliUnits,
-    reason: "GENESIS",
-    causeIds: contributionTx ? [contributionTx] : [],
-  });
-  emitSimpleEvent(
-    world,
-    "CompanyFounded",
-    `Основана компания «${company.name}»`,
-    `${founder.displayName} вошли на рынок «${marketGap.good.name}», где цены и концентрация сигнализировали о возможности.`,
-    [founder.id, company.id],
-    "positive",
-    contributionTx ? [contributionTx] : [],
-    { contributionCents: contribution },
-  );
 }
 
 function collectCorporateTax(world: WorldState): void {
   if (!isYearEnd(world.clock)) return;
-  const yearlyMetrics = world.metricsHistory.slice(-11);
   for (const company of activeCompanies(world)) {
-    const current = {
-      revenueCents: company.lastGrossRevenueCents,
-      expenseCents: company.lastOperatingExpenseCents,
-    };
-    const prior = yearlyMetrics
-      .flatMap((metric) => metric.companyMetrics)
-      .filter((metric) => metric.companyId === company.id)
-      .reduce(
-        (totals, metric) => ({
-          revenueCents: totals.revenueCents + metric.revenueCents,
-          expenseCents: totals.expenseCents + metric.expenseCents,
-        }),
-        { revenueCents: 0, expenseCents: 0 },
-      );
-    const taxableProfit = Math.max(
-      0,
-      prior.revenueCents + current.revenueCents - prior.expenseCents - current.expenseCents,
-    );
-    const tax = Math.min(
-      depositOf(world, company.id),
-      Math.floor((taxableProfit * world.government.corporateTaxBps) / 10_000),
-    );
-    transferDeposit(
-      world,
-      company.id,
-      world.government.id,
-      tax,
-      "CORPORATE_TAX",
-      `Налог на прибыль: ${company.name}`,
-    );
-    company.lastOperatingExpenseCents += tax;
+    const annualProfit = company.financialReports.slice(-11).reduce((sum, report) => sum + report.netIncomeCents, 0)
+      + company.lastGrossRevenueCents - company.lastCogsCents - company.lastWagesCents - company.lastDepreciationCents - company.lastInterestCents;
+    const tax = Math.min(depositOf(world, company.id), Math.max(0, Math.round(annualProfit * world.government.corporateTaxBps / 10_000)));
+    const tx = tax > 0 ? transferDeposit(world, company.id, world.government.id, tax, "CORPORATE_TAX", `Налог на прибыль: ${company.name}`) : null;
+    if (tx) { company.lastTaxCents += tax; company.lastOperatingExpenseCents += tax; }
   }
 }
 
 function updateCentralBankPolicy(world: WorldState): void {
-  if (!isYearEnd(world.clock)) return;
-  const metrics = collectMetrics(world);
-  const previousRate = world.centralBank.policyRateBps;
-  if (metrics.annualInflationBps > world.centralBank.inflationTargetBps + 150) {
-    world.centralBank.policyRateBps = Math.min(2_500, previousRate + 50);
-  } else if (
-    metrics.annualInflationBps < world.centralBank.inflationTargetBps - 150 &&
-    metrics.unemploymentBps > 900
-  ) {
-    world.centralBank.policyRateBps = Math.max(100, previousRate - 50);
-  }
-  if (world.centralBank.policyRateBps !== previousRate) {
-    emitSimpleEvent(
-      world,
-      "InterestRateChanged",
-      "Центральный банк изменил ключевую ставку",
-      `Ставка изменена с ${(previousRate / 100).toFixed(2)}% до ${(world.centralBank.policyRateBps / 100).toFixed(2)}% после наблюдаемой инфляции и занятости.`,
-      [world.centralBank.id],
-      "attention",
-      [],
-      {
-        previousRateBps: previousRate,
-        policyRateBps: world.centralBank.policyRateBps,
-        inflationBps: metrics.annualInflationBps,
-        unemploymentBps: metrics.unemploymentBps,
-      },
-    );
-  }
+  if (!isQuarterEnd(world.clock)) return;
+  const inflation = world.metricsHistory.at(-1)?.annualInflationBps ?? world.centralBank.inflationTargetBps;
+  const oldRate = world.centralBank.policyRateBps;
+  const newRate = clamp(oldRate + clamp(Math.round((inflation - world.centralBank.inflationTargetBps) * 0.18), -100, 125), 200, 2_500);
+  if (newRate === oldRate) return;
+  world.centralBank.policyRateBps = newRate;
+  world.centralBank.policyRateHistory.push({ elapsedMonth: world.clock.elapsedMonths, rateBps: newRate });
+  emitSimpleEvent(world, "InterestRateChanged", "Ключевая ставка изменена", `${(oldRate / 100).toFixed(2)}% → ${(newRate / 100).toFixed(2)}%`, [world.centralBank.id], "attention", [], { oldRateBps: oldRate, newRateBps: newRate, inflationBps: inflation });
+}
+
+function foundCompanyIfNeeded(world: WorldState): void {
+  if (!isYearEnd(world.clock) || activeCompanies(world).length > 10) return;
+  const founder = world.households.filter((item) => item.id !== world.player.householdId).sort((a, b) => depositOf(world, b.id) - depositOf(world, a.id))[0];
+  if (!founder || depositOf(world, founder.id) < 150_000_00) return;
+  const good = [...world.goods].sort((a, b) => suppliersFor(world, a.id).length - suppliersFor(world, b.id).length)[0];
+  const id = `company-${String(world.nextCompanyId++).padStart(3, "0")}`;
+  const capital = 100_000_00;
+  const company: Company = { id, name: `Новая ${good.shortName} ${world.nextCompanyId}`, goodId: good.id, ownerHouseholdId: founder.id, bankId: founder.bankId, active: true, employees: [], wageCents: founder.reservationWageCents, priceCents: good.basePriceCents, capacityMilliUnits: 80_000, productivityBps: 9_000, inventoryMilliUnits: 0, inventoryValueCents: 0, inputInventoryMilliUnits: Object.fromEntries(world.goods.map((item) => [item.id, 0])), inputInventoryValueCents: Object.fromEntries(world.goods.map((item) => [item.id, 0])), productiveCapital: { acquisitionCostCents: capital, bookValueCents: capital, accumulatedDepreciationCents: 0, usefulLifeMonths: 180, capacityMilliUnits: 80_000 }, retainedEarningsCents: 0, financialReports: [], lastProductionMilliUnits: 0, lastSalesMilliUnits: 0, lastGrossRevenueCents: 0, lastOperatingExpenseCents: 0, lastCogsCents: 0, lastIntermediateConsumptionCents: 0, lastIntermediateConsumptionBaseCents: 0, lastWagesCents: 0, lastDepreciationCents: 0, lastInterestCents: 0, lastTaxCents: 0, lastCapitalInvestmentCents: 0, lastHouseholdSalesCents: 0, lastGovernmentSalesCents: 0, distressMonths: 0, missedPayrollMonths: 0, foundedAtMonth: world.clock.elapsedMonths, closedAtMonth: null, closureReason: null };
+  world.companies.push(company);
+  founder.foundedCompanyIds.push(id);
+  const tx = capitalContribution(world, founder.id, id, capital);
+  if (!tx) { world.companies.pop(); founder.foundedCompanyIds.pop(); return; }
+  const supplier = suppliersFor(world, "goods").find((item) => item.id !== id);
+  const invested = supplier ? sellFinalGood(world, id, supplier, Math.round(capital * 0.8), "CAPITAL", id) : 0;
+  company.productiveCapital.acquisitionCostCents = invested;
+  company.productiveCapital.bookValueCents = invested;
+  company.lastCapitalInvestmentCents = invested;
+  world.nationalAccounts.current.capitalFormationCents += invested;
+  emitSimpleEvent(world, "CompanyFounded", "Зарегистрирована компания", company.name, [founder.id, company.id], "positive", [tx]);
 }
 
 export function stepMonth(world: WorldState): void {
-  resetMonthlyCompanyState(world);
+  for (const company of world.companies) resetCompanyPeriod(company);
+  beginNationalAccountingMonth(world);
   serviceLoans(world);
   runLabourMarket(world);
   payWagesAndTaxes(world);
   paySocialTransfers(world);
-  // Supply chain is processed in technological order within the monthly tick.
-  // A downstream producer can buy the output that an upstream producer made this month.
-  produceGoods(world, ["services"]);
-  procureInputs(world, ["energy"]);
-  produceGoods(world, ["energy"]);
-  procureInputs(world, ["food", "materials"]);
-  produceGoods(world, ["food", "materials"]);
-  procureInputs(world, ["goods"]);
-  produceGoods(world, ["goods"]);
-  clearGoodsMarket(world);
-  updatePricesAndWages(world);
-  updateDistress(world);
+  procureInputs(world);
+  produceGoods(world);
+  clearHouseholdMarket(world);
+  governmentPurchases(world);
+  depreciateCapital(world);
+  investInCapital(world);
+  updatePricesAndExpectations(world);
+  updateDistressAndBankruptcies(world);
   collectCorporateTax(world);
-  processBankruptcies(world);
-  for (let attempt = 0; attempt < 10 && activeCompanies(world).length < 10; attempt += 1) {
-    const before = activeCompanies(world).length;
-    foundCompanyIfNeeded(world);
-    if (activeCompanies(world).length === before) break;
-  }
-  updateCentralBankPolicy(world);
-
+  foundCompanyIfNeeded(world);
   const metric = collectMetrics(world);
   world.metricsHistory.push(metric);
-  const date = currentDate(world.clock);
-  emitSimpleEvent(
-    world,
-    "MonthClosed",
-    "Месяц закрыт",
-    `${String(date.month).padStart(2, "0")}.${date.year}: выпуск, рынок труда и финансовые книги сведены.`,
-    [],
-    "info",
-    [],
-    {
-      gdpCents: metric.nominalGdpCents,
-      unemploymentBps: metric.unemploymentBps,
-      cpiBps: metric.cpiBps,
-    },
-  );
+  recordPlayerMonth(world);
+  closeMonthlyAccounting(world);
+  updateCentralBankPolicy(world);
+  emitSimpleEvent(world, "MonthClosed", "Месяц закрыт", formatSimulationDate(world.clock), [], "info", [], { nominalGdpCents: metric.nominalGdpCents, annualInflationBps: metric.annualInflationBps, unemploymentBps: metric.unemploymentBps });
   world.clock.elapsedMonths += 1;
 }
 
 export function runMonths(world: WorldState, months: number): void {
-  if (!Number.isInteger(months) || months < 0) throw new Error("Число месяцев должно быть целым");
   for (let index = 0; index < months; index += 1) stepMonth(world);
 }

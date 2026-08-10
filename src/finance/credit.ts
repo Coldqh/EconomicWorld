@@ -8,6 +8,7 @@ import {
   postTransaction,
 } from "../core/ledger.ts";
 import type { Bank, Loan, WorldState } from "../domain/model.ts";
+import { bankLiquidityRatioBps } from "./liquidity.ts";
 
 export function bankCapitalCents(world: WorldState, bankId: string): number {
   return entityBook(world, bankId).capital;
@@ -51,7 +52,25 @@ export function issueLoan(
   const capital = bankCapitalCents(world, bankId);
   const newRiskAssets = bankLoanAssetsCents(world, bankId) + amountCents;
   const projectedRatio = newRiskAssets > 0 ? Math.floor((capital * 10_000) / newRiskAssets) : 100_000;
-  if (projectedRatio < bank.minimumCapitalRatioBps) return null;
+  const company = world.companies.find((item) => item.id === borrowerId);
+  const recentReports = company?.financialReports.slice(-3) ?? [];
+  const averageCashFlow = recentReports.length
+    ? recentReports.reduce((sum, report) => sum + report.operatingCashFlowCents, 0) / recentReports.length
+    : company?.lastGrossRevenueCents ?? amountCents;
+  const existingDebt = world.loans
+    .filter((loan) => loan.borrowerId === borrowerId && loan.status === "active")
+    .reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
+  const liquidityRatio = bankLiquidityRatioBps(world, bankId);
+  const reasons = {
+    capitalConstraint: projectedRatio < bank.minimumCapitalRatioBps,
+    liquidityConstraint: liquidityRatio < bank.minimumLiquidityRatioBps,
+    borrowerRisk: riskPremiumBps > 900,
+    cashFlowConstraint: averageCashFlow < 0 || existingDebt > Math.max(amountCents * 3, averageCashFlow * 24),
+  };
+  if (Object.values(reasons).some(Boolean)) {
+    emitSimpleEvent(world, "LoanRejected", "Банк отказал в кредите", `Заявка ${borrowerId} не прошла ограничения капитала, ликвидности или денежного потока.`, [bankId, borrowerId], "attention", causeIds, { ...reasons, projectedCapitalRatioBps: projectedRatio, liquidityRatioBps: liquidityRatio, averageCashFlowCents: Math.round(averageCashFlow) });
+    return null;
+  }
 
   const depositAccount = accountIds.deposit(borrowerId);
   const depositLiability = accountIds.bankDepositLiability(bankId, borrowerId);
@@ -156,6 +175,11 @@ export function serviceLoans(world: WorldState): void {
         amountCents: interestCents,
       },
     ]);
+    const borrowerCompany = world.companies.find((company) => company.id === loan.borrowerId);
+    if (borrowerCompany) {
+      borrowerCompany.lastInterestCents += interestCents;
+      borrowerCompany.lastOperatingExpenseCents += interestCents;
+    }
     postTransaction(world, "LOAN_PRINCIPAL", `Погашение principal ${loan.id}`, [
       { accountId: borrowerLoan, side: "debit", amountCents: principalCents },
       { accountId: accountIds.deposit(loan.borrowerId), side: "credit", amountCents: principalCents },

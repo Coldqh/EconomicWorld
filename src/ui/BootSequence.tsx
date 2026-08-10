@@ -2,14 +2,14 @@ import { useEffect, useState } from "react";
 import { useReducedMotion } from "./motion.tsx";
 
 const PHASES = [
-  "INITIALIZING LEDGER",
-  "CREATING HOUSEHOLDS",
-  "INITIALIZING FIRMS",
-  "INITIALIZING BANKS",
-  "ESTABLISHING PAYMENT NETWORK",
-  "BUILDING MARKETS",
-  "VERIFYING BALANCES",
-  "ECONOMY ONLINE",
+  "ЗАПУСК ОБЩЕГО РЕЕСТРА",
+  "СОЗДАНИЕ ДОМОХОЗЯЙСТВ",
+  "СОЗДАНИЕ КОМПАНИЙ",
+  "ЗАПУСК БАНКОВ",
+  "НАСТРОЙКА ПЛАТЕЖЕЙ",
+  "ФОРМИРОВАНИЕ РЫНКОВ",
+  "ПРОВЕРКА БАЛАНСОВ",
+  "ЭКОНОМИКА ГОТОВА",
 ];
 
 export function BootSequence({ onComplete }: { onComplete: () => void }) {
@@ -41,7 +41,7 @@ export function BootSequence({ onComplete }: { onComplete: () => void }) {
         <div className="boot-sequence">
           {PHASES.map((item, index) => (
             <div key={item} className={index < phase ? "is-done" : index === phase ? "is-active" : ""}>
-              <span>{String(index + 1).padStart(2, "0")}</span><b>{item}</b><i>{index < phase ? "OK" : index === phase ? "•••" : "—"}</i>
+              <span>{String(index + 1).padStart(2, "0")}</span><b>{item}</b><i>{index < phase ? "ДА" : index === phase ? "•••" : "—"}</i>
             </div>
           ))}
         </div>
