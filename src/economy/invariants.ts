@@ -10,10 +10,27 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const results: InvariantResult[] = [];
   const brokenTransaction = world.ledger.transactions.find((transaction) => transaction.entries.filter((entry) => entry.side === "debit").reduce((sum, entry) => sum + entry.amountCents, 0) !== transaction.entries.filter((entry) => entry.side === "credit").reduce((sum, entry) => sum + entry.amountCents, 0));
   results.push(result("Бухгалтерия", "double-entry", "Дебеты равны кредитам", !brokenTransaction, brokenTransaction ? `Нарушение в ${brokenTransaction.id}` : `${world.ledger.transactions.length.toLocaleString("ru-RU")} транзакций сбалансированы`));
+  const mixedCurrencyTransaction = world.ledger.transactions.find((transaction) => new Set(transaction.entries.map((entry) => world.ledger.accounts[entry.accountId]?.currency)).size !== 1);
+  results.push(result("Бухгалтерия", "single-currency-legs", "Каждая проводка выражена в одной валюте", !mixedCurrencyTransaction, mixedCurrencyTransaction?.id ?? "FX исполняется двумя связанными ledger-ногами"));
 
   const depositAssets = sumAccounts(world, (account) => account.category === "asset" && account.instrument === "deposit");
   const depositLiabilities = sumAccounts(world, (account) => account.category === "liability" && account.instrument === "deposit");
   results.push(result("Деньги", "deposit-mirror", "Депозиты имеют банковскую сторону", depositAssets === depositLiabilities, `Клиенты / банки: ${(depositAssets / 100).toLocaleString("ru-RU")} ₽`, depositAssets - depositLiabilities));
+  const currencyDepositMismatch = world.currencies.find((currency) => {
+    const assets = sumAccounts(world, (account) => account.currency === currency.id && account.category === "asset" && account.instrument === "deposit");
+    const liabilities = sumAccounts(world, (account) => account.currency === currency.id && account.category === "liability" && account.instrument === "deposit");
+    return assets !== liabilities;
+  });
+  results.push(result("Деньги", "deposit-mirror-by-currency", "Депозиты сверены по каждой валюте", !currencyDepositMismatch, currencyDepositMismatch?.id ?? `${world.currencies.length} валют сверены`));
+
+  const brokenBankAccount = world.bankAccounts.find((account) => {
+    const bank = world.banks.find((item) => item.id === account.bankId);
+    return !bank || bank.baseCurrency !== account.currencyId
+      || world.ledger.accounts[account.ledgerDepositAccountId]?.currency !== account.currencyId
+      || world.ledger.accounts[account.ledgerBankLiabilityAccountId]?.currency !== account.currencyId;
+  });
+  const duplicatedPrimary = [...new Set(world.bankAccounts.map((account) => account.ownerId))].find((ownerId) => world.bankAccounts.filter((account) => account.ownerId === ownerId && account.status === "active" && account.isPrimary).length !== 1);
+  results.push(result("Деньги", "bank-account-registry", "Банковские счета и валюты связаны", !brokenBankAccount && !duplicatedPrimary, brokenBankAccount?.id ?? duplicatedPrimary ?? `${world.bankAccounts.length} счетов`));
 
   const reserveAssets = sumAccounts(world, (account) => account.category === "asset" && account.instrument === "reserve" && world.banks.some((bank) => bank.id === account.ownerId));
   const reserveLiabilities = sumAccounts(world, (account) => account.category === "liability" && account.instrument === "reserve" && world.centralBanks.some((bank) => bank.id === account.ownerId));
@@ -22,8 +39,8 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const negativeReserves = world.banks.filter((bank) => balanceOf(world, accountIds.bankReserve(bank.id)) < 0);
   results.push(result("Ликвидность банков", "non-negative-reserves", "Резервы банков неотрицательны", negativeReserves.length === 0, negativeReserves.length ? negativeReserves.map((bank) => bank.name).join(", ") : "Межбанк и окно ЦБ закрывают расчётный дефицит"));
 
-  const loanAssets = sumAccounts(world, (account) => account.category === "asset" && account.instrument === "loan" && world.banks.some((bank) => bank.id === account.ownerId));
-  const loanLiabilities = sumAccounts(world, (account) => account.category === "liability" && account.instrument === "loan");
+  const loanAssets = sumAccounts(world, (account) => account.category === "asset" && account.instrument === "loan" && !account.id.includes(":margin-loan:") && world.banks.some((bank) => bank.id === account.ownerId));
+  const loanLiabilities = sumAccounts(world, (account) => account.category === "liability" && account.instrument === "loan" && !account.id.includes(":margin-loan:"));
   const contracts = world.loans.filter((loan) => loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
   results.push(result("Кредит", "loan-mirror", "Кредитор, должник и договор совпадают", loanAssets === loanLiabilities && loanAssets === contracts, `Основной долг: ${(contracts / 100).toLocaleString("ru-RU")} ₽`, loanAssets - contracts));
 
@@ -37,11 +54,10 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   }
   results.push(result("Бухгалтерия", "accounting-equation", "Балансовые уравнения выполняются", !brokenBook, brokenBook ? `Не сходится книга ${brokenBook}` : `${owners.length} книг прошли проверку`, bookDifference));
 
-  const monetaryOwners = [...new Set(Object.values(world.ledger.accounts).filter((account) => account.category === "asset" && account.instrument === "deposit").map((account) => account.ownerId))];
-  const negativeDeposits = monetaryOwners.filter((id) => balanceOf(world, accountIds.deposit(id)) < 0);
+  const negativeDeposits = world.bankAccounts.filter((account) => balanceOf(world, account.ledgerDepositAccountId) < 0).map((account) => account.id);
   results.push(result("Деньги", "non-negative-money", "Нет неразрешённого овердрафта", negativeDeposits.length === 0, negativeDeposits.length ? negativeDeposits.join(", ") : "Все депозитные счета неотрицательны"));
 
-  const allowedMoneyChanges = new Set(["GENESIS", "LOAN_ISSUED", "LOAN_PRINCIPAL", "LOAN_INTEREST"]);
+  const allowedMoneyChanges = new Set(["GENESIS", "LOAN_ISSUED", "LOAN_PRINCIPAL", "LOAN_INTEREST", "MARGIN_FINANCE", "MARGIN_REPAYMENT"]);
   const unauthorized = world.ledger.transactions.find((transaction) => {
     const change = transaction.entries.reduce((sum, entry) => {
       const account: LedgerAccount = world.ledger.accounts[entry.accountId];
@@ -116,10 +132,31 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const brokenOrder = world.marketOrders.find((order) => order.quantity <= 0 || order.remainingQuantity < 0 || order.remainingQuantity > order.quantity || (order.type === "limit" && (!order.limitPriceCents || order.limitPriceCents <= 0)));
   results.push(result("Рынки", "order-book", "Заявки корректны", !brokenOrder, brokenOrder?.id ?? `${world.marketOrders.length} заявок`));
 
-  const brokenTrade = world.marketTrades.find((trade) => trade.quantity <= 0 || trade.priceCents <= 0 || !world.marketOrders.some((order) => order.id === trade.buyOrderId) || !world.marketOrders.some((order) => order.id === trade.sellOrderId));
+  const allOrderIds = new Set([...world.marketOrders, ...world.archivedMarketOrders].map((order) => order.id));
+  const brokenTrade = world.marketTrades.find((trade) => trade.quantity <= 0 || trade.priceCents <= 0 || !allOrderIds.has(trade.buyOrderId) || !allOrderIds.has(trade.sellOrderId));
   results.push(result("Рынки", "trade-registry", "Сделки связаны с заявками", !brokenTrade, brokenTrade?.id ?? `${world.marketTrades.length} сделок`));
 
   const brokenScope = world.countries.find((country) => country.companyIds.some((id) => !world.companies.some((company) => company.id === id && company.headquartersCountryId === country.id)) || country.bankIds.some((id) => !world.banks.some((bank) => bank.id === id && bank.countryId === country.id)) || !world.centralBanks.some((bank) => bank.id === country.centralBankId));
   results.push(result("География", "country-economy-scope", "Экономические контуры стран связаны", !brokenScope, brokenScope?.name ?? `${world.countries.length} локальных контуров`));
+
+  const brokenMonetaryArea = world.monetaryAreas.find((area) => !world.centralBanks.some((bank) => bank.id === area.monetaryAuthorityId && bank.setsPolicyRate && bank.currencyId === area.currencyId)
+    || area.memberCountryIds.some((countryId) => { const country = world.countries.find((item) => item.id === countryId); return !country || country.monetaryAreaId !== area.id || country.currencyReference !== area.currencyId; }));
+  results.push(result("Деньги", "monetary-areas", "Денежные зоны имеют одну власть", !brokenMonetaryArea, brokenMonetaryArea?.name ?? `${world.monetaryAreas.length} денежных зон`));
+
+  const brokenFundUnits = world.funds.find((fund) => world.fundUnitHoldings.filter((holding) => holding.fundId === fund.id).reduce((sum, holding) => sum + holding.unitsMicros, 0) !== fund.unitsOutstandingMicros);
+  const brokenFundNav = world.funds.find((fund) => {
+    const cash = balanceOf(world, world.bankAccounts.find((account) => account.id === fund.bankAccountId)?.ledgerDepositAccountId ?? "");
+    const securities = world.equityHoldings.filter((holding) => holding.ownerId === fund.id).reduce((sum, holding) => sum + holding.shares * (world.listings.find((listing) => listing.securityId === holding.securityId)?.lastPriceCents ?? Math.round(holding.costBasisCents / Math.max(1, holding.shares))), 0);
+    const liabilities = world.marginAccounts.filter((account) => account.ownerId === fund.id && account.status !== "closed").reduce((sum, account) => sum + account.borrowedMinor, 0)
+      + world.repoAgreements.filter((repo) => repo.cashBorrowerId === fund.id && repo.status === "active").reduce((sum, repo) => sum + repo.cashAmountMinor, 0);
+    return cash + securities - liabilities !== fund.navMinor;
+  });
+  results.push(result("Фонды", "fund-units", "Паи фондов сходятся", !brokenFundUnits, brokenFundUnits?.name ?? `${world.funds.length} фондов`));
+  results.push(result("Фонды", "fund-nav", "Активы минус обязательства равны NAV", !brokenFundNav, brokenFundNav?.name ?? "NAV сверён с реальными позициями"));
+
+  const doublePledged = world.collateralPledges.find((pledge) => pledge.status === "active" && pledge.assetType === "security" && world.collateralPledges.filter((item) => item.status === "active" && item.ownerId === pledge.ownerId && item.assetType === "security" && item.assetId === pledge.assetId).reduce((sum, item) => sum + item.quantity, 0) > (world.equityHoldings.find((holding) => holding.ownerId === pledge.ownerId && holding.securityId === pledge.assetId)?.shares ?? 0));
+  const brokenMarginExposure = world.marginAccounts.find((account) => !world.primeBrokerExposures.some((exposure) => exposure.marginAccountId === account.id && exposure.primeBrokerId === account.primeBrokerId) || account.borrowedMinor < 0);
+  results.push(result("Обеспечение", "collateral-availability", "Залог нельзя использовать дважды", !doublePledged, doublePledged?.id ?? `${world.collateralPledges.filter((item) => item.status === "active").length} активных залогов`));
+  results.push(result("Обеспечение", "prime-broker-exposure", "Маржинальные счета связаны с прайм-брокером", !brokenMarginExposure, brokenMarginExposure?.id ?? `${world.marginAccounts.length} маржинальных счетов`));
   return results;
 }

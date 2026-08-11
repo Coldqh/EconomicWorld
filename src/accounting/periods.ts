@@ -26,26 +26,35 @@ export function resetCompanyPeriod(company: Company): void {
   company.lastGovernmentSalesCents = 0;
 }
 
-function cashFlowForCompany(world: WorldState, companyId: string): { operating: number; investing: number; financing: number } {
-  const flows = { operating: 0, investing: 0, financing: 0 };
+type CompanyCashFlow = { operating: number; investing: number; financing: number };
+
+function companyCashFlows(world: WorldState): Map<string, CompanyCashFlow> {
+  const companyIdsByDeposit = new Map(world.companies.map((company) => [accountIds.deposit(company.id), company.id]));
+  for (const account of world.bankAccounts) {
+    if (world.companies.some((company) => company.id === account.ownerId)) companyIdsByDeposit.set(account.ledgerDepositAccountId, account.ownerId);
+  }
+  const byCompany = new Map<string, CompanyCashFlow>();
   const financingKinds = new Set<TransactionKind>(["LOAN_ISSUED", "LOAN_PRINCIPAL", "CAPITAL_CONTRIBUTION"]);
   for (let index = world.ledger.transactions.length - 1; index >= 0; index -= 1) {
     const transaction = world.ledger.transactions[index];
     if (transaction.elapsedMonth < world.clock.elapsedMonths) break;
     if (transaction.elapsedMonth > world.clock.elapsedMonths) continue;
-    const depositEntry = transaction.entries.find((entry) => entry.accountId === accountIds.deposit(companyId));
-    if (!depositEntry) continue;
-    const delta = depositEntry.side === "debit" ? depositEntry.amountCents : -depositEntry.amountCents;
-    if (transaction.kind === "CAPITAL_INVESTMENT") flows.investing += delta;
-    else if (financingKinds.has(transaction.kind)) flows.financing += delta;
-    else flows.operating += delta;
+    for (const entry of transaction.entries) {
+      const companyId = companyIdsByDeposit.get(entry.accountId);
+      if (!companyId) continue;
+      const flows = byCompany.get(companyId) ?? { operating: 0, investing: 0, financing: 0 };
+      const delta = entry.side === "debit" ? entry.amountCents : -entry.amountCents;
+      if (transaction.kind === "CAPITAL_INVESTMENT") flows.investing += delta;
+      else if (financingKinds.has(transaction.kind)) flows.financing += delta;
+      else flows.operating += delta;
+      byCompany.set(companyId, flows);
+    }
   }
-  return flows;
+  return byCompany;
 }
 
-function createCompanyReport(world: WorldState, company: Company): CompanyFinancialReport {
+function createCompanyReport(world: WorldState, company: Company, cashFlow: CompanyCashFlow): CompanyFinancialReport {
   const book = entityBook(world, company.id);
-  const cashFlow = cashFlowForCompany(world, company.id);
   const grossProfitCents = company.lastGrossRevenueCents - company.lastCogsCents;
   const netIncomeCents = grossProfitCents
     - company.lastWagesCents
@@ -77,26 +86,32 @@ function createCompanyReport(world: WorldState, company: Company): CompanyFinanc
 }
 
 function closeOwnerProfitAndLoss(world: WorldState, ownerId: string, accounts: Array<(typeof world.ledger.accounts)[string]>): void {
-  const income = accounts.filter((account) => account.category === "income").map((account) => ({ account, value: balanceOf(world, account.id) })).filter((item) => item.value > 0);
-  const expenses = accounts.filter((account) => account.category === "expense").map((account) => ({ account, value: balanceOf(world, account.id) })).filter((item) => item.value > 0);
-  const incomeTotal = income.reduce((sum, item) => sum + item.value, 0);
-  const expenseTotal = expenses.reduce((sum, item) => sum + item.value, 0);
-  if (incomeTotal === 0 && expenseTotal === 0) return;
-  const retained = accountIds.retainedEarnings(ownerId);
-  ensureAccount(world.ledger, retained, ownerId, "Нераспределённая прибыль", "equity");
-  const entries = [
-    ...income.map((item) => ({ accountId: item.account.id, side: "debit" as const, amountCents: item.value })),
-    ...expenses.map((item) => ({ accountId: item.account.id, side: "credit" as const, amountCents: item.value })),
-  ];
-  if (incomeTotal > expenseTotal) entries.push({ accountId: retained, side: "credit", amountCents: incomeTotal - expenseTotal });
-  if (expenseTotal > incomeTotal) entries.push({ accountId: retained, side: "debit", amountCents: expenseTotal - incomeTotal });
-  postTransaction(world, "ACCOUNTING_CLOSE", `Закрытие месяца: ${ownerId}`, entries);
+  const currencies = [...new Set(accounts.map((account) => account.currency))];
+  for (const currency of currencies) {
+    const currencyAccounts = accounts.filter((account) => account.currency === currency);
+    const income = currencyAccounts.filter((account) => account.category === "income").map((account) => ({ account, value: balanceOf(world, account.id) })).filter((item) => item.value > 0);
+    const expenses = currencyAccounts.filter((account) => account.category === "expense").map((account) => ({ account, value: balanceOf(world, account.id) })).filter((item) => item.value > 0);
+    const incomeTotal = income.reduce((sum, item) => sum + item.value, 0);
+    const expenseTotal = expenses.reduce((sum, item) => sum + item.value, 0);
+    if (incomeTotal === 0 && expenseTotal === 0) continue;
+    const baseRetained = accountIds.retainedEarnings(ownerId);
+    const retained = world.ledger.accounts[baseRetained]?.currency === currency ? baseRetained : `${baseRetained}:${currency}`;
+    ensureAccount(world.ledger, retained, ownerId, `Нераспределённая прибыль · ${currency}`, "equity", currency);
+    const entries = [
+      ...income.map((item) => ({ accountId: item.account.id, side: "debit" as const, amountCents: item.value })),
+      ...expenses.map((item) => ({ accountId: item.account.id, side: "credit" as const, amountCents: item.value })),
+    ];
+    if (incomeTotal > expenseTotal) entries.push({ accountId: retained, side: "credit", amountCents: incomeTotal - expenseTotal });
+    if (expenseTotal > incomeTotal) entries.push({ accountId: retained, side: "debit", amountCents: expenseTotal - incomeTotal });
+    postTransaction(world, "ACCOUNTING_CLOSE", `Закрытие месяца: ${ownerId} · ${currency}`, entries);
+  }
 }
 
 export function closeMonthlyAccounting(world: WorldState): void {
+  const cashFlows = companyCashFlows(world);
   for (const company of world.companies) {
     if (!company.active) continue;
-    const report = createCompanyReport(world, company);
+    const report = createCompanyReport(world, company, cashFlows.get(company.id) ?? { operating: 0, investing: 0, financing: 0 });
     company.financialReports.push(report);
   }
   const owners = [
@@ -107,6 +122,8 @@ export function closeMonthlyAccounting(world: WorldState): void {
     ...world.centralBanks.map((item) => item.id),
     ...world.brokers.map((item) => item.id),
     ...world.exchanges.map((item) => item.id),
+    ...world.assetManagers.map((item) => item.id),
+    ...world.funds.map((item) => item.id),
     ...world.populationCohorts.map((item) => item.id),
     ...world.firmCohorts.map((item) => item.id),
     "goods-market",

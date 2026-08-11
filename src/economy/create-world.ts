@@ -28,6 +28,9 @@ import type {
   WorldState,
 } from "../domain/model.ts";
 import { COUNTRY_ECONOMY_PACKS } from "../data/country-economies.ts";
+import { CURRENCIES, MONETARY_AREAS, createFxPairs } from "../finance/currencies.ts";
+import { seedInstitutionalFinance } from "../finance/institutional.ts";
+import { seedLeverageFinance } from "../finance/leverage.ts";
 import { createFirmCohorts, createPopulationCohorts } from "../world/cohorts.ts";
 import { createCities, createCountries, createHousingCohorts, createProducts, createUniversities } from "../world/catalog.ts";
 import { updateWorldDiagnostics } from "../world/systems.ts";
@@ -72,6 +75,7 @@ function createHouseholds(people: Person[], banks: readonly Bank[]): Household[]
       displayName: index === 0 ? "Игрок" : `${FIRST_NAMES[index % FIRST_NAMES.length]} — ${LAST_NAMES[Math.floor(index / 10)]}`,
       personIds: [people[index].id],
       bankId: banks.find((bank) => bank.countryId === COUNTRY_ECONOMY_PACKS.find((pack) => pack.companies.some((company) => company.cityId === people[index].cityId))?.countryId)?.id ?? banks[0].id,
+      primaryBankAccountId: "",
       employerId: null,
       skillBps: 7_200 + ((index * 379) % 5_400),
       productivityBps: 7_800 + ((index * 173) % 4_600),
@@ -164,10 +168,23 @@ function createInstitutions(policyRateBps: number): {
     name: pack.centralBankName,
     countryId: pack.countryId,
     currencyId: pack.currencyId,
+    monetaryAreaId: `money-area-${pack.currencyId.toLowerCase()}`,
+    setsPolicyRate: pack.currencyId !== "EUR",
     policyRateBps: policyRateBps + (pack.countryId.charCodeAt(0) % 5) * 35,
     inflationTargetBps: 400,
     policyRateHistory: [{ elapsedMonth: 0, rateBps: policyRateBps }],
   }));
+  centralBanks.push({
+    id: "monetary-authority-eur",
+    name: "Европейский центральный банк",
+    countryId: "eu",
+    currencyId: "EUR",
+    monetaryAreaId: "money-area-eur",
+    setsPolicyRate: true,
+    policyRateBps,
+    inflationTargetBps: 200,
+    policyRateHistory: [{ elapsedMonth: 0, rateBps: policyRateBps }],
+  });
   const banks: Bank[] = COUNTRY_ECONOMY_PACKS.flatMap((pack) => pack.banks.map((bank) => ({
     id: bank.id,
     name: bank.name,
@@ -176,7 +193,7 @@ function createInstitutions(policyRateBps: number): {
     minimumLiquidityRatioBps: bank.liquidityRatioBps,
     countryId: pack.countryId,
     baseCurrency: pack.currencyId,
-    centralBankId: `central-bank-${pack.countryId}`,
+    centralBankId: pack.currencyId === "EUR" ? "monetary-authority-eur" : `central-bank-${pack.countryId}`,
     representationTier: "A" as const,
   })));
   const governments: Government[] = COUNTRY_ECONOMY_PACKS.map((pack, index) => ({
@@ -205,6 +222,8 @@ function createInstitutions(policyRateBps: number): {
     countryId: pack.countryId,
     bankId: pack.banks[0].id,
     exchangeIds: [`exchange-${pack.countryId}`],
+    supportedCurrencyIds: [pack.currencyId],
+    marginAvailable: true,
   }));
   return { banks, governments, centralBanks, exchanges, brokers };
 }
@@ -242,15 +261,18 @@ function createOwnershipAndMarkets(companies: readonly Company[], exchanges: Exc
     directorOwnerIds: [company.ownerHouseholdId],
     approvalThresholdBps: 5_001,
   }));
-  const listings: Listing[] = companies.filter((company) => company.corporateStatus === "public").map((company, index) => {
+  const listingCountByCountry: Record<string, number> = {};
+  const listings: Listing[] = companies.filter((company) => company.corporateStatus === "public").map((company) => {
     const exchange = exchanges.find((item) => item.countryId === company.headquartersCountryId)!;
+    const localIndex = (listingCountByCountry[company.headquartersCountryId] ?? 0) + 1;
+    listingCountByCountry[company.headquartersCountryId] = localIndex;
     exchange.listedSecurityIds.push(company.equitySecurityId);
     return {
-      id: `listing-${company.headquartersCountryId}`,
+      id: `listing-${company.headquartersCountryId}-${String(localIndex).padStart(2, "0")}`,
       exchangeId: exchange.id,
       companyId: company.id,
       securityId: company.equitySecurityId,
-      ticker: `${company.headquartersCountryId.toUpperCase()}${String(index + 1).padStart(2, "0")}`,
+      ticker: `${company.headquartersCountryId.toUpperCase()}${String(localIndex).padStart(2, "0")}`,
       currencyId: exchange.currencyId,
       listedAtMonth: 0,
       lastPriceCents: 1_000,
@@ -275,6 +297,11 @@ export const OCCUPATIONS: Occupation[] = [
   { id: "analyst", name: "Экономический аналитик", level: 2, requiredSkills: { economics: 1_000, statistics: 900, dataAnalysis: 750 }, productivityMultiplierBps: 10_800, minimumExperienceMonths: 6, nextOccupationIds: ["manager"], family: "finance" },
   { id: "developer", name: "Разработчик", level: 2, requiredSkills: { programming: 1_100, dataAnalysis: 650 }, productivityMultiplierBps: 11_200, minimumExperienceMonths: 6, nextOccupationIds: ["manager"], family: "software" },
   { id: "manager", name: "Руководитель", level: 3, requiredSkills: { management: 1_500, communication: 1_400, finance: 900 }, productivityMultiplierBps: 11_800, minimumExperienceMonths: 24, nextOccupationIds: [], family: "management" },
+  { id: "investment-analyst", name: "Инвестиционный аналитик", level: 2, requiredSkills: { finance: 1_250, accounting: 950, dataAnalysis: 900 }, productivityMultiplierBps: 11_000, minimumExperienceMonths: 6, nextOccupationIds: ["portfolio-manager", "fund-manager"], family: "finance" },
+  { id: "risk-analyst", name: "Риск-аналитик", level: 2, requiredSkills: { finance: 1_150, statistics: 1_150, dataAnalysis: 850 }, productivityMultiplierBps: 10_900, minimumExperienceMonths: 6, nextOccupationIds: ["portfolio-manager"], family: "finance" },
+  { id: "investment-banker", name: "Инвестиционный банкир", level: 3, requiredSkills: { finance: 1_650, accounting: 1_250, communication: 1_350 }, productivityMultiplierBps: 12_000, minimumExperienceMonths: 18, nextOccupationIds: ["fund-manager"], family: "finance" },
+  { id: "portfolio-manager", name: "Управляющий портфелем", level: 3, requiredSkills: { finance: 1_750, statistics: 1_300, management: 1_100 }, productivityMultiplierBps: 12_200, minimumExperienceMonths: 24, nextOccupationIds: ["fund-manager"], family: "finance" },
+  { id: "fund-manager", name: "Управляющий фондом", level: 4, requiredSkills: { finance: 2_100, management: 1_700, communication: 1_400 }, productivityMultiplierBps: 12_800, minimumExperienceMonths: 48, nextOccupationIds: [], family: "finance" },
 ];
 
 function assignInitialEmployment(world: WorldState): void {
@@ -333,31 +360,49 @@ export function createWorld(scenario: SimulationScenario = "baseline"): WorldSta
     }
   }
   const world: WorldState = {
-    schemaVersion: 4, saveVersion: 4, seed: "economic-world-v4", scenario,
+    schemaVersion: 5, saveVersion: 5, seed: "economic-world-v5", scenario,
     clock: { startYear: 2026, startMonth: 1, elapsedMonths: 0 }, ledger: createLedger(), goods: structuredClone(GOODS), goodsMovements: [], people, households, companies, banks,
     government: governments.find((item) => item.countryId === "ru")!,
     centralBank: centralBanks.find((item) => item.countryId === "ru")!,
     governments,
     centralBanks,
+    currencies: structuredClone(CURRENCIES),
+    monetaryAreas: structuredClone(MONETARY_AREAS),
+    bankAccounts: [],
     loans: [], bankFunding: [],
     nationalAccounts: { baseYear: 2026, cpiWeightsBps: Object.fromEntries(GOODS.map((good) => [good.id, good.consumptionWeightBps])), current: emptyAccountingPeriod({ goods: GOODS }) },
     occupations: structuredClone(OCCUPATIONS),
-    player: { personId: "person-player", householdId: "household-001", profileId: "student", automaticBasicSpending: true, consumptionBudgetBps: 7_500, savingsTargetBps: 2_500, pendingJobOffer: null, activeEnrollment: null, completedCourseIds: [], completedLessonIds: [], monthlyHistory: [], timeline: [], commandLog: [], nextCommandId: 1, nextTimelineId: 1, currentCityId: "moscow", residencePropertyId: null, activeTravel: null, universityApplications: [], activeUniversityEnrollment: null, completedProgramIds: [], educationHistory: [], visitedCityIds: ["moscow"], visitedCountryIds: ["ru"], residenceHistory: [{ cityId: "moscow", fromMonth: 0, toMonth: null }], durableAssetIds: [], propertyIds: [], brokerageAccountIds: [] },
-    events: [], metricsHistory: [], nextEventId: 1, nextGoodsMovementId: 1, nextLoanId: 1, nextFundingId: 1, nextCompanyId: companies.length + 1,
+    player: { personId: "person-player", householdId: "household-001", profileId: "student", automaticBasicSpending: false, consumptionBudgetBps: 7_500, savingsTargetBps: 2_500, pendingJobOffer: null, jobApplications: [], activeEnrollment: null, completedCourseIds: [], completedLessonIds: [], monthlyHistory: [], timeline: [], commandLog: [], nextCommandId: 1, nextTimelineId: 1, currentCityId: "moscow", residencePropertyId: null, activeTravel: null, universityApplications: [], activeUniversityEnrollment: null, completedProgramIds: [], educationHistory: [], visitedCityIds: ["moscow"], visitedCountryIds: ["ru"], residenceHistory: [{ cityId: "moscow", fromMonth: 0, toMonth: null }], durableAssetIds: [], propertyIds: [], brokerageAccountIds: [], bankAccountIds: [], reportingCurrencyId: "RUB", foodPlanId: "basic" },
+    events: [], metricsHistory: [], countryMetricsHistory: [], nextEventId: 1, nextGoodsMovementId: 1, nextLoanId: 1, nextFundingId: 1, nextCompanyId: companies.length + 1,
     countries, cities, universities, universityPrograms, housingCohorts, properties: [], products: createProducts(), durableAssets: [], populationCohorts, firmCohorts,
-    fidelity: { tierByEntityId: Object.fromEntries(people.map((person) => [person.id, person.fidelityTier])), relevanceByEntityId: { "person-player": 10_000 }, materializedPersonIds: [], budgets: { maxNamedPersons: 500, maxActivePersons: 200, maxFullCompanies: 100, maxActiveProperties: 300 }, activeCityIds: ["moscow"] },
+    fidelity: { tierByEntityId: Object.fromEntries(people.map((person) => [person.id, person.fidelityTier])), relevanceByEntityId: { "person-player": 10_000 }, materializedPersonIds: [], budgets: { maxNamedPersons: 500, maxActivePersons: 200, maxFullCompanies: 120, maxActiveProperties: 300 }, activeCityIds: ["moscow"] },
     ledgerArchives: [],
     diagnostics: { populationRepresented: 0, businessesRepresented: 0, highFidelityPersons: 0, materializedPersons: 0, explicitFirms: 0, firmCohorts: 0, materializedProperties: 0, housingUnitsRepresented: 0, ledgerHotTransactions: 0, ledgerArchivedTransactions: 0, estimatedSaveBytes: 0, deterministicWorkUnits: 0 },
     nextMaterializedPersonId: 1, nextPropertyId: 1, nextDurableAssetId: 1, nextApplicationId: 1,
     equitySecurities: ownership.equitySecurities,
     equityHoldings: ownership.equityHoldings,
     corporateBonds: [], bondHoldings: [], corporateBoards: ownership.corporateBoards, corporateActions: [], acquisitions: [],
-    exchanges, listings: ownership.listings, brokers, brokerageAccounts: [], marketOrders: [], marketTrades: [], ohlcvBars: [], marketIndices: ownership.marketIndices,
+    exchanges, listings: ownership.listings, brokers, brokerageAccounts: [], marketOrders: [], archivedMarketOrders: [], marketTrades: [], ohlcvBars: [], marketIndices: ownership.marketIndices,
+    fxPairs: createFxPairs(), fxOrders: [], fxTrades: [], fxDealers: [],
+    assetManagers: [], funds: [], fundUnitHoldings: [], investmentBankMandates: [],
+    marginAccounts: [], marginCalls: [], collateralPledges: [], securitiesLoans: [], shortPositions: [], repoAgreements: [], primeBrokerExposures: [],
     nextSecurityId: companies.length + 1, nextHoldingId: ownership.equityHoldings.length + 1, nextBondId: 1, nextCorporateActionId: 1,
     nextAcquisitionId: 1, nextBrokerageAccountId: 1, nextOrderId: 1, nextTradeId: 1, nextOrderSequence: 1,
+    nextBankAccountId: 1, nextFxOrderId: 1, nextFxTradeId: 1, nextFundUnitHoldingId: 1,
+    nextMarginAccountId: 1, nextMarginCallId: 1, nextCollateralId: 1, nextSecuritiesLoanId: 1,
+    nextShortPositionId: 1, nextRepoId: 1,
   };
 
   for (const bank of banks) seedBankCapital(world, bank.id, scenario === "bank-liquidity-stress" ? 8_000_000_00 : 20_000_000_00);
+  const dealer = { id: "fx-dealer-global", name: "Global FX Liquidity", bankAccountIds: [] as string[], targetInventoryByCurrency: {} as Record<string, number>, spreadBps: 20 };
+  world.fxDealers.push(dealer);
+  for (const currency of world.currencies) {
+    const bank = world.banks.find((item) => item.baseCurrency === currency.id)!;
+    seedDeposit(world, dealer.id, bank.id, 50_000_000_00);
+    const account = world.bankAccounts.find((item) => item.ownerId === dealer.id && item.bankId === bank.id && item.currencyId === currency.id)!;
+    dealer.bankAccountIds.push(account.id);
+    dealer.targetInventoryByCurrency[currency.id] = 50_000_000_00;
+  }
   households.forEach((household, index) => seedDeposit(world, household.id, household.bankId, index === 0 ? 850_000_00 : 85_000_00 + ((index * 1_937_00) % 130_000_00)));
   companies.forEach((company, index) => {
     seedDeposit(world, company.id, company.bankId, 5_500_000_00 + index * 270_000_00);
@@ -391,6 +436,8 @@ export function createWorld(scenario: SimulationScenario = "baseline"): WorldSta
     seedDeposit(world, `transport-sector:${city.id}`, bankId, 30_000_000);
   }
   assignInitialEmployment(world);
+  seedInstitutionalFinance(world);
+  seedLeverageFinance(world);
   updateWorldDiagnostics(world);
   emitSimpleEvent(world, "WorldCreated", "Экономика запущена", `${world.diagnostics.populationRepresented.toLocaleString("ru-RU")} жителей · ${world.cities.length} городов · ${world.universities.length} вузов`, [world.government.id, world.centralBank.id], "positive");
   return world;

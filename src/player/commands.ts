@@ -1,5 +1,5 @@
 import { emitSimpleEvent } from "../core/events.ts";
-import { ensureEntityAccounts, transferDeposit } from "../core/ledger.ts";
+import { bankAccountsForOwner, ensureEntityAccounts, transferDeposit } from "../core/ledger.ts";
 import { ACADEMY_COURSES } from "../education/catalog.ts";
 import type { Occupation, PlayerCommandRecord, SkillId, WorldState } from "../domain/model.ts";
 import { addPlayerTimeline, playerHousehold, playerPerson } from "./system.ts";
@@ -50,6 +50,7 @@ export function availableOccupations(world: WorldState, companyId: string): Occu
   const company = world.companies.find((item) => item.id === companyId);
   if (!company?.active || company.cityId !== world.player.currentCityId) return [];
   const base = company.goodId === "services" ? ["admin", "analyst", "developer"] : ["worker", "analyst"];
+  if (company.industry === "финансы") base.push("investment-analyst", "risk-analyst", "investment-banker", "portfolio-manager");
   if (company.employees.length >= 8) base.push("manager");
   return world.occupations.filter((occupation) => base.includes(occupation.id));
 }
@@ -73,12 +74,15 @@ export function applyForJob(world: WorldState, companyId: string, occupationId: 
   const requirementsMet = Object.entries(occupation.requiredSkills).every(([skill, required]) => playerPerson(world).skills[skill as SkillId] >= Math.round((required ?? 0) * 0.72));
   const affordable = company.lastGrossRevenueCents === 0 || company.lastGrossRevenueCents > company.wageCents * Math.max(1, company.employees.length) * 0.45;
   const accepted = requirementsMet && affordable && strongerApplicants < 4 && company.distressMonths < 3;
+  const reason = accepted ? "Предложение готово." : `Соответствие ${Math.round(score / 100)}%; более сильных кандидатов: ${strongerApplicants}.`;
+  const applicationId = `job-application-${String(world.player.jobApplications.length + 1).padStart(6, "0")}`;
+  world.player.jobApplications.push({ id: applicationId, companyId, occupationId, submittedAtMonth: world.clock.elapsedMonths, status: accepted ? "offered" : "rejected", reason, offerId: accepted ? `job-offer-${applicationId}` : null });
   emitSimpleEvent(world, "JobApplied", accepted ? "Работодатель подготовил предложение" : "Работодатель отклонил заявку", accepted ? `${company.name} готова предложить должность «${occupation.name}».` : `Требования навыков, конкуренция или финансы ${company.name} не позволяют сделать предложение.`, [world.player.personId, company.id], accepted ? "positive" : "attention", [], { scoreBps: score, strongerApplicants, requirementsMet, affordable });
-  if (!accepted) return { accepted, reason: `Соответствие ${Math.round(score / 100)}%; более сильных кандидатов: ${strongerApplicants}.` };
+  if (!accepted) return { accepted, reason };
   const salaryCents = Math.round(company.wageCents * (0.88 + occupation.level * 0.11));
   world.player.pendingJobOffer = { companyId, occupationId, salaryCents, createdAtMonth: world.clock.elapsedMonths, expiresAtMonth: world.clock.elapsedMonths + 2, scoreBps: score };
   emitSimpleEvent(world, "JobOfferCreated", "Получено предложение о работе", `${company.name}: ${occupation.name}, ${(salaryCents / 100).toLocaleString("ru-RU")} ₽ в месяц.`, [world.player.personId, company.id], "positive", [], { salaryCents, scoreBps: score });
-  return { accepted, reason: "Предложение готово." };
+  return { accepted, reason };
 }
 
 export function acceptJobOffer(world: WorldState): boolean {
@@ -88,6 +92,12 @@ export function acceptJobOffer(world: WorldState): boolean {
   const occupation = world.occupations.find((item) => item.id === offer.occupationId);
   const household = playerHousehold(world);
   if (!company?.active || !occupation || household.employerId) return false;
+  const salaryCurrency = world.countries.find((country) => country.id === company.headquartersCountryId)?.currencyReference;
+  const salaryAccount = salaryCurrency && bankAccountsForOwner(world, household.id, salaryCurrency)[0];
+  if (!salaryAccount) return false;
+  household.bankId = salaryAccount.bankId;
+  household.primaryBankAccountId = salaryAccount.id;
+  world.bankAccounts.filter((account) => account.ownerId === household.id).forEach((account) => { account.isPrimary = account.id === salaryAccount.id; });
   household.employerId = company.id;
   household.monthsUnemployed = 0;
   company.employees.push(household.id);
@@ -98,6 +108,8 @@ export function acceptJobOffer(world: WorldState): boolean {
   emitSimpleEvent(world, "JobStarted", "Трудовой договор заключён", `${playerPerson(world).displayName} начал работать в ${company.name}.`, [world.player.personId, company.id], "positive", [], { salaryCents: offer.salaryCents });
   addPlayerTimeline(world, "job", "Новая работа", `${occupation.name} · ${company.name}`);
   world.player.pendingJobOffer = null;
+  const application = [...world.player.jobApplications].reverse().find((item) => item.companyId === company.id && item.occupationId === occupation.id && item.status === "offered");
+  if (application) application.status = "accepted";
   return true;
 }
 
@@ -138,4 +150,14 @@ export function setPlayerSavingsTarget(world: WorldState, savingsTargetBps: numb
   household.savingsPreferenceBps = target;
   household.consumptionPropensityBps = Math.max(2_000, 10_000 - target);
   recordCommand(world, "SET_SAVINGS", { savingsTargetBps: target });
+}
+
+export function setPlayerReportingCurrency(world: WorldState, currencyId: string): boolean {
+  if (!world.currencies.some((currency) => currency.id === currencyId)) return false;
+  world.player.reportingCurrencyId = currencyId;
+  return true;
+}
+
+export function setPlayerFoodPlan(world: WorldState, foodPlanId: WorldState["player"]["foodPlanId"]): void {
+  world.player.foodPlanId = foodPlanId;
 }

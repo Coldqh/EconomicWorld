@@ -16,7 +16,9 @@ import { defaultBorrowerLoans, issueLoan, settleBorrowerLoansFromCash, serviceLo
 import { recordPlayerMonth } from "../player/system.ts";
 import { progressPlayerWorld } from "../player/world-commands.ts";
 import { compactLedgerHistory, migratePopulationCohorts, updateAggregateEconomies, updateWorldDiagnostics } from "../world/systems.ts";
-import { collectMetrics } from "./metrics.ts";
+import { collectCountryMetrics, collectMetrics } from "./metrics.ts";
+import { runInstitutionalFinance } from "../finance/institutional.ts";
+import { processMarginRisk } from "../finance/leverage.ts";
 import { allocateConsumptionBudget } from "./consumer-choice.ts";
 import { runBankruptcyWaterfall, serviceCorporateBonds } from "../corporate/finance.ts";
 import { runMarketAgents } from "../markets/exchange.ts";
@@ -39,6 +41,12 @@ function companyById(world: WorldState, id: string): Company | undefined {
 
 function countryIdForCity(world: WorldState, cityId: string): string {
   return world.cities.find((city) => city.id === cityId)?.countryId ?? "ru";
+}
+
+function currencyForEntity(world: WorldState, entityId: string): string {
+  const account = world.bankAccounts.find((item) => item.ownerId === entityId && item.isPrimary && item.status === "active")
+    ?? world.bankAccounts.find((item) => item.ownerId === entityId && item.status === "active");
+  return account?.currencyId ?? "RUB";
 }
 
 function governmentForCountry(world: WorldState, countryId: string) {
@@ -168,7 +176,7 @@ function procureInputs(world: WorldState): void {
         const cost = Math.floor((quantity * seller.priceCents) / 1_000);
         if (quantity <= 0 || cost <= 0) continue;
         const inputAccount = accountIds.inputInventory(buyer.id, inputId);
-        ensureAccount(world.ledger, inputAccount, buyer.id, `Сырьё: ${goodById(world, inputId).name}`, "asset");
+        ensureAccount(world.ledger, inputAccount, buyer.id, `Сырьё: ${goodById(world, inputId).name}`, "asset", currencyForEntity(world, buyer.id));
         const tx = settleDepositPayment(world, buyer.id, seller.id, cost, "INPUT_PURCHASE", `${buyer.name} купила ${goodById(world, inputId).shortName}`, inputAccount, accountIds.operatingIncome(seller.id));
         if (!tx) break;
         const moved = consumeSellerInventory(world, seller, quantity, "INPUT", buyer.id, [tx]);
@@ -205,7 +213,7 @@ function produceGoods(world: WorldState): void {
       if (value > 0) credits.push({ accountId: accountIds.inputInventory(company.id, inputId), side: "credit", amountCents: value });
     }
     if (consumedValue > 0) {
-      ensureAccount(world.ledger, accountIds.finishedInventory(company.id), company.id, "Готовая продукция", "asset");
+      ensureAccount(world.ledger, accountIds.finishedInventory(company.id), company.id, "Готовая продукция", "asset", currencyForEntity(world, company.id));
       postTransaction(world, "PRODUCTION", `Выпуск: ${company.name}`, [{ accountId: accountIds.finishedInventory(company.id), side: "debit", amountCents: consumedValue }, ...credits]);
       company.inventoryValueCents += consumedValue;
     }
@@ -252,7 +260,7 @@ function sellFinalGood(world: WorldState, payerId: string, seller: Company, budg
   if (quantity <= 0 || gross <= 0) return 0;
   const kind = reason === "CAPITAL" ? "CAPITAL_INVESTMENT" : "GOODS_CLEARING";
   const payerAccount = reason === "CAPITAL" ? accountIds.productiveCapital(payerId) : accountIds.operatingExpense(payerId);
-  ensureAccount(world.ledger, payerAccount, payerId, reason === "CAPITAL" ? "Производственный капитал" : "Потребление", reason === "CAPITAL" ? "asset" : "expense");
+  ensureAccount(world.ledger, payerAccount, payerId, reason === "CAPITAL" ? "Производственный капитал" : "Потребление", reason === "CAPITAL" ? "asset" : "expense", currencyForEntity(world, payerId));
   const destinationName = world.households.find((item) => item.id === destinationId)?.displayName
     ?? world.companies.find((item) => item.id === destinationId)?.name
     ?? (world.governments.some((government) => government.id === destinationId) ? "Правительство" : destinationId);
@@ -268,8 +276,9 @@ function sellFinalGood(world: WorldState, payerId: string, seller: Company, budg
 function recognizeMonthlySalesCosts(world: WorldState): void {
   for (const company of world.companies) {
     if (company.lastCogsCents > 0) {
-      ensureAccount(world.ledger, accountIds.cogsExpense(company.id), company.id, "Себестоимость продаж", "expense");
-      ensureAccount(world.ledger, accountIds.finishedInventory(company.id), company.id, "Готовая продукция", "asset");
+      const currency = currencyForEntity(world, company.id);
+      ensureAccount(world.ledger, accountIds.cogsExpense(company.id), company.id, "Себестоимость продаж", "expense", currency);
+      ensureAccount(world.ledger, accountIds.finishedInventory(company.id), company.id, "Готовая продукция", "asset", currency);
       postTransaction(world, "COGS", `Себестоимость за месяц: ${company.name}`, [
         { accountId: accountIds.cogsExpense(company.id), side: "debit", amountCents: company.lastCogsCents },
         { accountId: accountIds.finishedInventory(company.id), side: "credit", amountCents: company.lastCogsCents },
@@ -285,6 +294,7 @@ function recognizeMonthlySalesCosts(world: WorldState): void {
 
 function clearHouseholdMarket(world: WorldState): void {
   for (const household of world.households) {
+    if (household.id === world.player.householdId) continue;
     const totalBudget = householdBudget(world, household);
     if (totalBudget <= 0) continue;
     const budgets = allocateConsumptionBudget(world, household, totalBudget);
@@ -308,6 +318,26 @@ function clearHouseholdMarket(world: WorldState): void {
       }
     }
   }
+  const player = world.households.find((household) => household.id === world.player.householdId);
+  if (player) {
+    player.lastDisposableIncomeCents = player.employerId ? companyById(world, player.employerId)?.wageCents ?? 0 : governmentForCountry(world, countryIdForCity(world, player.cityId)).monthlyUnemploymentBenefitCents;
+    player.lastSpendingByCategoryCents = { food: 0, housing: 0, energy: 0, transport: 0, services: 0, goods: 0, education: 0, entertainment: 0, luxury: 0 };
+    const foodQuantityMilliUnits = { minimal: 12_000, basic: 18_000, good: 27_000, premium: 40_000 }[world.player.foodPlanId];
+    const seller = chooseSeller(world, player, "food");
+    if (seller) {
+      const budget = Math.min(depositOf(world, player.id), Math.max(1, Math.round(foodQuantityMilliUnits * seller.priceCents / 1_000)));
+      const before = seller.lastSalesMilliUnits;
+      const spent = sellFinalGood(world, player.id, seller, budget, "CONSUMPTION", player.id);
+      const quantity = seller.lastSalesMilliUnits - before;
+      if (spent > 0) {
+        player.consumptionMilliUnits.food = (player.consumptionMilliUnits.food ?? 0) + quantity;
+        player.preferredSellerByGoodId.food = seller.id;
+        player.lastSpendingByCategoryCents.food = spent;
+        world.nationalAccounts.current.householdConsumptionCents += spent;
+        world.nationalAccounts.current.householdConsumptionByGoodCents.food += spent;
+      }
+    }
+  }
 }
 
 function governmentPurchases(world: WorldState): void {
@@ -328,8 +358,9 @@ function depreciateCapital(world: WorldState): void {
     const capital = company.productiveCapital;
     const depreciation = Math.min(capital.bookValueCents, Math.max(1, Math.round(capital.acquisitionCostCents / capital.usefulLifeMonths)));
     if (depreciation <= 0) continue;
-    ensureAccount(world.ledger, accountIds.depreciationExpense(company.id), company.id, "Амортизация", "expense");
-    ensureAccount(world.ledger, accountIds.productiveCapital(company.id), company.id, "Производственный капитал", "asset");
+    const currency = currencyForEntity(world, company.id);
+    ensureAccount(world.ledger, accountIds.depreciationExpense(company.id), company.id, "Амортизация", "expense", currency);
+    ensureAccount(world.ledger, accountIds.productiveCapital(company.id), company.id, "Производственный капитал", "asset", currency);
     postTransaction(world, "DEPRECIATION", `Амортизация: ${company.name}`, [
       { accountId: accountIds.depreciationExpense(company.id), side: "debit", amountCents: depreciation },
       { accountId: accountIds.productiveCapital(company.id), side: "credit", amountCents: depreciation },
@@ -409,20 +440,27 @@ function collectCorporateTax(world: WorldState): void {
 
 function updateCentralBankPolicy(world: WorldState): void {
   if (!isQuarterEnd(world.clock)) return;
-  const inflation = world.metricsHistory.at(-1)?.annualInflationBps ?? world.centralBank.inflationTargetBps;
-  for (const centralBank of world.centralBanks) {
+  for (const centralBank of world.centralBanks.filter((bank) => bank.setsPolicyRate)) {
+    const area = world.monetaryAreas.find((item) => item.id === centralBank.monetaryAreaId);
+    const local = world.countryMetricsHistory.filter((point) => point.elapsedMonth === world.clock.elapsedMonths && area?.memberCountryIds.includes(point.countryId));
+    const inflation = local.length ? Math.round(local.reduce((sum, point) => sum + point.inflationBps, 0) / local.length) : centralBank.inflationTargetBps;
+    const unemployment = local.length ? Math.round(local.reduce((sum, point) => sum + point.unemploymentBps, 0) / local.length) : 500;
     const oldRate = centralBank.policyRateBps;
-    const countryOffset = (centralBank.countryId.charCodeAt(0) % 5 - 2) * 8;
-    const newRate = clamp(oldRate + clamp(Math.round((inflation - centralBank.inflationTargetBps) * 0.18) + countryOffset, -100, 125), 100, 2_500);
+    const labourAdjustment = unemployment > 800 ? -25 : unemployment < 400 ? 15 : 0;
+    const newRate = clamp(oldRate + clamp(Math.round((inflation - centralBank.inflationTargetBps) * 0.18) + labourAdjustment, -100, 125), 0, 2_500);
     if (newRate === oldRate) continue;
     centralBank.policyRateBps = newRate;
     centralBank.policyRateHistory.push({ elapsedMonth: world.clock.elapsedMonths, rateBps: newRate });
     emitSimpleEvent(world, "InterestRateChanged", "Ключевая ставка изменена", `${centralBank.name}: ${(oldRate / 100).toFixed(2)}% → ${(newRate / 100).toFixed(2)}%`, [centralBank.id], "attention", [], { oldRateBps: oldRate, newRateBps: newRate, inflationBps: inflation });
   }
+  for (const nationalBank of world.centralBanks.filter((bank) => !bank.setsPolicyRate)) {
+    const authority = world.centralBanks.find((bank) => bank.id === world.monetaryAreas.find((area) => area.id === nationalBank.monetaryAreaId)?.monetaryAuthorityId);
+    if (authority) nationalBank.policyRateBps = authority.policyRateBps;
+  }
 }
 
 function foundCompanyIfNeeded(world: WorldState): void {
-  if (!isYearEnd(world.clock) || activeCompanies(world).length > 10) return;
+  if (!isQuarterEnd(world.clock) || activeCompanies(world).length >= world.fidelity.budgets.maxFullCompanies) return;
   const founder = world.households.filter((item) => item.id !== world.player.householdId).sort((a, b) => depositOf(world, b.id) - depositOf(world, a.id))[0];
   if (!founder || depositOf(world, founder.id) < 150_000_00) return;
   const good = [...world.goods].sort((a, b) => suppliersFor(world, a.id).length - suppliersFor(world, b.id).length)[0];
@@ -439,7 +477,15 @@ function foundCompanyIfNeeded(world: WorldState): void {
   world.corporateBoards.push({ id: boardId, companyId: id, directorOwnerIds: [founder.id], approvalThresholdBps: 5_001 });
   founder.foundedCompanyIds.push(id);
   const tx = capitalContribution(world, founder.id, id, capital);
-  if (!tx) { world.companies.pop(); founder.foundedCompanyIds.pop(); return; }
+  if (!tx) {
+    world.companies.pop();
+    world.countries.find((country) => country.id === countryId)!.companyIds = world.countries.find((country) => country.id === countryId)!.companyIds.filter((companyId) => companyId !== id);
+    world.equitySecurities = world.equitySecurities.filter((security) => security.id !== securityId);
+    world.equityHoldings = world.equityHoldings.filter((holding) => holding.securityId !== securityId);
+    world.corporateBoards = world.corporateBoards.filter((board) => board.id !== boardId);
+    founder.foundedCompanyIds.pop();
+    return;
+  }
   const supplier = suppliersFor(world, "goods", countryId).find((item) => item.id !== id);
   const invested = supplier ? sellFinalGood(world, id, supplier, Math.round(capital * 0.8), "CAPITAL", id) : 0;
   company.productiveCapital.acquisitionCostCents = invested;
@@ -467,11 +513,14 @@ export function stepMonth(world: WorldState): void {
   updatePricesAndExpectations(world);
   updateDistressAndBankruptcies(world);
   collectCorporateTax(world);
+  runInstitutionalFinance(world);
   if (isQuarterEnd(world.clock)) runMarketAgents(world);
+  processMarginRisk(world);
   foundCompanyIfNeeded(world);
   recognizeMonthlySalesCosts(world);
   const metric = collectMetrics(world);
   world.metricsHistory.push(metric);
+  world.countryMetricsHistory.push(...collectCountryMetrics(world));
   recordPlayerMonth(world);
   progressPlayerWorld(world);
   closeMonthlyAccounting(world);

@@ -64,6 +64,7 @@ export function enrollUniversity(world: WorldState, programId: string): boolean 
   const program = world.universityPrograms.find((item) => item.id === programId);
   const university = program && world.universities.find((item) => item.id === program.universityId);
   if (!application || !program || !university || world.player.activeUniversityEnrollment) return false;
+  if (program.attendanceMode === "ON_CAMPUS" && world.player.currentCityId !== university.cityId) return false;
   const tuition = program.tuitionPerYearCents;
   const tx = transferDeposit(world, world.player.householdId, university.id, tuition, "UNIVERSITY_TUITION", `Обучение: ${university.shortName} · ${program.name}`);
   if (!tx) return false;
@@ -202,6 +203,7 @@ export function progressPlayerWorld(world: WorldState): void {
     const program = world.universityPrograms.find((item) => item.id === enrollment.programId);
     const university = program && world.universities.find((item) => item.id === enrollment.universityId);
     if (program && university) {
+      if (program.attendanceMode === "ON_CAMPUS" && world.player.currentCityId !== university.cityId) enrollment.status = "paused";
       if (world.clock.elapsedMonths >= enrollment.nextTuitionMonth) {
         const tx = transferDeposit(world, world.player.householdId, university.id, program.tuitionPerYearCents, "UNIVERSITY_TUITION", `Следующий год обучения: ${university.shortName}`);
         if (tx) enrollment.nextTuitionMonth += 12;
@@ -222,6 +224,11 @@ export function progressPlayerWorld(world: WorldState): void {
         addPlayerTimeline(world, "education", "Диплом", `${university.shortName} · ${program.name}`);
       }
     }
+  }
+  if (enrollment?.status === "paused") {
+    const program = world.universityPrograms.find((item) => item.id === enrollment.programId);
+    const university = program && world.universities.find((item) => item.id === enrollment.universityId);
+    if (program && university && (program.attendanceMode !== "ON_CAMPUS" || world.player.currentCityId === university.cityId)) enrollment.status = "active";
   }
 
   const residence = world.player.residencePropertyId && world.properties.find((property) => property.id === world.player.residencePropertyId);

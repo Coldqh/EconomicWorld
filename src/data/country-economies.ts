@@ -30,7 +30,7 @@ export interface CountryEconomyPack {
   companies: CountryCompanySeed[];
 }
 
-export const COUNTRY_ECONOMY_PACKS: CountryEconomyPack[] = [
+const BASE_COUNTRY_ECONOMY_PACKS: CountryEconomyPack[] = [
   {
     countryId: "ru", currencyId: "RUB", governmentName: "Правительство России", centralBankName: "Банк России",
     exchangeName: "Московская биржа", exchangeShortName: "MOEX", brokerName: "Мир Инвестиции",
@@ -175,6 +175,80 @@ export const COUNTRY_ECONOMY_PACKS: CountryEconomyPack[] = [
     ],
   },
 ];
+
+const MARKET_EXPANSION: Record<string, CountryCompanySeed[]> = {
+  ru: [
+    { name: "Волга Телеком", cityId: "kazan", goodId: "services", industry: "телекоммуникации", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Балтика Ритейл", cityId: "saint-petersburg", goodId: "goods", industry: "розничная торговля", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "МосТех", cityId: "moscow", goodId: "services", industry: "технологии", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Кама Машины", cityId: "kazan", goodId: "materials", industry: "машиностроение", representationTier: "B", sizeClass: "medium", listed: false },
+  ],
+  de: [
+    { name: "Rhein Energie", cityId: "hamburg", goodId: "energy", industry: "энергетика", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Bavaria Cloud", cityId: "munich", goodId: "services", industry: "технологии", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Nord Handel", cityId: "hamburg", goodId: "goods", industry: "торговля", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Spree Media", cityId: "berlin", goodId: "services", industry: "медиа", representationTier: "B", sizeClass: "medium", listed: false },
+  ],
+  fr: [
+    { name: "Hexagone Luxe", cityId: "paris", goodId: "goods", industry: "предметы роскоши", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Rhone Energie", cityId: "lyon", goodId: "energy", industry: "энергетика", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Seine Numerique", cityId: "paris", goodId: "services", industry: "технологии", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Occitanie Food", cityId: "toulouse", goodId: "food", industry: "продовольствие", representationTier: "B", sizeClass: "medium", listed: false },
+  ],
+  gb: [
+    { name: "Albion Energy", cityId: "edinburgh", goodId: "energy", industry: "энергетика", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Thames Digital", cityId: "london", goodId: "services", industry: "технологии", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Northern Retail", cityId: "manchester", goodId: "goods", industry: "торговля", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Caledonia Labs", cityId: "edinburgh", goodId: "services", industry: "исследования", representationTier: "B", sizeClass: "medium", listed: false },
+  ],
+  us: [
+    { name: "Pacific Compute", cityId: "san-francisco", goodId: "services", industry: "технологии", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Great Lakes Energy", cityId: "chicago", goodId: "energy", industry: "энергетика", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Union Consumer", cityId: "new-york", goodId: "goods", industry: "потребительские товары", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Bay Research", cityId: "san-francisco", goodId: "services", industry: "исследования", representationTier: "B", sizeClass: "medium", listed: false },
+  ],
+  jp: [
+    { name: "Kansai Robotics", cityId: "osaka", goodId: "goods", industry: "робототехника", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Nippon Energy", cityId: "tokyo", goodId: "energy", industry: "энергетика", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Chubu Materials", cityId: "nagoya", goodId: "materials", industry: "материалы", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Sakura Media", cityId: "tokyo", goodId: "services", industry: "медиа", representationTier: "B", sizeClass: "medium", listed: false },
+  ],
+  ca: [
+    { name: "Maple Energy", cityId: "toronto", goodId: "energy", industry: "энергетика", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Pacific Digital", cityId: "vancouver", goodId: "services", industry: "технологии", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Quebec Consumer", cityId: "montreal", goodId: "goods", industry: "потребительские товары", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Ontario Foods", cityId: "toronto", goodId: "food", industry: "продовольствие", representationTier: "B", sizeClass: "medium", listed: false },
+  ],
+  it: [
+    { name: "Lombardia Energia", cityId: "milan", goodId: "energy", industry: "энергетика", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Italia Digitale", cityId: "milan", goodId: "services", industry: "технологии", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Tirreno Food", cityId: "rome", goodId: "food", industry: "продовольствие", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Piemonte Labs", cityId: "turin", goodId: "services", industry: "исследования", representationTier: "B", sizeClass: "medium", listed: false },
+  ],
+  es: [
+    { name: "Iberia Energia", cityId: "madrid", goodId: "energy", industry: "энергетика", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Catalunya Digital", cityId: "barcelona", goodId: "services", industry: "технологии", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Levante Retail", cityId: "valencia", goodId: "goods", industry: "торговля", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Castilla Foods", cityId: "madrid", goodId: "food", industry: "продовольствие", representationTier: "B", sizeClass: "medium", listed: false },
+  ],
+  nl: [
+    { name: "Delta Energy", cityId: "rotterdam", goodId: "energy", industry: "энергетика", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Holland Chips", cityId: "eindhoven", goodId: "goods", industry: "электроника", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Canal Commerce", cityId: "amsterdam", goodId: "services", industry: "торговля", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Lowlands Food", cityId: "rotterdam", goodId: "food", industry: "продовольствие", representationTier: "B", sizeClass: "medium", listed: false },
+  ],
+  kr: [
+    { name: "Han Semiconductor", cityId: "seoul", goodId: "goods", industry: "полупроводники", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Korea Mobility", cityId: "incheon", goodId: "materials", industry: "автомобили", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Busan Retail", cityId: "busan", goodId: "food", industry: "торговля", representationTier: "A", sizeClass: "large", listed: true },
+    { name: "Seoul Media Lab", cityId: "seoul", goodId: "services", industry: "медиа", representationTier: "B", sizeClass: "medium", listed: false },
+  ],
+};
+
+export const COUNTRY_ECONOMY_PACKS: CountryEconomyPack[] = BASE_COUNTRY_ECONOMY_PACKS.map((pack) => ({
+  ...pack,
+  companies: [...pack.companies, ...(MARKET_EXPANSION[pack.countryId] ?? [])],
+}));
 
 export function packForCountry(countryId: string): CountryEconomyPack {
   const pack = COUNTRY_ECONOMY_PACKS.find((item) => item.countryId === countryId);

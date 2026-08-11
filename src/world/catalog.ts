@@ -72,6 +72,9 @@ const UNIVERSITY_SEEDS = [
   ["polimi", "Миланский политехнический институт", "Polimi", "institute", "milan", 9_050],
   ["upm", "Мадридский политехнический университет", "UPM", "university", "madrid", 8_850],
   ["tue", "Эйндховенский технический университет", "TU/e", "university", "eindhoven", 9_200],
+  ["snu", "Сеульский национальный университет", "SNU", "university", "seoul", 9_550],
+  ["kaist", "Корейский институт передовых технологий", "KAIST", "institute", "seoul", 9_650],
+  ["pusan-u", "Пусанский национальный университет", "PNU", "university", "busan", 9_100],
 ] as const;
 
 const PROGRAM_TEMPLATES = [
@@ -85,6 +88,7 @@ export function createCountries(): Country[] {
     id,
     name,
     currencyReference,
+    monetaryAreaId: `money-area-${currencyReference.toLowerCase()}`,
     legalProfile,
     taxContext,
     cityIds: CITY_SEEDS.filter((city) => city[1] === id).map((city) => city[0]),
@@ -92,7 +96,7 @@ export function createCountries(): Country[] {
     bankIds: [],
     universityIds: [],
     governmentId: `government-${id}`,
-    centralBankId: `central-bank-${id}`,
+    centralBankId: currencyReference === "EUR" ? "monetary-authority-eur" : `central-bank-${id}`,
     exchangeIds: [`exchange-${id}`],
     industries: [...new Set(CITY_SEEDS.filter((city) => city[1] === id).flatMap((city) => city[7]))],
   }));
@@ -140,6 +144,7 @@ export function createUniversities(bankIds: readonly string[]): { universities: 
         requiredSkills: { [requiredSkill]: requiredScore },
         skillOutcomes: { [requiredSkill]: requiredScore + 1_300, [outcomeSkill]: outcomeScore + 1_100 },
         specialization: suffix,
+        attendanceMode: suffix === "software" && universityIndex % 5 === 0 ? "REMOTE" : "ON_CAMPUS",
       });
       return programId;
     });
