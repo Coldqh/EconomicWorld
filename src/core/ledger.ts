@@ -8,9 +8,27 @@ import type {
 } from "../domain/model.ts";
 import { emitSimpleEvent } from "./events.ts";
 
+const ownerAccountIndex = new WeakMap<LedgerState, Map<string, string[]>>();
+
+function indexedAccountIds(ledger: LedgerState, ownerId: string): string[] {
+  let index = ownerAccountIndex.get(ledger);
+  if (!index) {
+    index = new Map<string, string[]>();
+    for (const account of Object.values(ledger.accounts)) {
+      const ids = index.get(account.ownerId) ?? [];
+      ids.push(account.id);
+      index.set(account.ownerId, ids);
+    }
+    ownerAccountIndex.set(ledger, index);
+  }
+  return index.get(ownerId) ?? [];
+}
+
 export const accountIds = {
   deposit: (ownerId: string) => `${ownerId}:asset:deposit`,
+  bankAccountDeposit: (ownerId: string, bankId: string, currencyId: string) => `${ownerId}:asset:deposit:${bankId}:${currencyId}`,
   openingEquity: (ownerId: string) => `${ownerId}:equity:opening`,
+  openingEquityCurrency: (ownerId: string, currencyId: string) => `${ownerId}:equity:opening:${currencyId}`,
   operatingIncome: (ownerId: string) => `${ownerId}:income:operating`,
   operatingExpense: (ownerId: string) => `${ownerId}:expense:operating`,
   cogsExpense: (ownerId: string) => `${ownerId}:expense:cogs`,
@@ -40,6 +58,7 @@ export const accountIds = {
     `${ownerId}:liability:loan:${bankId}`,
   bankDepositLiability: (bankId: string, depositorId: string) =>
     `${bankId}:liability:deposit:${depositorId}`,
+  bankAccountLiability: (bankId: string, bankAccountId: string) => `${bankId}:liability:deposit-account:${bankAccountId}`,
   bankReserve: (bankId: string) => `${bankId}:asset:reserve`,
   bankLoanAsset: (bankId: string, borrowerId: string) =>
     `${bankId}:asset:loan:${borrowerId}`,
@@ -60,6 +79,13 @@ export const accountIds = {
     `${bankId}:liability:central-bank-facility`,
   intercentralReceivable: (centralBankId: string, counterpartyId: string) => `${centralBankId}:asset:intercentral:${counterpartyId}`,
   intercentralPayable: (centralBankId: string, counterpartyId: string) => `${centralBankId}:liability:intercentral:${counterpartyId}`,
+  fundUnits: (ownerId: string, fundId: string) => `${ownerId}:asset:fund-units:${fundId}`,
+  fundUnitCapital: (fundId: string) => `${fundId}:equity:fund-units`,
+  fxPosition: (ownerId: string, tradeId: string, currencyId: string) => `${ownerId}:equity:fx-position:${tradeId}:${currencyId}`,
+  marginLoanAsset: (primeBrokerId: string, marginAccountId: string) => `${primeBrokerId}:asset:margin-loan:${marginAccountId}`,
+  marginLoanLiability: (ownerId: string, marginAccountId: string) => `${ownerId}:liability:margin-loan:${marginAccountId}`,
+  repoAsset: (lenderId: string, repoId: string) => `${lenderId}:asset:repo:${repoId}`,
+  repoLiability: (borrowerId: string, repoId: string) => `${borrowerId}:liability:repo:${repoId}`,
 };
 
 export function createLedger(): LedgerState {
@@ -113,8 +139,15 @@ export function ensureAccount(
       currency: currency ?? "RUB",
     };
     ledger.balances[id] = 0;
-  } else if (currency) {
-    ledger.accounts[id].currency = currency;
+    const index = ownerAccountIndex.get(ledger);
+    if (index) {
+      const ids = index.get(ownerId) ?? [];
+      ids.push(id);
+      index.set(ownerId, ids);
+    }
+  } else if (currency && ledger.accounts[id].currency !== currency) {
+    // Один ledger-счёт не может менять валюту вслед за текущим банковским счётом владельца.
+    // Для мультивалютных позиций вызывающий код создаёт отдельный currency-scoped id.
   }
   return id;
 }
@@ -147,13 +180,17 @@ export function postTransaction(
   if (entries.length < 2) throw new Error(`Транзакция ${kind} не имеет двух сторон`);
   let debits = 0;
   let credits = 0;
+  let transactionCurrency: string | null = null;
   for (const entry of entries) {
     if (!Number.isSafeInteger(entry.amountCents) || entry.amountCents <= 0) {
       throw new Error(`Некорректная сумма проводки ${entry.amountCents}`);
     }
-    if (!world.ledger.accounts[entry.accountId]) {
+    const account = world.ledger.accounts[entry.accountId];
+    if (!account) {
       throw new Error(`Неизвестный счёт ${entry.accountId}`);
     }
+    transactionCurrency ??= account.currency;
+    if (account.currency !== transactionCurrency) throw new Error(`Межвалютная транзакция ${kind} требует отдельных ledger-ног: ${transactionCurrency}/${account.currency}`);
     if (entry.side === "debit") debits += entry.amountCents;
     else credits += entry.amountCents;
   }
@@ -182,12 +219,28 @@ export function balanceOf(world: WorldState, accountId: string): number {
 }
 
 export function depositOf(world: WorldState, ownerId: string): number {
-  return balanceOf(world, accountIds.deposit(ownerId));
+  const primary = world.bankAccounts?.find((account) => account.ownerId === ownerId && account.isPrimary && account.status === "active");
+  return balanceOf(world, primary?.ledgerDepositAccountId ?? accountIds.deposit(ownerId));
+}
+
+export function bankAccountBalance(world: WorldState, bankAccountId: string): number {
+  const account = world.bankAccounts.find((item) => item.id === bankAccountId && item.status === "active");
+  return account ? balanceOf(world, account.ledgerDepositAccountId) : 0;
+}
+
+export function bankAccountsForOwner(world: WorldState, ownerId: string, currencyId?: string) {
+  return world.bankAccounts.filter((account) => account.ownerId === ownerId && account.status === "active" && (!currencyId || account.currencyId === currencyId));
+}
+
+export function primaryBankAccount(world: WorldState, ownerId: string) {
+  return bankAccountsForOwner(world, ownerId).find((account) => account.isPrimary) ?? bankAccountsForOwner(world, ownerId)[0] ?? null;
 }
 
 export function findBankIdForEntity(world: WorldState, entityId: string): string {
+  const explicitAccount = primaryBankAccount(world, entityId);
+  if (explicitAccount) return explicitAccount.bankId;
   const household = world.households.find((item) => item.id === entityId);
-  if (household) return household.bankId;
+  if (household) return primaryBankAccount(world, entityId)?.bankId ?? household.bankId;
   const company = world.companies.find((item) => item.id === entityId);
   if (company) return company.bankId;
   const populationCohort = world.populationCohorts.find((item) => item.id === entityId);
@@ -213,11 +266,71 @@ export function findBankIdForEntity(world: WorldState, entityId: string): string
   throw new Error(`Для ${entityId} не назначен коммерческий банк`);
 }
 
+export function openBankAccount(
+  world: WorldState,
+  ownerId: string,
+  bankId: string,
+  makePrimary = false,
+): { ok: boolean; message: string; accountId?: string } {
+  const bank = world.banks.find((item) => item.id === bankId);
+  if (!bank) return { ok: false, message: "Банк не найден" };
+  const existing = world.bankAccounts.find((account) => account.ownerId === ownerId && account.bankId === bankId && account.currencyId === bank.baseCurrency && account.status === "active");
+  if (existing) {
+    if (makePrimary) setPrimaryBankAccount(world, ownerId, existing.id);
+    return { ok: true, message: makePrimary ? "Счёт выбран основным" : "Счёт уже открыт", accountId: existing.id };
+  }
+  const hasAccounts = world.bankAccounts.some((account) => account.ownerId === ownerId && account.status === "active");
+  const id = `bank-account-${String(world.nextBankAccountId++).padStart(7, "0")}`;
+  const isPrimary = makePrimary || !hasAccounts;
+  if (isPrimary) world.bankAccounts.filter((account) => account.ownerId === ownerId).forEach((account) => { account.isPrimary = false; });
+  const ledgerDepositAccountId = hasAccounts ? accountIds.bankAccountDeposit(ownerId, bankId, bank.baseCurrency) : accountIds.deposit(ownerId);
+  const ledgerBankLiabilityAccountId = hasAccounts ? accountIds.bankAccountLiability(bankId, id) : accountIds.bankDepositLiability(bankId, ownerId);
+  const account = {
+    id,
+    ownerId,
+    bankId,
+    currencyId: bank.baseCurrency,
+    ledgerDepositAccountId,
+    ledgerBankLiabilityAccountId,
+    openedAtMonth: world.clock.elapsedMonths,
+    status: "active" as const,
+    isPrimary,
+  };
+  world.bankAccounts.push(account);
+  ensureAccount(world.ledger, ledgerDepositAccountId, ownerId, `Депозит ${bank.baseCurrency} · ${bank.name}`, "asset", bank.baseCurrency);
+  ensureAccount(world.ledger, ledgerBankLiabilityAccountId, bankId, `Депозитный счёт ${ownerId}`, "liability", bank.baseCurrency);
+  if (isPrimary) {
+    const household = world.households.find((item) => item.id === ownerId);
+    if (household) {
+      household.primaryBankAccountId = id;
+      household.bankId = bankId;
+    }
+  }
+  if (ownerId === world.player.householdId && !world.player.bankAccountIds.includes(id)) world.player.bankAccountIds.push(id);
+  emitSimpleEvent(world, "BankAccountOpened", "Банковский счёт открыт", `${bank.name} · ${bank.baseCurrency}`, [ownerId, bankId], "positive");
+  return { ok: true, message: "Счёт открыт", accountId: id };
+}
+
+export function setPrimaryBankAccount(world: WorldState, ownerId: string, bankAccountId: string): boolean {
+  const selected = world.bankAccounts.find((account) => account.id === bankAccountId && account.ownerId === ownerId && account.status === "active");
+  if (!selected) return false;
+  world.bankAccounts.filter((account) => account.ownerId === ownerId).forEach((account) => { account.isPrimary = account.id === selected.id; });
+  const household = world.households.find((item) => item.id === ownerId);
+  if (household) {
+    household.primaryBankAccountId = selected.id;
+    household.bankId = selected.bankId;
+  }
+  return true;
+}
+
 export function centralBankIdForBank(world: WorldState, bankId: string): string {
   return world.banks.find((bank) => bank.id === bankId)?.centralBankId ?? world.centralBank.id;
 }
 
 function reserveSettlementEntries(world: WorldState, payerBankId: string, recipientBankId: string, amountCents: number): LedgerEntry[] {
+  const payerCurrency = world.banks.find((bank) => bank.id === payerBankId)?.baseCurrency;
+  const recipientCurrency = world.banks.find((bank) => bank.id === recipientBankId)?.baseCurrency;
+  if (!payerCurrency || payerCurrency !== recipientCurrency) throw new Error("Межвалютный платёж требует FX-конвертации");
   const payerCentralBankId = centralBankIdForBank(world, payerBankId);
   const recipientCentralBankId = centralBankIdForBank(world, recipientBankId);
   const entries: LedgerEntry[] = [
@@ -226,16 +339,6 @@ function reserveSettlementEntries(world: WorldState, payerBankId: string, recipi
     { accountId: accountIds.centralBankReserveLiability(payerCentralBankId, payerBankId), side: "debit", amountCents },
     { accountId: accountIds.centralBankReserveLiability(recipientCentralBankId, recipientBankId), side: "credit", amountCents },
   ];
-  if (payerCentralBankId !== recipientCentralBankId) {
-    const receivableId = accountIds.intercentralReceivable(recipientCentralBankId, payerCentralBankId);
-    const payableId = accountIds.intercentralPayable(payerCentralBankId, recipientCentralBankId);
-    ensureAccount(world.ledger, receivableId, recipientCentralBankId, `Межцентробанковское требование к ${payerCentralBankId}`, "asset", "EWU");
-    ensureAccount(world.ledger, payableId, payerCentralBankId, `Межцентробанковское обязательство перед ${recipientCentralBankId}`, "liability", "EWU");
-    entries.push(
-      { accountId: receivableId, side: "debit", amountCents },
-      { accountId: payableId, side: "credit", amountCents },
-    );
-  }
   return entries;
 }
 
@@ -321,23 +424,63 @@ export function settleDepositPayment(
   causeIds: string[] = [],
 ): string | null {
   amountCents = Math.floor(amountCents);
-  if (amountCents <= 0 || depositOf(world, payerId) < amountCents) return null;
-  const payerBankId = findBankIdForEntity(world, payerId);
-  const recipientBankId = findBankIdForEntity(world, recipientId);
+  const payerAccount = primaryBankAccount(world, payerId);
+  const recipientAccount = primaryBankAccount(world, recipientId);
+  if (amountCents <= 0 || !payerAccount || !recipientAccount || payerAccount.currencyId !== recipientAccount.currencyId || bankAccountBalance(world, payerAccount.id) < amountCents) return null;
+  const currency = payerAccount.currencyId;
+  const payerDebit = world.ledger.accounts[payerDebitAccountId];
+  const recipientCredit = world.ledger.accounts[recipientCreditAccountId];
+  if (!payerDebit || !recipientCredit) return null;
+  if (payerDebit.currency !== currency) {
+    payerDebitAccountId = `${payerDebitAccountId}:${currency}`;
+    ensureAccount(world.ledger, payerDebitAccountId, payerDebit.ownerId, `${payerDebit.name} · ${currency}`, payerDebit.category, currency);
+  }
+  if (recipientCredit.currency !== currency) {
+    recipientCreditAccountId = `${recipientCreditAccountId}:${currency}`;
+    ensureAccount(world.ledger, recipientCreditAccountId, recipientCredit.ownerId, `${recipientCredit.name} · ${currency}`, recipientCredit.category, currency);
+  }
+  const payerBankId = payerAccount.bankId;
+  const recipientBankId = recipientAccount.bankId;
   ensureBankingAccounts(world, payerId, payerBankId);
   ensureBankingAccounts(world, recipientId, recipientBankId);
   if (payerBankId !== recipientBankId) ensureSettlementLiquidity(world, payerBankId, amountCents);
   const entries: LedgerEntry[] = [
     { accountId: payerDebitAccountId, side: "debit", amountCents },
-    { accountId: accountIds.deposit(payerId), side: "credit", amountCents },
-    { accountId: accountIds.deposit(recipientId), side: "debit", amountCents },
+    { accountId: payerAccount.ledgerDepositAccountId, side: "credit", amountCents },
+    { accountId: recipientAccount.ledgerDepositAccountId, side: "debit", amountCents },
     { accountId: recipientCreditAccountId, side: "credit", amountCents },
-    { accountId: accountIds.bankDepositLiability(payerBankId, payerId), side: "debit", amountCents },
-    { accountId: accountIds.bankDepositLiability(recipientBankId, recipientId), side: "credit", amountCents },
+    { accountId: payerAccount.ledgerBankLiabilityAccountId, side: "debit", amountCents },
+    { accountId: recipientAccount.ledgerBankLiabilityAccountId, side: "credit", amountCents },
   ];
   if (payerBankId !== recipientBankId) {
     entries.push(...reserveSettlementEntries(world, payerBankId, recipientBankId, amountCents));
   }
+  return postTransaction(world, kind, memo, entries, causeIds);
+}
+
+export function transferBankAccountBalance(
+  world: WorldState,
+  payerBankAccountId: string,
+  recipientBankAccountId: string,
+  amountMinor: number,
+  kind: TransactionKind,
+  memo: string,
+  causeIds: string[] = [],
+): string | null {
+  const payer = world.bankAccounts.find((account) => account.id === payerBankAccountId && account.status === "active");
+  const recipient = world.bankAccounts.find((account) => account.id === recipientBankAccountId && account.status === "active");
+  amountMinor = Math.floor(amountMinor);
+  if (!payer || !recipient || amountMinor <= 0 || payer.currencyId !== recipient.currencyId || bankAccountBalance(world, payer.id) < amountMinor) return null;
+  ensureBankingAccounts(world, payer.ownerId, payer.bankId);
+  ensureBankingAccounts(world, recipient.ownerId, recipient.bankId);
+  if (payer.bankId !== recipient.bankId) ensureSettlementLiquidity(world, payer.bankId, amountMinor);
+  const entries: LedgerEntry[] = [
+    { accountId: payer.ledgerDepositAccountId, side: "credit", amountCents: amountMinor },
+    { accountId: recipient.ledgerDepositAccountId, side: "debit", amountCents: amountMinor },
+    { accountId: payer.ledgerBankLiabilityAccountId, side: "debit", amountCents: amountMinor },
+    { accountId: recipient.ledgerBankLiabilityAccountId, side: "credit", amountCents: amountMinor },
+  ];
+  if (payer.bankId !== recipient.bankId) entries.push(...reserveSettlementEntries(world, payer.bankId, recipient.bankId, amountMinor));
   return postTransaction(world, kind, memo, entries, causeIds);
 }
 
@@ -379,7 +522,16 @@ export function seedDeposit(
 ): void {
   const centralBankId = centralBankIdForBank(world, bankId);
   const currency = world.banks.find((bank) => bank.id === bankId)?.baseCurrency ?? "RUB";
+  let bankAccount = world.bankAccounts.find((account) => account.ownerId === ownerId && account.bankId === bankId && account.currencyId === currency && account.status === "active");
+  if (!bankAccount) {
+    const opened = openBankAccount(world, ownerId, bankId, !world.bankAccounts.some((account) => account.ownerId === ownerId));
+    bankAccount = world.bankAccounts.find((account) => account.id === opened.accountId);
+  }
+  if (!bankAccount) throw new Error(`Не удалось открыть стартовый счёт ${ownerId}`);
   ensureBankingAccounts(world, ownerId, bankId);
+  const ownerBankAccounts = world.bankAccounts.filter((account) => account.ownerId === ownerId && account.status === "active");
+  const openingEquityId = ownerBankAccounts.length === 1 ? accountIds.openingEquity(ownerId) : accountIds.openingEquityCurrency(ownerId, currency);
+  ensureAccount(world.ledger, openingEquityId, ownerId, `Начальный капитал ${currency}`, "equity", currency);
   ensureAccount(
     world.ledger,
     accountIds.centralBankMonetaryAsset(centralBankId),
@@ -389,10 +541,10 @@ export function seedDeposit(
     currency,
   );
   postTransaction(world, "GENESIS", `Начальный депозит: ${ownerId}`, [
-    { accountId: accountIds.deposit(ownerId), side: "debit", amountCents },
-    { accountId: accountIds.openingEquity(ownerId), side: "credit", amountCents },
+    { accountId: bankAccount.ledgerDepositAccountId, side: "debit", amountCents },
+    { accountId: openingEquityId, side: "credit", amountCents },
     { accountId: accountIds.bankReserve(bankId), side: "debit", amountCents },
-    { accountId: accountIds.bankDepositLiability(bankId, ownerId), side: "credit", amountCents },
+    { accountId: bankAccount.ledgerBankLiabilityAccountId, side: "credit", amountCents },
     {
       accountId: accountIds.centralBankMonetaryAsset(centralBankId),
       side: "debit",
@@ -573,23 +725,31 @@ export function capitalContribution(
   if (amountCents <= 0 || depositOf(world, householdId) < amountCents) return null;
   const payerBankId = findBankIdForEntity(world, householdId);
   const recipientBankId = findBankIdForEntity(world, companyId);
+  const payerCurrency = world.banks.find((bank) => bank.id === payerBankId)?.baseCurrency ?? "RUB";
+  const recipientCurrency = world.banks.find((bank) => bank.id === recipientBankId)?.baseCurrency ?? "RUB";
+  if (payerCurrency !== recipientCurrency) return null;
   ensureBankingAccounts(world, householdId, payerBankId);
   ensureBankingAccounts(world, companyId, recipientBankId);
+  if (!primaryBankAccount(world, companyId)) openBankAccount(world, companyId, recipientBankId, true);
+  const payerAccount = primaryBankAccount(world, householdId);
+  const recipientAccount = primaryBankAccount(world, companyId);
+  if (!payerAccount || !recipientAccount) return null;
   ensureAccount(
     world.ledger,
     accountIds.investment(householdId, companyId),
     householdId,
     `Доля в ${companyId}`,
     "asset",
+    payerCurrency,
   );
   if (payerBankId !== recipientBankId) ensureSettlementLiquidity(world, payerBankId, amountCents);
   const entries: LedgerEntry[] = [
     { accountId: accountIds.investment(householdId, companyId), side: "debit", amountCents },
-    { accountId: accountIds.deposit(householdId), side: "credit", amountCents },
-    { accountId: accountIds.deposit(companyId), side: "debit", amountCents },
+    { accountId: payerAccount.ledgerDepositAccountId, side: "credit", amountCents },
+    { accountId: recipientAccount.ledgerDepositAccountId, side: "debit", amountCents },
     { accountId: accountIds.openingEquity(companyId), side: "credit", amountCents },
-    { accountId: accountIds.bankDepositLiability(payerBankId, householdId), side: "debit", amountCents },
-    { accountId: accountIds.bankDepositLiability(recipientBankId, companyId), side: "credit", amountCents },
+    { accountId: payerAccount.ledgerBankLiabilityAccountId, side: "debit", amountCents },
+    { accountId: recipientAccount.ledgerBankLiabilityAccountId, side: "credit", amountCents },
   ];
   if (payerBankId !== recipientBankId) {
     entries.push(...reserveSettlementEntries(world, payerBankId, recipientBankId, amountCents));
@@ -623,8 +783,9 @@ export function entityBook(world: WorldState, ownerId: string): {
   capital: number;
 } {
   const totals = { assets: 0, liabilities: 0, equity: 0, income: 0, expenses: 0 };
-  for (const account of Object.values(world.ledger.accounts)) {
-    if (account.ownerId !== ownerId) continue;
+  for (const accountId of indexedAccountIds(world.ledger, ownerId)) {
+    const account = world.ledger.accounts[accountId];
+    if (!account) continue;
     const balance = balanceOf(world, account.id);
     if (account.category === "asset") totals.assets += balance;
     if (account.category === "liability") totals.liabilities += balance;

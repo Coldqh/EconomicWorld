@@ -1,6 +1,35 @@
 export type AccountCategory = "asset" | "liability" | "equity" | "income" | "expense";
 export type EntrySide = "debit" | "credit";
 
+export interface Currency {
+  id: string;
+  code: "RUB" | "USD" | "EUR" | "GBP" | "JPY" | "CAD" | "KRW";
+  displayName: string;
+  symbol: string;
+  minorUnitDigits: number;
+  monetaryAreaId: string;
+}
+
+export interface MonetaryArea {
+  id: string;
+  name: string;
+  currencyId: Currency["id"];
+  monetaryAuthorityId: string;
+  memberCountryIds: string[];
+}
+
+export interface BankAccount {
+  id: string;
+  ownerId: string;
+  bankId: string;
+  currencyId: Currency["id"];
+  ledgerDepositAccountId: string;
+  ledgerBankLiabilityAccountId: string;
+  openedAtMonth: number;
+  status: "active" | "closed";
+  isPrimary: boolean;
+}
+
 export interface LedgerAccount {
   id: string;
   ownerId: string;
@@ -24,8 +53,12 @@ export interface LedgerAccount {
     | "security"
     | "bond"
     | "goodwill"
-    | "intercentral"
-    | "monetary-base";
+  | "intercentral"
+    | "monetary-base"
+    | "fund-unit"
+    | "margin-loan"
+    | "collateral"
+    | "repo";
   currency: string;
 }
 
@@ -84,7 +117,25 @@ export type TransactionKind =
   | "BROKER_FEE"
   | "EXCHANGE_FEE"
   | "BANKRUPTCY_DISTRIBUTION"
-  | "SECURITY_REVALUATION";
+  | "SECURITY_REVALUATION"
+  | "FX_TRADE"
+  | "FUND_SUBSCRIPTION"
+  | "FUND_REDEMPTION"
+  | "MANAGEMENT_FEE"
+  | "PERFORMANCE_FEE"
+  | "PENSION_CONTRIBUTION"
+  | "ETF_CREATION"
+  | "ETF_REDEMPTION"
+  | "UNDERWRITING_FEE"
+  | "MARGIN_FINANCE"
+  | "MARGIN_REPAYMENT"
+  | "SECURITIES_BORROW"
+  | "BORROW_FEE"
+  | "DIVIDEND_COMPENSATION"
+  | "REPO_OPEN"
+  | "REPO_REPAYMENT"
+  | "COLLATERAL_PLEDGE"
+  | "PRIME_BROKER_LOSS";
 
 export interface LedgerTransaction {
   id: string;
@@ -171,7 +222,20 @@ export type EventType =
   | "OrderPlaced"
   | "OrderCancelled"
   | "TradeExecuted"
-  | "BrokerageOpened";
+  | "BrokerageOpened"
+  | "BankAccountOpened"
+  | "FxTradeExecuted"
+  | "FundSubscribed"
+  | "FundRedeemed"
+  | "FundFeeCharged"
+  | "MarginCallIssued"
+  | "ForcedLiquidation"
+  | "SecuritiesBorrowed"
+  | "ShortOpened"
+  | "ShortCovered"
+  | "RepoOpened"
+  | "RepoRepaid"
+  | "PrimeBrokerLoss";
 
 export interface DomainEvent {
   id: string;
@@ -238,6 +302,7 @@ export interface Household {
   displayName: string;
   personIds: string[];
   bankId: string;
+  primaryBankAccountId: string;
   employerId: string | null;
   skillBps: number;
   productivityBps: number;
@@ -388,12 +453,16 @@ export interface CentralBank {
   policyRateHistory: PolicyRatePoint[];
   countryId: string;
   currencyId: string;
+  monetaryAreaId: string;
+  setsPolicyRate: boolean;
 }
 
 export interface Loan {
   id: string;
   lenderBankId: string;
   borrowerId: string;
+  currencyId: string;
+  settlementBankAccountId: string;
   originalPrincipalCents: number;
   remainingPrincipalCents: number;
   annualRateBps: number;
@@ -457,6 +526,24 @@ export interface MetricPoint {
   marketShareBpsByCompany: Record<string, number>;
 }
 
+export interface CountryMetricPoint {
+  countryId: string;
+  currencyId: string;
+  elapsedMonth: number;
+  nominalGdpMinor: number;
+  realGdpMinor: number;
+  gdpGrowthBps: number;
+  cpiBps: number;
+  inflationBps: number;
+  unemploymentBps: number;
+  employment: number;
+  depositMoneyMinor: number;
+  creditMinor: number;
+  activeCompanies: number;
+  productionMilliUnits: number;
+  consumptionMinor: number;
+}
+
 export interface CurrentAccountingPeriod {
   openingInventoryValueCents: number;
   householdConsumptionCents: number;
@@ -492,6 +579,16 @@ export interface JobOffer {
   scoreBps: number;
 }
 
+export interface JobApplication {
+  id: string;
+  companyId: string;
+  occupationId: string;
+  submittedAtMonth: number;
+  status: "submitted" | "offered" | "rejected" | "accepted";
+  reason: string;
+  offerId: string | null;
+}
+
 export interface CourseEnrollment {
   courseId: string;
   enrolledAtMonth: number;
@@ -504,6 +601,7 @@ export interface Country {
   id: string;
   name: string;
   currencyReference: string;
+  monetaryAreaId: string;
   legalProfile: string;
   taxContext: string;
   cityIds: string[];
@@ -566,6 +664,7 @@ export interface UniversityProgram {
   requiredSkills: Partial<Record<SkillId, number>>;
   skillOutcomes: Partial<Record<SkillId, number>>;
   specialization: string;
+  attendanceMode: "ON_CAMPUS" | "REMOTE" | "HYBRID";
 }
 
 export interface University {
@@ -771,6 +870,7 @@ export interface PlayerState {
   consumptionBudgetBps: number;
   savingsTargetBps: number;
   pendingJobOffer: JobOffer | null;
+  jobApplications: JobApplication[];
   activeEnrollment: CourseEnrollment | null;
   completedCourseIds: string[];
   completedLessonIds: string[];
@@ -792,6 +892,9 @@ export interface PlayerState {
   durableAssetIds: string[];
   propertyIds: string[];
   brokerageAccountIds: string[];
+  bankAccountIds: string[];
+  reportingCurrencyId: string;
+  foodPlanId: "minimal" | "basic" | "good" | "premium";
 }
 
 export interface EquitySecurity {
@@ -893,6 +996,8 @@ export interface Broker {
   countryId: string;
   bankId: string;
   exchangeIds: string[];
+  supportedCurrencyIds: string[];
+  marginAvailable: boolean;
 }
 
 export interface BrokerageAccount {
@@ -900,6 +1005,8 @@ export interface BrokerageAccount {
   brokerId: string;
   ownerId: string;
   currencyId: string;
+  jurisdictionCountryId: string;
+  settlementBankAccountIds: string[];
   openedAtMonth: number;
   status: "active" | "closed";
 }
@@ -951,11 +1058,205 @@ export interface MarketIndex {
   history: Array<{ elapsedMonth: number; levelBps: number }>;
 }
 
+export interface FxPair {
+  id: string;
+  baseCurrencyId: string;
+  quoteCurrencyId: string;
+  referenceRatePpm: number;
+  lastRatePpm: number;
+  previousRatePpm: number;
+  bidRatePpm: number;
+  askRatePpm: number;
+  spreadBps: number;
+  volumeBaseMinor: number;
+}
+
+export interface FxOrder {
+  id: string;
+  pairId: string;
+  ownerId: string;
+  side: "buy-base" | "sell-base";
+  baseAmountMinor: number;
+  remainingBaseMinor: number;
+  limitRatePpm: number | null;
+  type: "market" | "limit";
+  placedAtMonth: number;
+  sequence: number;
+  status: "open" | "partially-filled" | "filled" | "cancelled" | "rejected";
+}
+
+export interface FxTrade {
+  id: string;
+  pairId: string;
+  buyerId: string;
+  sellerId: string;
+  baseAmountMinor: number;
+  quoteAmountMinor: number;
+  ratePpm: number;
+  feeQuoteMinor: number;
+  elapsedMonth: number;
+  transactionGroupId: string;
+  baseLegTransactionId: string;
+  quoteLegTransactionId: string;
+}
+
+export interface FxDealer {
+  id: string;
+  name: string;
+  bankAccountIds: string[];
+  targetInventoryByCurrency: Record<string, number>;
+  spreadBps: number;
+}
+
+export interface FundMandate {
+  assetClasses: Array<"equity" | "bond" | "cash" | "private-equity">;
+  countryIds: string[];
+  benchmarkIndexId: string | null;
+  cashBufferBps: number;
+  maxPositionBps: number;
+  riskTargetBps: number;
+}
+
+export interface AssetManager {
+  id: string;
+  name: string;
+  countryId: string;
+  ownerId: string;
+  bankAccountId: string;
+  fundIds: string[];
+  employeeCount: number;
+  revenueMinor: number;
+  expensesMinor: number;
+}
+
+export interface Fund {
+  id: string;
+  name: string;
+  type: "open-end" | "etf" | "hedge" | "pension" | "private-capital";
+  managerId: string;
+  currencyId: string;
+  bankAccountId: string;
+  unitSecurityId: string | null;
+  unitsOutstandingMicros: number;
+  navMinor: number;
+  highWaterMarkMinorPerUnit: number;
+  managementFeeBps: number;
+  performanceFeeBps: number;
+  mandate: FundMandate;
+  status: "active" | "liquidating" | "closed";
+}
+
+export interface FundUnitHolding {
+  id: string;
+  fundId: string;
+  investorId: string;
+  unitsMicros: number;
+  costBasisMinor: number;
+}
+
+export interface InvestmentBankMandate {
+  id: string;
+  investmentBankId: string;
+  clientCompanyId: string;
+  type: "ipo" | "bond" | "ma";
+  feeBps: number;
+  targetAmountMinor: number;
+  placedAmountMinor: number;
+  status: "proposed" | "active" | "closed" | "failed";
+}
+
+export interface CollateralPledge {
+  id: string;
+  ownerId: string;
+  securedPartyId: string;
+  assetType: "security" | "cash";
+  assetId: string;
+  quantity: number;
+  currencyId: string;
+  haircutBps: number;
+  markedValueMinor: number;
+  purpose: "margin" | "repo" | "prime-brokerage";
+  status: "active" | "released" | "liquidated";
+}
+
+export interface MarginAccount {
+  id: string;
+  ownerId: string;
+  primeBrokerId: string;
+  brokerageAccountId: string;
+  currencyId: string;
+  cashMinor: number;
+  borrowedMinor: number;
+  initialMarginBps: number;
+  maintenanceMarginBps: number;
+  maxLeverageBps: number;
+  status: "active" | "margin-call" | "defaulted" | "closed";
+}
+
+export interface MarginCall {
+  id: string;
+  marginAccountId: string;
+  requiredEquityMinor: number;
+  currentEquityMinor: number;
+  issuedAtMonth: number;
+  deadlineMonth: number;
+  status: "open" | "met" | "liquidating" | "defaulted";
+  reason: string;
+}
+
+export interface SecuritiesLoan {
+  id: string;
+  securityId: string;
+  quantity: number;
+  lenderId: string;
+  borrowerId: string;
+  collateralPledgeId: string;
+  borrowFeeBps: number;
+  openedAtMonth: number;
+  status: "active" | "returned" | "defaulted";
+}
+
+export interface ShortPosition {
+  id: string;
+  marginAccountId: string;
+  securityId: string;
+  securitiesLoanId: string;
+  quantity: number;
+  entryPriceMinor: number;
+  accruedBorrowFeeMinor: number;
+  status: "open" | "covered" | "defaulted";
+}
+
+export interface RepoAgreement {
+  id: string;
+  cashLenderId: string;
+  cashBorrowerId: string;
+  currencyId: string;
+  cashAmountMinor: number;
+  collateralPledgeId: string;
+  repoRateBps: number;
+  openedAtMonth: number;
+  maturityMonth: number;
+  status: "active" | "repaid" | "defaulted";
+}
+
+export interface PrimeBrokerExposure {
+  id: string;
+  primeBrokerId: string;
+  clientId: string;
+  marginAccountId: string;
+  loanMinor: number;
+  collateralValueMinor: number;
+  unrealizedExposureMinor: number;
+  liquidationShortfallMinor: number;
+  status: "active" | "liquidating" | "closed" | "loss";
+}
+
 export type SimulationScenario = "baseline" | "high-demand" | "supply-constraint" | "high-rates" | "bank-liquidity-stress";
 
 export interface WorldState {
-  schemaVersion: 4;
-  saveVersion: 4;
+  schemaVersion: 5;
+  saveVersion: 5;
   seed: string;
   scenario: SimulationScenario;
   clock: SimulationClock;
@@ -970,6 +1271,9 @@ export interface WorldState {
   centralBank: CentralBank;
   governments: Government[];
   centralBanks: CentralBank[];
+  currencies: Currency[];
+  monetaryAreas: MonetaryArea[];
+  bankAccounts: BankAccount[];
   loans: Loan[];
   bankFunding: BankFunding[];
   nationalAccounts: NationalAccountsState;
@@ -977,6 +1281,7 @@ export interface WorldState {
   player: PlayerState;
   events: DomainEvent[];
   metricsHistory: MetricPoint[];
+  countryMetricsHistory: CountryMetricPoint[];
   nextEventId: number;
   nextGoodsMovementId: number;
   nextLoanId: number;
@@ -1011,9 +1316,25 @@ export interface WorldState {
   brokers: Broker[];
   brokerageAccounts: BrokerageAccount[];
   marketOrders: MarketOrder[];
+  archivedMarketOrders: MarketOrder[];
   marketTrades: MarketTrade[];
   ohlcvBars: OhlcvBar[];
   marketIndices: MarketIndex[];
+  fxPairs: FxPair[];
+  fxOrders: FxOrder[];
+  fxTrades: FxTrade[];
+  fxDealers: FxDealer[];
+  assetManagers: AssetManager[];
+  funds: Fund[];
+  fundUnitHoldings: FundUnitHolding[];
+  investmentBankMandates: InvestmentBankMandate[];
+  marginAccounts: MarginAccount[];
+  marginCalls: MarginCall[];
+  collateralPledges: CollateralPledge[];
+  securitiesLoans: SecuritiesLoan[];
+  shortPositions: ShortPosition[];
+  repoAgreements: RepoAgreement[];
+  primeBrokerExposures: PrimeBrokerExposure[];
   nextSecurityId: number;
   nextHoldingId: number;
   nextBondId: number;
@@ -1023,11 +1344,21 @@ export interface WorldState {
   nextOrderId: number;
   nextTradeId: number;
   nextOrderSequence: number;
+  nextBankAccountId: number;
+  nextFxOrderId: number;
+  nextFxTradeId: number;
+  nextFundUnitHoldingId: number;
+  nextMarginAccountId: number;
+  nextMarginCallId: number;
+  nextCollateralId: number;
+  nextSecuritiesLoanId: number;
+  nextShortPositionId: number;
+  nextRepoId: number;
 }
 
 export interface InvariantResult {
   id: string;
-  section: "Национальные счета" | "Бухгалтерия" | "Товары" | "Деньги" | "Кредит" | "Ликвидность банков" | "Игрок" | "Население" | "География" | "Жильё" | "Образование" | "Производительность" | "Собственность" | "Рынки";
+  section: "Национальные счета" | "Бухгалтерия" | "Товары" | "Деньги" | "Валюты" | "Кредит" | "Ликвидность банков" | "Игрок" | "Население" | "География" | "Жильё" | "Образование" | "Производительность" | "Собственность" | "Рынки" | "Фонды" | "Обеспечение";
   title: string;
   ok: boolean;
   detail: string;

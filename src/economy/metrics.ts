@@ -1,6 +1,6 @@
 import { calculateNationalAccounts } from "../accounting/national-accounts.ts";
-import { sumAccounts } from "../core/ledger.ts";
-import type { MetricPoint, WorldState } from "../domain/model.ts";
+import { bankAccountBalance, sumAccounts } from "../core/ledger.ts";
+import type { CountryMetricPoint, MetricPoint, WorldState } from "../domain/model.ts";
 
 function averagePriceForGood(world: WorldState, goodId: string): number {
   const companies = world.companies.filter((company) => company.active && company.goodId === goodId);
@@ -94,6 +94,45 @@ export function collectMetrics(world: WorldState): MetricPoint {
 
 export function latestMetrics(world: WorldState): MetricPoint {
   return world.metricsHistory.at(-1) ?? collectMetrics(world);
+}
+
+export function collectCountryMetrics(world: WorldState): CountryMetricPoint[] {
+  return world.countries.map((country) => {
+    const companies = world.companies.filter((company) => company.headquartersCountryId === country.id);
+    const households = world.households.filter((household) => world.cities.find((city) => city.id === household.cityId)?.countryId === country.id);
+    const cohorts = world.populationCohorts.filter((cohort) => cohort.countryId === country.id);
+    const nominalGdpMinor = companies.reduce((sum, company) => sum + Math.max(0, company.lastGrossRevenueCents - company.lastIntermediateConsumptionCents), 0);
+    const pricePoints = world.cities.filter((city) => city.countryId === country.id).flatMap((city) => Object.entries(city.localPriceByGoodCents));
+    const cpiBps = pricePoints.length ? Math.round(pricePoints.reduce((sum, [goodId, price]) => sum + price * 10_000 / Math.max(1, world.goods.find((good) => good.id === goodId)?.basePriceCents ?? price), 0) / pricePoints.length) : 10_000;
+    const previous = [...world.countryMetricsHistory].reverse().find((point) => point.countryId === country.id);
+    const twelveMonthsAgo = [...world.countryMetricsHistory].reverse().find((point) => point.countryId === country.id && point.elapsedMonth <= world.clock.elapsedMonths - 12);
+    const realGdpMinor = Math.round(nominalGdpMinor * 10_000 / Math.max(1, cpiBps));
+    const gdpGrowthBps = previous?.realGdpMinor ? Math.round((realGdpMinor - previous.realGdpMinor) * 10_000 / previous.realGdpMinor) : 0;
+    const inflationBps = twelveMonthsAgo?.cpiBps ? Math.round((cpiBps - twelveMonthsAgo.cpiBps) * 10_000 / twelveMonthsAgo.cpiBps) : 0;
+    const employedNamed = households.filter((household) => household.employerId).length;
+    const employedAggregate = cohorts.reduce((sum, cohort) => sum + cohort.employedCount, 0);
+    const labourForce = households.length + cohorts.reduce((sum, cohort) => sum + cohort.populationCount, 0);
+    const employment = employedNamed + employedAggregate;
+    const depositMoneyMinor = world.bankAccounts.filter((account) => country.bankIds.includes(account.bankId) && account.currencyId === country.currencyReference).reduce((sum, account) => sum + bankAccountBalance(world, account.id), 0);
+    const creditMinor = world.loans.filter((loan) => country.bankIds.includes(loan.lenderBankId) && loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
+    return {
+      countryId: country.id,
+      currencyId: country.currencyReference,
+      elapsedMonth: world.clock.elapsedMonths,
+      nominalGdpMinor,
+      realGdpMinor,
+      gdpGrowthBps,
+      cpiBps,
+      inflationBps,
+      unemploymentBps: Math.round((labourForce - employment) * 10_000 / Math.max(1, labourForce)),
+      employment,
+      depositMoneyMinor,
+      creditMinor,
+      activeCompanies: companies.filter((company) => company.active).length,
+      productionMilliUnits: companies.reduce((sum, company) => sum + company.lastProductionMilliUnits, 0),
+      consumptionMinor: households.reduce((sum, household) => sum + Object.values(household.lastSpendingByCategoryCents).reduce((subtotal, value) => subtotal + value, 0), 0),
+    };
+  });
 }
 
 export function deterministicFingerprint(world: WorldState): string {

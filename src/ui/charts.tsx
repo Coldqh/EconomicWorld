@@ -1,4 +1,5 @@
 import { useId, useMemo, useState } from "react";
+import type { OhlcvBar } from "../domain/model.ts";
 
 const WIDTH = 720;
 const HEIGHT = 250;
@@ -135,6 +136,40 @@ export function MarketBars({ production, sales }: { production: number; sales: n
       <i className="sales" style={{ width: `${(sales / max) * 100}%` }} />
     </div>
   );
+}
+
+export function TradingChart({ bars, format, ariaLabel }: { bars: OhlcvBar[]; format: (value: number) => string; ariaLabel: string }) {
+  const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  if (!bars.length) return <div className="trading-chart empty-chart" role="img" aria-label={`${ariaLabel}: сделок нет`}>Нет сделок — свечи не построены</div>;
+  const width = 820;
+  const height = 360;
+  const priceRight = 740;
+  const priceTop = 18;
+  const volumeTop = 280;
+  const visible = bars.slice(-60);
+  const low = Math.min(...visible.map((bar) => bar.lowCents));
+  const high = Math.max(...visible.map((bar) => bar.highCents));
+  const span = Math.max(1, high - low);
+  const maxVolume = Math.max(1, ...visible.map((bar) => bar.volume));
+  const candleWidth = Math.max(3, Math.min(16, priceRight / visible.length * 0.62));
+  const priceY = (value: number) => priceTop + (1 - (value - low) / span) * 238;
+  const x = (index: number) => 18 + index * (priceRight - 36) / Math.max(1, visible.length - 1);
+  const active = activeIndex === null ? visible.at(-1)! : visible[activeIndex];
+  const activeX = x(activeIndex === null ? visible.length - 1 : activeIndex);
+  return <div className="trading-chart">
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={ariaLabel} onPointerMove={(event) => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const local = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+      setActiveIndex(Math.max(0, Math.min(visible.length - 1, Math.round(local / rect.width * (visible.length - 1)))));
+    }} onPointerLeave={() => setActiveIndex(null)}>
+      {[0, 1, 2, 3, 4].map((step) => { const y = priceTop + step * 59.5; const value = Math.round(high - span * step / 4); return <g key={step}><line className="trade-grid" x1="0" x2={priceRight} y1={y} y2={y} /><text className="price-axis" x={priceRight + 8} y={y + 4}>{format(value)}</text></g>; })}
+      {visible.map((bar, index) => { const candleX = x(index); const positive = bar.closeCents >= bar.openCents; const top = priceY(Math.max(bar.openCents, bar.closeCents)); const bottom = priceY(Math.min(bar.openCents, bar.closeCents)); const volumeHeight = Math.max(1, bar.volume / maxVolume * 54); return <g key={`${bar.securityId}-${bar.elapsedMonth}`} className={positive ? "candle-up" : "candle-down"}><line className="wick" x1={candleX} x2={candleX} y1={priceY(bar.highCents)} y2={priceY(bar.lowCents)} /><rect className="candle" x={candleX - candleWidth / 2} y={top} width={candleWidth} height={Math.max(1.5, bottom - top)} /><rect className="volume" x={candleX - candleWidth / 2} y={volumeTop + 58 - volumeHeight} width={candleWidth} height={volumeHeight} /></g>; })}
+      <line className="trade-crosshair" x1={activeX} x2={activeX} y1={priceTop} y2="338" />
+      <line className="trade-current" x1="0" x2={priceRight} y1={priceY(visible.at(-1)!.closeCents)} y2={priceY(visible.at(-1)!.closeCents)} />
+      <text className="time-axis" x="18" y="350">{visible[0].elapsedMonth + 1}м</text><text className="time-axis" x={priceRight - 24} y="350">{visible.at(-1)!.elapsedMonth + 1}м</text>
+    </svg>
+    <div className="ohlc-tooltip"><span>{active.elapsedMonth + 1} месяц</span><b>О {format(active.openCents)}</b><b>М {format(active.highCents)}</b><b>Мн {format(active.lowCents)}</b><b>З {format(active.closeCents)}</b><small>Объём {active.volume.toLocaleString("ru-RU")}</small></div>
+  </div>;
 }
 
 export function BalanceVisual({ assets, liabilities, capital }: { assets: number; liabilities: number; capital: number }) {

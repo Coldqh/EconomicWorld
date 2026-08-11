@@ -40,6 +40,7 @@ export function materializePerson(world: WorldState, cohortId: string, important
     displayName: person.displayName,
     personIds: [personId],
     bankId: cohort.bankId,
+    primaryBankAccountId: "",
     employerId: null,
     skillBps: Math.round(Object.values(person.skills).reduce((sum, value) => sum + value, 0) / SKILLS.length),
     productivityBps: 8_000,

@@ -1,10 +1,12 @@
 import { emitSimpleEvent } from "../core/events.ts";
 import {
   accountIds,
+  bankAccountBalance,
+  bankAccountsForOwner,
   balanceOf,
-  depositOf,
   ensureAccount,
   entityBook,
+  openBankAccount,
   postTransaction,
 } from "../core/ledger.ts";
 import type { Bank, Loan, WorldState } from "../domain/model.ts";
@@ -72,24 +74,32 @@ export function issueLoan(
     return null;
   }
 
-  const depositAccount = accountIds.deposit(borrowerId);
-  const depositLiability = accountIds.bankDepositLiability(bankId, borrowerId);
+  let settlement = bankAccountsForOwner(world, borrowerId, bank.baseCurrency).find((account) => account.bankId === bankId);
+  if (!settlement) {
+    const opened = openBankAccount(world, borrowerId, bankId, !bankAccountsForOwner(world, borrowerId).length);
+    settlement = world.bankAccounts.find((account) => account.id === opened.accountId);
+  }
+  if (!settlement) return null;
+  const settlementDepositAccount = settlement.ledgerDepositAccountId;
+  const depositLiability = settlement.ledgerBankLiabilityAccountId;
   const borrowerLoan = accountIds.loanLiability(borrowerId, bankId);
   const bankLoan = accountIds.bankLoanAsset(bankId, borrowerId);
-  ensureAccount(world.ledger, depositAccount, borrowerId, "Банковский депозит", "asset");
-  ensureAccount(world.ledger, depositLiability, bankId, `Депозит ${borrowerId}`, "liability");
-  ensureAccount(world.ledger, borrowerLoan, borrowerId, `Кредит ${bankId}`, "liability");
-  ensureAccount(world.ledger, bankLoan, bankId, `Кредит ${borrowerId}`, "asset");
-  ensureAccount(world.ledger, accountIds.bankInterestIncome(bankId), bankId, "Процентный доход", "income");
-  ensureAccount(world.ledger, accountIds.bankCreditLoss(bankId), bankId, "Кредитные убытки", "expense");
+  ensureAccount(world.ledger, settlementDepositAccount, borrowerId, "Банковский депозит", "asset", bank.baseCurrency);
+  ensureAccount(world.ledger, depositLiability, bankId, `Депозит ${borrowerId}`, "liability", bank.baseCurrency);
+  ensureAccount(world.ledger, borrowerLoan, borrowerId, `Кредит ${bankId}`, "liability", bank.baseCurrency);
+  ensureAccount(world.ledger, bankLoan, bankId, `Кредит ${borrowerId}`, "asset", bank.baseCurrency);
+  ensureAccount(world.ledger, accountIds.bankInterestIncome(bankId), bankId, "Процентный доход", "income", bank.baseCurrency);
+  ensureAccount(world.ledger, accountIds.bankCreditLoss(bankId), bankId, "Кредитные убытки", "expense", bank.baseCurrency);
 
   const loan: Loan = {
     id: `loan-${String(world.nextLoanId++).padStart(7, "0")}`,
     lenderBankId: bankId,
     borrowerId,
+    currencyId: bank.baseCurrency,
+    settlementBankAccountId: settlement.id,
     originalPrincipalCents: amountCents,
     remainingPrincipalCents: amountCents,
-    annualRateBps: world.centralBank.policyRateBps + bank.baseSpreadBps + riskPremiumBps,
+    annualRateBps: (world.centralBanks.find((item) => item.id === bank.centralBankId)?.policyRateBps ?? world.centralBank.policyRateBps) + bank.baseSpreadBps + riskPremiumBps,
     remainingMonths: termMonths,
     missedPayments: 0,
     status: "active",
@@ -100,7 +110,7 @@ export function issueLoan(
     "LOAN_ISSUED",
     `${bank.name} выдал кредит ${borrowerId}`,
     [
-      { accountId: depositAccount, side: "debit", amountCents },
+      { accountId: settlementDepositAccount, side: "debit", amountCents },
       { accountId: borrowerLoan, side: "credit", amountCents },
       { accountId: bankLoan, side: "debit", amountCents },
       { accountId: depositLiability, side: "credit", amountCents },
@@ -132,7 +142,8 @@ export function serviceLoans(world: WorldState): void {
       1,
       Math.round((loan.remainingPrincipalCents * loan.annualRateBps) / 120_000),
     );
-    const available = depositOf(world, loan.borrowerId);
+    const settlement = world.bankAccounts.find((account) => account.id === loan.settlementBankAccountId && account.status === "active");
+    const available = settlement ? bankAccountBalance(world, settlement.id) : 0;
     if (available < principalCents + interestCents) {
       loan.missedPayments += 1;
       if (loan.missedPayments === 1 || loan.missedPayments === 3) {
@@ -152,25 +163,27 @@ export function serviceLoans(world: WorldState): void {
 
     const borrowerLoan = accountIds.loanLiability(loan.borrowerId, loan.lenderBankId);
     const bankLoan = accountIds.bankLoanAsset(loan.lenderBankId, loan.borrowerId);
-    const bankDepositLiability = accountIds.bankDepositLiability(
-      loan.lenderBankId,
-      loan.borrowerId,
-    );
-    const borrowerExpense = accountIds.operatingExpense(loan.borrowerId);
-    ensureAccount(world.ledger, borrowerExpense, loan.borrowerId, "Расходы", "expense");
+    if (!settlement) continue;
+    const bankDepositLiability = settlement.ledgerBankLiabilityAccountId;
+    const baseExpense = accountIds.operatingExpense(loan.borrowerId);
+    const borrowerExpense = world.ledger.accounts[baseExpense]?.currency === loan.currencyId ? baseExpense : `${baseExpense}:${loan.currencyId}`;
+    const baseInterestIncome = accountIds.bankInterestIncome(loan.lenderBankId);
+    const bankInterestIncome = world.ledger.accounts[baseInterestIncome]?.currency === loan.currencyId ? baseInterestIncome : `${baseInterestIncome}:${loan.currencyId}`;
+    ensureAccount(world.ledger, borrowerExpense, loan.borrowerId, "Расходы", "expense", loan.currencyId);
     ensureAccount(
       world.ledger,
-      accountIds.bankInterestIncome(loan.lenderBankId),
+      bankInterestIncome,
       loan.lenderBankId,
       "Процентный доход",
       "income",
+      loan.currencyId,
     );
     postTransaction(world, "LOAN_INTEREST", `Проценты по ${loan.id}`, [
       { accountId: borrowerExpense, side: "debit", amountCents: interestCents },
-      { accountId: accountIds.deposit(loan.borrowerId), side: "credit", amountCents: interestCents },
+      { accountId: settlement.ledgerDepositAccountId, side: "credit", amountCents: interestCents },
       { accountId: bankDepositLiability, side: "debit", amountCents: interestCents },
       {
-        accountId: accountIds.bankInterestIncome(loan.lenderBankId),
+        accountId: bankInterestIncome,
         side: "credit",
         amountCents: interestCents,
       },
@@ -182,7 +195,7 @@ export function serviceLoans(world: WorldState): void {
     }
     postTransaction(world, "LOAN_PRINCIPAL", `Погашение principal ${loan.id}`, [
       { accountId: borrowerLoan, side: "debit", amountCents: principalCents },
-      { accountId: accountIds.deposit(loan.borrowerId), side: "credit", amountCents: principalCents },
+      { accountId: settlement.ledgerDepositAccountId, side: "credit", amountCents: principalCents },
       { accountId: bankDepositLiability, side: "debit", amountCents: principalCents },
       { accountId: bankLoan, side: "credit", amountCents: principalCents },
     ]);
@@ -211,8 +224,9 @@ export function settleBorrowerLoansFromCash(
   let recovered = 0;
   for (const loan of world.loans) {
     if (loan.borrowerId !== borrowerId || loan.status !== "active") continue;
+    const settlement = world.bankAccounts.find((account) => account.id === loan.settlementBankAccountId && account.status === "active");
     const amountCents = Math.min(
-      depositOf(world, borrowerId),
+      settlement ? bankAccountBalance(world, settlement.id) : 0,
       loan.remainingPrincipalCents,
     );
     if (amountCents <= 0) continue;
@@ -227,12 +241,12 @@ export function settleBorrowerLoansFromCash(
           amountCents,
         },
         {
-          accountId: accountIds.deposit(borrowerId),
+          accountId: settlement!.ledgerDepositAccountId,
           side: "credit",
           amountCents,
         },
         {
-          accountId: accountIds.bankDepositLiability(loan.lenderBankId, borrowerId),
+          accountId: settlement!.ledgerBankLiabilityAccountId,
           side: "debit",
           amountCents,
         },
@@ -263,19 +277,25 @@ export function defaultBorrowerLoans(
     if (loan.borrowerId !== borrowerId || loan.status !== "active") continue;
     const amountCents = loan.remainingPrincipalCents;
     if (amountCents <= 0) continue;
+    const baseIncome = accountIds.operatingIncome(borrowerId);
+    const borrowerIncome = world.ledger.accounts[baseIncome]?.currency === loan.currencyId ? baseIncome : `${baseIncome}:${loan.currencyId}`;
+    const baseLoss = accountIds.bankCreditLoss(loan.lenderBankId);
+    const bankLoss = world.ledger.accounts[baseLoss]?.currency === loan.currencyId ? baseLoss : `${baseLoss}:${loan.currencyId}`;
     ensureAccount(
       world.ledger,
-      accountIds.operatingIncome(borrowerId),
+      borrowerIncome,
       borrowerId,
       "Доход от реструктуризации",
       "income",
+      loan.currencyId,
     );
     ensureAccount(
       world.ledger,
-      accountIds.bankCreditLoss(loan.lenderBankId),
+      bankLoss,
       loan.lenderBankId,
       "Кредитные убытки",
       "expense",
+      loan.currencyId,
     );
     postTransaction(
       world,
@@ -288,12 +308,12 @@ export function defaultBorrowerLoans(
           amountCents,
         },
         {
-          accountId: accountIds.operatingIncome(borrowerId),
+          accountId: borrowerIncome,
           side: "credit",
           amountCents,
         },
         {
-          accountId: accountIds.bankCreditLoss(loan.lenderBankId),
+          accountId: bankLoss,
           side: "debit",
           amountCents,
         },

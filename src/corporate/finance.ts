@@ -1,11 +1,13 @@
 import { emitSimpleEvent } from "../core/events.ts";
 import {
   accountIds,
+  bankAccountBalance,
   depositOf,
   ensureAccount,
   entityBook,
   postTransaction,
   settleDepositPayment,
+  transferBankAccountBalance,
 } from "../core/ledger.ts";
 import type { Company, CorporateAction, EquityHolding, WorldState } from "../domain/model.ts";
 
@@ -172,6 +174,7 @@ export function transferShares(
   shares: number,
   pricePerShareCents: number,
   kind: "EQUITY_SECONDARY" | "MARKET_TRADE" = "EQUITY_SECONDARY",
+  settlement?: { buyerBankAccountId: string; sellerBankAccountId: string },
 ): CorporateResult {
   shares = Math.floor(shares);
   const security = world.equitySecurities.find((item) => item.id === securityId);
@@ -179,25 +182,40 @@ export function transferShares(
   const sellerHolding = holdingFor(world, securityId, sellerId);
   const cashCents = shares * Math.floor(pricePerShareCents);
   if (!security || !company || !sellerHolding || shares <= 0 || sellerHolding.shares < shares) return result(false, "Недостаточно акций");
-  if (ownerCurrency(world, buyerId) !== security.currencyId || ownerCurrency(world, sellerId) !== security.currencyId) return result(false, "Валюты сторон не совпадают");
-  if (depositOf(world, buyerId) < cashCents) return result(false, "Недостаточно денег");
+  const buyerSettlement = settlement && world.bankAccounts.find((account) => account.id === settlement.buyerBankAccountId && account.ownerId === buyerId && account.status === "active");
+  const sellerSettlement = settlement && world.bankAccounts.find((account) => account.id === settlement.sellerBankAccountId && account.ownerId === sellerId && account.status === "active");
+  if (settlement && (!buyerSettlement || !sellerSettlement || buyerSettlement.currencyId !== security.currencyId || sellerSettlement.currencyId !== security.currencyId)) return result(false, "Расчётные счета не соответствуют валюте инструмента");
+  if (!settlement && (ownerCurrency(world, buyerId) !== security.currencyId || ownerCurrency(world, sellerId) !== security.currencyId)) return result(false, "Валюты сторон не совпадают");
+  if ((buyerSettlement ? bankAccountBalance(world, buyerSettlement.id) : depositOf(world, buyerId)) < cashCents) return result(false, "Недостаточно денег");
   const sellerBookCents = Math.round((sellerHolding.costBasisCents * shares) / sellerHolding.shares);
   const revaluationId = revalueSecurityBook(world, sellerId, securityId, sellerBookCents, cashCents);
   const buyerAssetId = accountIds.security(buyerId, securityId);
   const sellerAssetId = accountIds.security(sellerId, securityId);
   ensureAccount(world.ledger, buyerAssetId, buyerId, `Акции ${company.name}`, "asset", security.currencyId);
   ensureAccount(world.ledger, sellerAssetId, sellerId, `Акции ${company.name}`, "asset", security.currencyId);
-  const transactionId = settleDepositPayment(world, buyerId, sellerId, cashCents, kind, `Передача акций ${company.name}`, buyerAssetId, sellerAssetId);
-  if (!transactionId) return result(false, "Расчёт сделки не выполнен");
+  let transactionIds: string[] = [];
+  if (buyerSettlement && sellerSettlement) {
+    const cashId = transferBankAccountBalance(world, buyerSettlement.id, sellerSettlement.id, cashCents, kind, `Денежный расчёт ${company.name}`);
+    if (!cashId) return result(false, "Расчёт сделки не выполнен");
+    const securityId = postTransaction(world, kind, `Передача акций ${company.name}`, [
+      { accountId: buyerAssetId, side: "debit", amountCents: cashCents },
+      { accountId: sellerAssetId, side: "credit", amountCents: cashCents },
+    ], [cashId]);
+    transactionIds = [cashId, securityId];
+  } else {
+    const transactionId = settleDepositPayment(world, buyerId, sellerId, cashCents, kind, `Передача акций ${company.name}`, buyerAssetId, sellerAssetId);
+    if (!transactionId) return result(false, "Расчёт сделки не выполнен");
+    transactionIds = [transactionId];
+  }
   sellerHolding.shares -= shares;
   sellerHolding.costBasisCents -= sellerBookCents;
   addHolding(world, securityId, buyerId, shares, cashCents);
   if (sellerHolding.shares === 0) world.equityHoldings.splice(world.equityHoldings.indexOf(sellerHolding), 1);
   if (kind === "EQUITY_SECONDARY") {
     recordAction(world, company.id, "share-transfer", "Передача акций", cashCents, [sellerId, buyerId]);
-    emitSimpleEvent(world, "SharesTransferred", "Передача акций", `${shares.toLocaleString("ru-RU")} акций`, [sellerId, buyerId, company.id], "info", [transactionId]);
+    emitSimpleEvent(world, "SharesTransferred", "Передача акций", `${shares.toLocaleString("ru-RU")} акций`, [sellerId, buyerId, company.id], "info", transactionIds);
   }
-  return result(true, `Передано ${shares.toLocaleString("ru-RU")} акций`, [revaluationId, transactionId].filter(Boolean) as string[]);
+  return result(true, `Передано ${shares.toLocaleString("ru-RU")} акций`, [revaluationId, ...transactionIds].filter(Boolean) as string[]);
 }
 
 export function declareDividend(world: WorldState, companyId: string, totalCents: number): CorporateResult {
