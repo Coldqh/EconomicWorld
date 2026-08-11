@@ -99,7 +99,12 @@ export function issueLoan(
     settlementBankAccountId: settlement.id,
     originalPrincipalCents: amountCents,
     remainingPrincipalCents: amountCents,
-    annualRateBps: (world.centralBanks.find((item) => item.id === bank.centralBankId)?.policyRateBps ?? world.centralBank.policyRateBps) + bank.baseSpreadBps + riskPremiumBps,
+    annualRateBps: Math.round((world.centralBanks.find((item) => item.id === bank.centralBankId)?.policyRateBps ?? world.centralBank.policyRateBps)
+      + bank.baseSpreadBps
+      + riskPremiumBps
+      + Math.max(0, bank.minimumCapitalRatioBps + 250 - projectedRatio) / 4
+      + Math.max(0, bank.minimumLiquidityRatioBps + 250 - liquidityRatio) / 4
+      + (world.countryMacroStates.find((state) => state.countryId === bank.countryId)?.lendingStandardsBps ?? 4_000) / 20),
     remainingMonths: termMonths,
     missedPayments: 0,
     status: "active",

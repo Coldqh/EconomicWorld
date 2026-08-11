@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { bankAccountBalance, bankAccountsForOwner, openBankAccount, sumAccounts, transferBankAccountBalance } from "../src/core/ledger.ts";
+import { accountIds, balanceOf, bankAccountBalance, bankAccountsForOwner, entityBook, openBankAccount, seedDeposit, sumAccounts, transferBankAccountBalance } from "../src/core/ledger.ts";
 import { createWorld } from "../src/economy/create-world.ts";
 import { checkInvariants } from "../src/economy/invariants.ts";
 import { deterministicFingerprint } from "../src/economy/metrics.ts";
@@ -16,12 +16,28 @@ import { formatMoney } from "../src/finance/currencies.ts";
 import { migrateWorldState } from "../src/persistence/migrations.ts";
 import { assetManagerAum, calculateFundNav, chargeFundFees, closeUnderwritingMandate, contributeToPensionFund, createUnderwritingMandate, rebalanceInstitutionalPortfolios, redeemFund, subscribeFund } from "../src/finance/institutional.ts";
 import { buyToCover, chargeSecuritiesBorrowFees, checkMaintenanceMargin, compensateBorrowedDividend, forceLiquidation, marginAccountState, openMarginAccount, openRepo, placeMarginBuy, placeShortSale, pledgeSecurityCollateral, processMarginRisk, repayRepo, securityHaircutBps } from "../src/finance/leverage.ts";
+import { createCreditDefaultSwap, createForward, createFuture, createFxSwap, createInterestRateSwap, createTotalReturnSwap, derivativeExposure, exerciseOption, expireOptions, forceTrsUnwind, refreshOptionQuotes, settleCdsCreditEvent, settleCdsPremium, settleForward, settleInterestRateSwap, settleTotalReturnSwap, writeOption } from "../src/finance/derivatives.ts";
+import { applyClearingDefaultWaterfall, createNettingSet, settleBilateralNet, settleFuturesVariationMargin } from "../src/finance/clearing.ts";
+import { impliedVolatilityBps, valueEuropeanOption } from "../src/finance/option-pricing.ts";
+import { collectPropertyTaxes, createSovereignAuction, openMarketPurchase, openMarketSale, payDepositInsurance, recalculateGovernmentBudgets, requestLenderOfLastResort, restructureSovereignBond, runMonetaryPolicy, runSovereignAuction, serviceSovereignDebt, updateSovereignValuations } from "../src/economy/macroeconomics.ts";
+import { settleFinancialPayment } from "../src/finance/financial-settlement.ts";
 import type { WorldState } from "../src/domain/model.ts";
+
+function localMarket(world: WorldState, countryId = "ru") {
+  const exchange = world.exchanges.find((item) => item.countryId === countryId)!;
+  const listing = world.listings.find((item) => item.exchangeId === exchange.id)!;
+  const banks = world.banks.filter((item) => item.countryId === countryId);
+  return { exchange, listing, banks };
+}
+
+function depositMoney(world: WorldState): number {
+  return sumAccounts(world, (account) => account.category === "asset" && account.instrument === "deposit");
+}
 
 test("фазы 3 и 4 создают масштабный географический мир", () => {
   const world = createWorld();
-  assert.equal(world.schemaVersion, 5);
-  assert.equal(world.saveVersion, 5);
+  assert.equal(world.schemaVersion, 6);
+  assert.equal(world.saveVersion, 6);
   assert.equal(world.households.length, 100);
   assert.equal(world.people.length, 100);
   assert.equal(world.companies.length, 77);
@@ -194,7 +210,7 @@ test("старое сохранение мигрирует в мультивал
   delete legacy.fxTrades;
   delete legacy.fxDealers;
   const migrated = migrateWorldState(legacy);
-  assert.equal(migrated.schemaVersion, 5);
+  assert.equal(migrated.schemaVersion, 6);
   assert.ok(bankAccountsForOwner(migrated, migrated.player.householdId, "RUB").length > 0);
   assert.ok(migrated.bankAccounts.every((account) => migrated.ledger.accounts[account.ledgerDepositAccountId]));
   assert.equal(migrated.player.personId, "person-player");
@@ -416,8 +432,371 @@ test("заём бумаг, short, cover, fees, dividend compensation и repo н�
   assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
 });
 
+test("форвард создаётся и рассчитывается по фактической цене", () => {
+  const world = createWorld();
+  const { listing, banks } = localMarket(world);
+  const buyerCash = bankAccountBalance(world, bankAccountsForOwner(world, banks[0].id, listing.currencyId)[0].id);
+  const contract = createForward(world, banks[0].id, banks[1].id, { kind: "equity", securityId: listing.securityId }, 10, listing.lastPriceCents, 1)!;
+  listing.lastPriceCents += 100;
+  world.clock.elapsedMonths = 1;
+  const result = settleForward(world, contract.id);
+  assert.equal(result.ok, true);
+  assert.equal(result.payoffMinor, 1_000);
+  assert.equal(bankAccountBalance(world, bankAccountsForOwner(world, banks[0].id, listing.currencyId)[0].id), buyerCash + 1_000);
+  assert.equal(contract.status, "matured");
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("фьючерс новируется CCP, требует маржу и даёт нулевую сумму variation margin", () => {
+  const world = createWorld();
+  const { exchange, listing, banks } = localMarket(world);
+  const contract = createFuture(world, banks[0].id, banks[1].id, { kind: "equity", securityId: listing.securityId }, exchange.id, 3, 10, 6)!;
+  assert.ok(contract.ccpId);
+  assert.equal(world.clearedPositions.filter((position) => position.contractId === contract.id).reduce((sum, position) => sum + position.netQuantity, 0), 0);
+  assert.equal(world.collateralPledges.filter((pledge) => pledge.referenceId === contract.id && pledge.status === "active").length, 2);
+  const longBefore = bankAccountBalance(world, bankAccountsForOwner(world, banks[0].id, listing.currencyId)[0].id);
+  const shortBefore = bankAccountBalance(world, bankAccountsForOwner(world, banks[1].id, listing.currencyId)[0].id);
+  const settled = settleFuturesVariationMargin(world, contract.id, contract.initialPriceMinor + 40);
+  assert.equal(settled.ok, true);
+  assert.equal(bankAccountBalance(world, bankAccountsForOwner(world, banks[0].id, listing.currencyId)[0].id) - longBefore, settled.amountMinor);
+  assert.equal(bankAccountBalance(world, bankAccountsForOwner(world, banks[1].id, listing.currencyId)[0].id) - shortBefore, -settled.amountMinor);
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("call и put исполняются, а премия остаётся реальным денежным потоком", () => {
+  const world = createWorld();
+  const { exchange, listing, banks } = localMarket(world);
+  for (const optionType of ["call", "put"] as const) {
+    world.clock.elapsedMonths = 0;
+    const series = world.optionMarketSeries.find((item) => item.exchangeId === exchange.id && item.underlyingSecurityId === listing.securityId && item.optionType === optionType)!;
+    const holderBefore = bankAccountBalance(world, bankAccountsForOwner(world, banks[0].id, listing.currencyId)[0].id);
+    const answer = writeOption(world, series.id, banks[0].id, banks[1].id, 1);
+    assert.equal(answer.ok, true);
+    const contract = world.derivativeContracts.find((item) => item.id === answer.contractId && item.type === "option")!;
+    assert.ok(bankAccountBalance(world, bankAccountsForOwner(world, banks[0].id, listing.currencyId)[0].id) < holderBefore);
+    listing.lastPriceCents = optionType === "call" ? series.strikeMinor + 200 : Math.max(1, series.strikeMinor - 200);
+    world.clock.elapsedMonths = series.expirationMonth;
+    const exercised = exerciseOption(world, contract.id, true);
+    assert.equal(exercised.ok, true, optionType);
+    assert.equal(contract.status, "exercised");
+    assert.equal(series.openInterest, 0);
+  }
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("опцион вне денег истекает и освобождает обеспечение", () => {
+  const world = createWorld();
+  const { exchange, listing, banks } = localMarket(world);
+  const series = world.optionMarketSeries.filter((item) => item.exchangeId === exchange.id && item.optionType === "call").sort((a, b) => b.strikeMinor - a.strikeMinor)[0];
+  const answer = writeOption(world, series.id, banks[0].id, banks[1].id, 1);
+  const contract = world.derivativeContracts.find((item) => item.id === answer.contractId && item.type === "option")!;
+  listing.lastPriceCents = Math.max(1, series.strikeMinor - 100);
+  world.clock.elapsedMonths = series.expirationMonth;
+  assert.equal(expireOptions(world), 1);
+  assert.equal(contract.status, "expired");
+  const set = world.nettingSets.find((item) => item.id === contract.nettingSetId)!;
+  assert.ok(world.collateralPledges.filter((pledge) => set.collateralPledgeIds.includes(pledge.id)).every((pledge) => pledge.status === "released"));
+});
+
+test("покрытая продажа call использует акции, put — денежное обеспечение", () => {
+  const world = createWorld();
+  const { exchange, listing, banks } = localMarket(world);
+  const call = world.optionMarketSeries.find((item) => item.exchangeId === exchange.id && item.underlyingSecurityId === listing.securityId && item.optionType === "call")!;
+  const writerHolding = world.equityHoldings.find((holding) => holding.securityId === listing.securityId && holding.shares >= call.contractMultiplier)!;
+  assert.equal(writeOption(world, call.id, banks[0].id, writerHolding.ownerId, 1).ok, true);
+  assert.ok(world.collateralPledges.some((pledge) => pledge.ownerId === writerHolding.ownerId && pledge.assetType === "security" && pledge.purpose === "derivative-margin"));
+  const put = world.optionMarketSeries.find((item) => item.exchangeId === exchange.id && item.underlyingSecurityId === listing.securityId && item.optionType === "put")!;
+  assert.equal(writeOption(world, put.id, banks[0].id, banks[1].id, 1).ok, true);
+  assert.ok(world.collateralPledges.some((pledge) => pledge.ownerId === banks[1].id && pledge.assetType === "cash" && pledge.markedValueMinor === put.strikeMinor * put.contractMultiplier));
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("Delta, Gamma, Theta, Vega и implied volatility рассчитываются согласованно", () => {
+  const input = { optionType: "call" as const, underlyingPriceMinor: 10_000, strikeMinor: 10_000, timeToExpiryYears: 1, riskFreeRateBps: 500, volatilityBps: 2_500 };
+  const value = valueEuropeanOption(input);
+  assert.ok(value.theoreticalValueMinor > value.intrinsicValueMinor);
+  assert.ok(value.delta > 0 && value.delta < 1);
+  assert.ok(value.gamma > 0);
+  assert.ok(value.thetaPerMonthMinor < 0);
+  assert.ok(value.vegaPerVolPointMinor > 0);
+  const solved = impliedVolatilityBps({ optionType: input.optionType, underlyingPriceMinor: input.underlyingPriceMinor, strikeMinor: input.strikeMinor, timeToExpiryYears: input.timeToExpiryYears, riskFreeRateBps: input.riskFreeRateBps }, value.theoreticalValueMinor)!;
+  assert.ok(Math.abs(solved - input.volatilityBps) < 100);
+});
+
+test("IRS платит только чистую разницу фиксированной и плавающей ног", () => {
+  const world = createWorld();
+  const { banks } = localMarket(world);
+  const contract = createInterestRateSwap(world, banks[0].id, banks[1].id, "money-area-rub", 10_000_000_00, 600, 12, 3)!;
+  world.clock.elapsedMonths = 3;
+  const result = settleInterestRateSwap(world, contract.id);
+  assert.equal(result.ok, true);
+  assert.ok(result.netMinor !== 0);
+  assert.ok(result.transactionId);
+  assert.equal(world.ledger.transactions.filter((transaction) => transaction.kind === "SWAP_SETTLEMENT").length, 2);
+});
+
+test("bilateral netting схлопывает встречные требования в один платёж", () => {
+  const world = createWorld();
+  const { banks } = localMarket(world);
+  const set = createNettingSet(world, banks[0].id, banks[1].id, "RUB");
+  const result = settleBilateralNet(world, set.id, 900_000, 650_000, "Тест взаимозачёта");
+  assert.equal(result.netMinor, 250_000);
+  assert.ok(result.transactionId);
+});
+
+test("TRS передаёт total return, вызывает margin call и принудительное закрытие", () => {
+  const successWorld = createWorld();
+  const successMarket = localMarket(successWorld);
+  const success = createTotalReturnSwap(successWorld, successMarket.banks[0].id, successMarket.banks[1].id, successMarket.listing.securityId, 10, 6)!;
+  successMarket.listing.lastPriceCents += 100;
+  assert.equal(settleTotalReturnSwap(successWorld, success.id).ok, true);
+
+  const world = createWorld();
+  const { listing, banks } = localMarket(world);
+  const playerAccount = bankAccountsForOwner(world, world.player.householdId, listing.currencyId)[0];
+  const quantity = Math.max(1, Math.floor(bankAccountBalance(world, playerAccount.id) * 4 / listing.lastPriceCents));
+  const contract = createTotalReturnSwap(world, world.player.householdId, banks[0].id, listing.securityId, quantity, 6)!;
+  listing.lastPriceCents = Math.max(1, Math.round(listing.lastPriceCents * 0.65));
+  assert.equal(settleTotalReturnSwap(world, contract.id).ok, false);
+  assert.equal(contract.status, "margin-call");
+  assert.ok(world.derivativeMarginCalls.some((call) => call.contractId === contract.id && call.status === "open"));
+  forceTrsUnwind(world, contract.id);
+  assert.equal(contract.status, "defaulted");
+});
+
+test("CDS начисляет премию и платит loss given default с recovery", () => {
+  const world = createWorld();
+  const { banks } = localMarket(world);
+  const bond = world.sovereignBonds.find((item) => item.countryId === "ru")!;
+  const contract = createCreditDefaultSwap(world, banks[0].id, banks[1].id, bond.id, 1_000_000_00, 12, 4_000)!;
+  world.clock.elapsedMonths = 3;
+  assert.ok(settleCdsPremium(world, contract.id));
+  bond.status = "defaulted";
+  const settlement = settleCdsCreditEvent(world, contract.id);
+  assert.equal(settlement.ok, true);
+  assert.equal(settlement.paymentMinor, 600_000_00);
+});
+
+test("физический FX forward и FX swap проводят обе валютные ноги", () => {
+  const world = createWorld();
+  const dealer = world.fxDealers[0];
+  const playerId = world.player.householdId;
+  const usdBank = world.banks.find((bank) => bank.baseCurrency === "USD")!;
+  seedDeposit(world, playerId, usdBank.id, 1_000_000_00);
+  const pair = world.fxPairs.find((item) => item.id === "RUB-USD")!;
+  const forward = createForward(world, playerId, dealer.id, { kind: "currency-pair", pairId: pair.id }, 100_000, pair.lastRatePpm, 1, "physical")!;
+  world.clock.elapsedMonths = 1;
+  assert.equal(settleForward(world, forward.id).ok, true);
+  const swap = createFxSwap(world, playerId, dealer.id, pair.id, 50_000, 1);
+  assert.ok(swap);
+  assert.ok(world.ledger.transactions.filter((transaction) => transaction.kind === "FX_FORWARD_SETTLEMENT" || transaction.kind === "DERIVATIVE_SETTLEMENT").length >= 8);
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("mark-to-market не создаёт деньги, а exposure отличает notional от риска", () => {
+  const world = createWorld();
+  const { exchange, listing, banks } = localMarket(world);
+  createFuture(world, banks[0].id, banks[1].id, { kind: "equity", securityId: listing.securityId }, exchange.id, 1, 10, 6);
+  const before = depositMoney(world);
+  refreshOptionQuotes(world);
+  const exposure = derivativeExposure(world, banks[0].id);
+  assert.equal(depositMoney(world), before);
+  assert.ok(exposure.grossNotionalMinor > exposure.grossMarketValueMinor);
+});
+
+test("CCP waterfall использует реальные деньги участника и гарантийный фонд", () => {
+  const world = createWorld();
+  const { exchange, listing, banks } = localMarket(world);
+  const contract = createFuture(world, banks[0].id, banks[1].id, { kind: "equity", securityId: listing.securityId }, exchange.id, 1, 10, 6)!;
+  const creditorBefore = bankAccountBalance(world, bankAccountsForOwner(world, banks[1].id, "RUB")[0].id);
+  const result = applyClearingDefaultWaterfall(world, contract.ccpId!, banks[0].id, contract.initialMarginMinor + 1_000_000, banks[1].id);
+  assert.equal(result.uncoveredMinor, 0);
+  assert.ok(bankAccountBalance(world, bankAccountsForOwner(world, banks[1].id, "RUB")[0].id) > creditorBefore);
+  assert.equal(world.clearingMemberAccounts.find((member) => member.memberId === banks[0].id)?.status, "defaulted");
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("одинаковый replay деривативов детерминирован", () => {
+  const left = createWorld();
+  const right = createWorld();
+  for (const world of [left, right]) {
+    const { exchange, listing, banks } = localMarket(world);
+    const future = createFuture(world, banks[0].id, banks[1].id, { kind: "equity", securityId: listing.securityId }, exchange.id, 2, 10, 6)!;
+    settleFuturesVariationMargin(world, future.id, future.initialPriceMinor + 25);
+    createInterestRateSwap(world, banks[0].id, banks[1].id, "money-area-rub", 100_000_00, 500, 12, 3);
+  }
+  assert.deepEqual(left.derivativeContracts, right.derivativeContracts);
+  assert.deepEqual(left.clearedPositions, right.clearedPositions);
+  assert.equal(deterministicFingerprint(left), deterministicFingerprint(right));
+});
+
+test("налоги, расходы, дефицит, профицит и автоматические стабилизаторы идут через ledger", () => {
+  const world = createWorld();
+  const propertyBefore = world.ledger.transactions.filter((transaction) => transaction.kind === "PROPERTY_TAX").length;
+  assert.ok(collectPropertyTaxes(world) > 0);
+  assert.ok(world.ledger.transactions.filter((transaction) => transaction.kind === "PROPERTY_TAX").length > propertyBefore);
+  runMonths(world, 1);
+  assert.ok(world.governmentBudgets.some((budget) => budget.budgetBalanceMinor < 0));
+  assert.ok(world.governmentBudgets.some((budget) => budget.budgetBalanceMinor > 0));
+  assert.ok(world.ledger.transactions.some((transaction) => transaction.kind === "SOCIAL_TRANSFER"));
+  assert.ok(world.ledger.transactions.some((transaction) => transaction.kind === "GOODS_CLEARING" && transaction.entries.some((entry) => world.governments.some((government) => government.id === world.ledger.accounts[entry.accountId]?.ownerId))));
+});
+
+test("аукцион выпускает госдолг и сверяет держателей с номиналом", () => {
+  const world = createWorld();
+  const auction = createSovereignAuction(world, "ru", "5y", 2_000_000_00)!;
+  const result = runSovereignAuction(world, auction.id);
+  assert.equal(result.ok, true);
+  const bond = world.sovereignBonds.find((item) => item.id === result.bondId)!;
+  assert.equal(world.sovereignBondHoldings.filter((holding) => holding.bondId === bond.id).reduce((sum, holding) => sum + holding.faceValueMinor, 0), bond.outstandingFaceValueMinor);
+  assert.ok(world.ledger.transactions.some((transaction) => transaction.kind === "SOVEREIGN_ISSUE"));
+});
+
+test("непокрытый аукцион не создаёт долг и повышает суверенный риск", () => {
+  const world = createWorld();
+  const state = world.countryMacroStates.find((item) => item.countryId === "ru")!;
+  const riskBefore = state.sovereignRiskBps;
+  const auction = createSovereignAuction(world, "ru", "10y", 100_000_000_00)!;
+  const result = runSovereignAuction(world, auction.id, 0);
+  assert.equal(result.ok, false);
+  assert.equal(auction.status, "failed");
+  assert.ok(state.sovereignRiskBps > riskBefore);
+});
+
+test("госдолг платит купон, погашается и рефинансируется при нехватке cash", () => {
+  const world = createWorld();
+  const bond = world.sovereignBonds.find((item) => item.countryId === "ru" && item.maturityBucket === "short")!;
+  const governmentAccount = bankAccountsForOwner(world, bond.governmentId, bond.currencyId)[0];
+  const recipientBank = world.banks.find((bank) => bank.countryId === "ru")!;
+  const leave = Math.max(1, Math.floor(bond.outstandingFaceValueMinor / 4));
+  const cash = bankAccountBalance(world, governmentAccount.id);
+  if (cash > leave) settleFinancialPayment(world, bond.governmentId, recipientBank.id, bond.currencyId, cash - leave, "TRANSFER", "Подготовка рефинансирования");
+  const auctionCount = world.sovereignAuctions.length;
+  bond.maturityMonth = world.clock.elapsedMonths;
+  serviceSovereignDebt(world);
+  assert.ok(world.ledger.transactions.some((transaction) => transaction.kind === "SOVEREIGN_COUPON"));
+  assert.ok(world.sovereignAuctions.length > auctionCount);
+  assert.ok(bond.status === "matured" || bond.status === "defaulted");
+});
+
+test("кривая доходности и debt/GDP строятся из локального госдолга", () => {
+  const world = createWorld();
+  runMonths(world, 2);
+  for (const country of world.countries) {
+    const curve = [...world.yieldCurveHistory].reverse().find((snapshot) => snapshot.countryId === country.id)!;
+    const point = [...world.macroHistory].reverse().find((item) => item.countryId === country.id)!;
+    assert.equal(curve.points.length, 5);
+    assert.ok(point.debtToGdpBps > 0);
+    assert.equal(point.currencyId, country.currencyReference);
+  }
+});
+
+test("страны стартуют с разными профилями государственного долга", () => {
+  const world = createWorld();
+  runMonths(world, 1);
+  const latest = world.macroHistory.slice(-world.countries.length);
+  const debtRatios = latest.map((point) => point.debtToGdpBps);
+  assert.ok(new Set(latest.map((point) => point.publicDebtMinor)).size >= 6);
+  assert.ok(Math.min(...debtRatios) < 6_000);
+  assert.ok(Math.max(...debtRatios) > 15_000);
+});
+
+test("правило ЦБ реагирует на инфляцию и сохраняет реальные входы решения", () => {
+  const world = createWorld();
+  runMonths(world, 1);
+  for (const point of world.macroHistory) { point.inflationBps = 1_500; point.outputGapBps = 500; point.defaultRateBps = 0; point.sovereignRiskBps = 0; }
+  world.clock.elapsedMonths = 3;
+  const before = world.centralBanks.find((bank) => bank.id === "central-bank-ru")!.policyRateBps;
+  runMonetaryPolicy(world);
+  const decision = [...world.monetaryPolicyDecisions].reverse().find((item) => item.centralBankId === "central-bank-ru")!;
+  assert.ok(decision.newRateBps > before);
+  assert.equal(decision.observedInflationBps, 1_500);
+  assert.equal(decision.outputGapBps, 500);
+});
+
+test("OMO, QE и QT меняют бумаги, резервы и доходность без прямой записи в GDP", () => {
+  const world = createWorld();
+  const { banks } = localMarket(world);
+  const bank = banks[0];
+  const centralBank = world.centralBanks.find((item) => item.id === bank.centralBankId)!;
+  const holding = world.sovereignBondHoldings.find((item) => item.holderId === bank.id && world.sovereignBonds.find((bond) => bond.id === item.bondId)?.countryId === "ru")!;
+  const bond = world.sovereignBonds.find((item) => item.id === holding.bondId)!;
+  const face = Math.min(500_000_00, Math.floor(holding.faceValueMinor / 4));
+  const reservesBefore = balanceOf(world, accountIds.bankReserve(bank.id));
+  const yieldBefore = bond.yieldBps;
+  const gdpBefore = world.metricsHistory.length;
+  assert.equal(openMarketPurchase(world, centralBank.id, bank.id, bond.id, face, "OPEN_MARKET_PURCHASE"), true);
+  assert.ok(balanceOf(world, accountIds.bankReserve(bank.id)) > reservesBefore);
+  assert.ok(bond.yieldBps < yieldBefore);
+  assert.equal(openMarketSale(world, centralBank.id, bank.id, bond.id, Math.floor(face / 2), "OPEN_MARKET_SALE"), true);
+  assert.equal(openMarketPurchase(world, centralBank.id, bank.id, bond.id, Math.floor(face / 4), "QE"), true);
+  assert.equal(openMarketSale(world, centralBank.id, bank.id, bond.id, Math.floor(face / 4), "QT"), true);
+  assert.equal(world.metricsHistory.length, gdpBefore);
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("кредит последней инстанции требует суверенный залог и создаёт резервы", () => {
+  const world = createWorld();
+  const bank = localMarket(world).banks[0];
+  const holding = world.sovereignBondHoldings.find((item) => item.holderId === bank.id)!;
+  const reservesBefore = balanceOf(world, accountIds.bankReserve(bank.id));
+  assert.equal(requestLenderOfLastResort(world, bank.id, 100_000_00, holding.bondId), true);
+  assert.ok(balanceOf(world, accountIds.bankReserve(bank.id)) > reservesBefore);
+  const funding = world.bankFunding.find((item) => item.borrowerBankId === bank.id && item.kind === "central-bank")!;
+  assert.ok(funding.collateralPledgeId);
+});
+
+test("страхование вкладов закрывает требование к упавшему банку и платит на новый счёт", () => {
+  const world = createWorld();
+  const failedBank = localMarket(world).banks[0];
+  const account = world.bankAccounts.find((item) => item.bankId === failedBank.id && item.ownerId.startsWith("household-") && bankAccountBalance(world, item.id) > 0)!;
+  const owner = account.ownerId;
+  const paid = payDepositInsurance(world, failedBank.id);
+  assert.ok(paid > 0);
+  assert.equal(account.status, "closed");
+  assert.equal(balanceOf(world, account.ledgerDepositAccountId), 0);
+  assert.ok(world.bankAccounts.some((item) => item.ownerId === owner && item.bankId !== failedBank.id && item.status === "active"));
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("рост суверенного риска переоценивает актив банка и влияет на капитал", () => {
+  const world = createWorld();
+  const bank = localMarket(world).banks[0];
+  const holding = world.sovereignBondHoldings.find((item) => item.holderId === bank.id && world.sovereignBonds.find((bond) => bond.id === item.bondId)?.maturityBucket === "10y")!;
+  const state = world.countryMacroStates.find((item) => item.countryId === "ru")!;
+  const bookBefore = holding.bookValueMinor;
+  const capitalBefore = entityBook(world, bank.id).capital;
+  state.sovereignRiskBps += 1_000;
+  updateSovereignValuations(world);
+  assert.ok(holding.bookValueMinor < bookBefore);
+  assert.ok(entityBook(world, bank.id).capital < capitalBefore);
+});
+
+test("суверенный дефолт и реструктуризация создают реальный haircut держателя", () => {
+  const world = createWorld();
+  const bond = world.sovereignBonds.find((item) => item.countryId === "ru")!;
+  const governmentAccount = bankAccountsForOwner(world, bond.governmentId, bond.currencyId)[0];
+  const cash = bankAccountBalance(world, governmentAccount.id);
+  settleFinancialPayment(world, bond.governmentId, localMarket(world).banks[0].id, bond.currencyId, cash, "TRANSFER", "Исчерпание казначейского счёта");
+  serviceSovereignDebt(world);
+  const defaulted = world.sovereignBonds.find((item) => item.countryId === "ru" && item.status === "defaulted")!;
+  assert.ok(defaulted);
+  const holder = world.sovereignBondHoldings.find((item) => item.bondId === defaulted.id && item.faceValueMinor > 0)!;
+  const holderCapitalBefore = entityBook(world, holder.holderId).capital;
+  const faceBefore = holder.faceValueMinor;
+  assert.equal(restructureSovereignBond(world, defaulted.id, 3_000, 24, 100), true);
+  assert.equal(defaulted.status, "restructured");
+  assert.ok(holder.faceValueMinor < faceBefore);
+  assert.ok(entityBook(world, holder.holderId).capital < holderCapitalBefore);
+  recalculateGovernmentBudgets(world);
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
 test("автономный мир проходит 20 лет с архивированием истории", { timeout: 90_000 }, () => {
   const world = createWorld();
+  const { exchange, listing, banks } = localMarket(world);
+  createFuture(world, banks[0].id, banks[1].id, { kind: "equity", securityId: listing.securityId }, exchange.id, 2, 10, 120);
+  createInterestRateSwap(world, banks[0].id, banks[1].id, "money-area-rub", 10_000_000_00, 700, 120, 3);
   const started = Date.now();
   runMonths(world, 240);
   const elapsedMs = Date.now() - started;

@@ -57,7 +57,7 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const negativeDeposits = world.bankAccounts.filter((account) => balanceOf(world, account.ledgerDepositAccountId) < 0).map((account) => account.id);
   results.push(result("Деньги", "non-negative-money", "Нет неразрешённого овердрафта", negativeDeposits.length === 0, negativeDeposits.length ? negativeDeposits.join(", ") : "Все депозитные счета неотрицательны"));
 
-  const allowedMoneyChanges = new Set(["GENESIS", "LOAN_ISSUED", "LOAN_PRINCIPAL", "LOAN_INTEREST", "MARGIN_FINANCE", "MARGIN_REPAYMENT"]);
+  const allowedMoneyChanges = new Set(["GENESIS", "LOAN_ISSUED", "LOAN_PRINCIPAL", "LOAN_INTEREST", "MARGIN_FINANCE", "MARGIN_REPAYMENT", "OPEN_MARKET_PURCHASE", "OPEN_MARKET_SALE", "QE", "QT", "DEPOSIT_INSURANCE"]);
   const unauthorized = world.ledger.transactions.find((transaction) => {
     const change = transaction.entries.reduce((sum, entry) => {
       const account: LedgerAccount = world.ledger.accounts[entry.accountId];
@@ -147,9 +147,14 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const brokenFundNav = world.funds.find((fund) => {
     const cash = balanceOf(world, world.bankAccounts.find((account) => account.id === fund.bankAccountId)?.ledgerDepositAccountId ?? "");
     const securities = world.equityHoldings.filter((holding) => holding.ownerId === fund.id).reduce((sum, holding) => sum + holding.shares * (world.listings.find((listing) => listing.securityId === holding.securityId)?.lastPriceCents ?? Math.round(holding.costBasisCents / Math.max(1, holding.shares))), 0);
+    const corporateBonds = world.bondHoldings.filter((holding) => holding.holderId === fund.id).reduce((sum, holding) => sum + holding.costBasisCents, 0);
+    const sovereignBonds = world.sovereignBondHoldings.filter((holding) => holding.holderId === fund.id).reduce((sum, holding) => {
+      const bond = world.sovereignBonds.find((item) => item.id === holding.bondId);
+      return !bond || bond.outstandingFaceValueMinor <= 0 ? sum : sum + Math.round(bond.marketPriceMinor * holding.faceValueMinor / bond.outstandingFaceValueMinor);
+    }, 0);
     const liabilities = world.marginAccounts.filter((account) => account.ownerId === fund.id && account.status !== "closed").reduce((sum, account) => sum + account.borrowedMinor, 0)
       + world.repoAgreements.filter((repo) => repo.cashBorrowerId === fund.id && repo.status === "active").reduce((sum, repo) => sum + repo.cashAmountMinor, 0);
-    return cash + securities - liabilities !== fund.navMinor;
+    return cash + securities + corporateBonds + sovereignBonds - liabilities !== fund.navMinor;
   });
   results.push(result("Фонды", "fund-units", "Паи фондов сходятся", !brokenFundUnits, brokenFundUnits?.name ?? `${world.funds.length} фондов`));
   results.push(result("Фонды", "fund-nav", "Активы минус обязательства равны NAV", !brokenFundNav, brokenFundNav?.name ?? "NAV сверён с реальными позициями"));
@@ -158,5 +163,43 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const brokenMarginExposure = world.marginAccounts.find((account) => !world.primeBrokerExposures.some((exposure) => exposure.marginAccountId === account.id && exposure.primeBrokerId === account.primeBrokerId) || account.borrowedMinor < 0);
   results.push(result("Обеспечение", "collateral-availability", "Залог нельзя использовать дважды", !doublePledged, doublePledged?.id ?? `${world.collateralPledges.filter((item) => item.status === "active").length} активных залогов`));
   results.push(result("Обеспечение", "prime-broker-exposure", "Маржинальные счета связаны с прайм-брокером", !brokenMarginExposure, brokenMarginExposure?.id ?? `${world.marginAccounts.length} маржинальных счетов`));
+
+  const validUnderlying = (contract: WorldState["derivativeContracts"][number]): boolean => {
+    const underlying = contract.underlying;
+    if (underlying.kind === "equity") return world.equitySecurities.some((security) => security.id === underlying.securityId);
+    if (underlying.kind === "bond") return world.corporateBonds.some((bond) => bond.id === underlying.bondId) || world.sovereignBonds.some((bond) => bond.id === underlying.bondId);
+    if (underlying.kind === "currency-pair") return world.fxPairs.some((pair) => pair.id === underlying.pairId);
+    if (underlying.kind === "interest-rate") return world.monetaryAreas.some((area) => area.id === underlying.monetaryAreaId);
+    if (underlying.kind === "index") return world.exchanges.some((exchange) => exchange.id === underlying.indexId) || world.countries.some((country) => country.id === underlying.indexId);
+    return world.corporateBonds.some((bond) => bond.id === underlying.obligationId) || world.sovereignBonds.some((bond) => bond.id === underlying.obligationId) || world.loans.some((loan) => loan.id === underlying.obligationId) || world.companies.some((company) => company.id === underlying.obligationId);
+  };
+  const brokenDerivative = world.derivativeContracts.find((contract) => contract.notionalMinor <= 0 || contract.maturityMonth < contract.startMonth || contract.counterpartyIds[0] === contract.counterpartyIds[1] || !validUnderlying(contract));
+  results.push(result("Деривативы", "derivative-contracts", "Договоры деривативов имеют базовый актив и номинал", !brokenDerivative, brokenDerivative?.id ?? `${world.derivativeContracts.length} договоров`));
+
+  const brokenOpenInterest = world.optionMarketSeries.find((series) => series.openInterest !== world.derivativeContracts.reduce((sum, contract) => contract.type === "option" && contract.seriesId === series.id && (contract.status === "active" || contract.status === "margin-call") ? sum + contract.quantity : sum, 0));
+  results.push(result("Деривативы", "option-open-interest", "Открытый интерес опционов сверен", !brokenOpenInterest, brokenOpenInterest?.id ?? `${world.optionMarketSeries.length} серий`));
+
+  const doublePledgedSovereign = world.collateralPledges.find((pledge) => pledge.status === "active" && pledge.assetType === "sovereign-bond" && world.collateralPledges.filter((item) => item.status === "active" && item.ownerId === pledge.ownerId && item.assetType === "sovereign-bond" && item.assetId === pledge.assetId).reduce((sum, item) => sum + item.quantity, 0) > (world.sovereignBondHoldings.find((holding) => holding.holderId === pledge.ownerId && holding.bondId === pledge.assetId)?.faceValueMinor ?? 0));
+  results.push(result("Обеспечение", "sovereign-collateral-availability", "Государственный долг нельзя заложить дважды", !doublePledgedSovereign, doublePledgedSovereign?.id ?? "Залоги госдолга обеспечены"));
+
+  const brokenClearedFuture = world.derivativeContracts.find((contract) => contract.type === "future" && contract.ccpId && (contract.status === "active" || contract.status === "margin-call") && (() => {
+    const positions = world.clearedPositions.filter((position) => position.contractId === contract.id && position.status === "open");
+    return positions.length !== 2 || positions.reduce((sum, position) => sum + position.netQuantity, 0) !== 0;
+  })());
+  const brokenClearingMember = world.clearingMemberAccounts.find((account) => !world.clearingHouses.some((house) => house.id === account.clearingHouseId) || account.initialMarginMinor < 0 || account.defaultFundContributionMinor < 0);
+  results.push(result("Клиринг", "clearing-positions", "Клиринг сохраняет нулевую сумму позиций", !brokenClearedFuture && !brokenClearingMember, brokenClearedFuture?.id ?? brokenClearingMember?.id ?? `${world.clearingHouses.length} клиринговых домов`));
+
+  const brokenSovereignRegistry = world.sovereignBonds.find((bond) => world.sovereignBondHoldings.filter((holding) => holding.bondId === bond.id).reduce((sum, holding) => sum + holding.faceValueMinor, 0) !== bond.outstandingFaceValueMinor);
+  const brokenGovernmentBudget = world.governmentBudgets.find((budget) => budget.publicDebtMinor !== world.sovereignBonds.filter((bond) => bond.governmentId === budget.governmentId && (bond.status === "active" || bond.status === "restructured")).reduce((sum, bond) => sum + bond.outstandingFaceValueMinor, 0));
+  results.push(result("Государственный долг", "sovereign-registry", "Государственный долг сверен с держателями", !brokenSovereignRegistry && !brokenGovernmentBudget, brokenSovereignRegistry?.id ?? brokenGovernmentBudget?.governmentId ?? `${world.sovereignBonds.length} выпусков`));
+
+  const brokenYieldCurve = world.countries.find((country) => {
+    const curve = [...world.yieldCurveHistory].reverse().find((snapshot) => snapshot.countryId === country.id);
+    return !curve || curve.points.length !== 5 || curve.points.some((point, index) => point.maturityMonths <= 0 || (index > 0 && point.maturityMonths <= curve.points[index - 1].maturityMonths));
+  });
+  results.push(result("Государственный долг", "yield-curves", "Кривые доходности имеют пять сроков", !brokenYieldCurve, brokenYieldCurve?.name ?? `${world.countries.length} кривых`));
+
+  const brokenCentralBankSheet = world.centralBankBalanceSheets.find((sheet) => sheet.governmentSecuritiesMinor !== world.sovereignBondHoldings.filter((holding) => holding.holderId === sheet.centralBankId).reduce((sum, holding) => sum + holding.bookValueMinor, 0) || sheet.bankReservesMinor < 0 || !world.centralBanks.some((bank) => bank.id === sheet.centralBankId && bank.currencyId === sheet.currencyId));
+  results.push(result("Денежная политика", "central-bank-balance", "Баланс центрального банка сверен", !brokenCentralBankSheet, brokenCentralBankSheet?.centralBankId ?? `${world.centralBankBalanceSheets.length} балансов`));
   return results;
 }

@@ -1,6 +1,9 @@
 import { accountIds, ensureAccount, ensureEntityAccounts, seedDeposit, seedNonCashAsset } from "../core/ledger.ts";
 import type { MetricPoint, WorldState } from "../domain/model.ts";
 import { createWorld } from "../economy/create-world.ts";
+import { seedMacroeconomics } from "../economy/macroeconomics.ts";
+import { seedClearingHouses } from "../finance/clearing.ts";
+import { seedDerivativeMarkets } from "../finance/derivatives.ts";
 
 type LegacyWorld = Omit<Partial<WorldState>, "schemaVersion" | "saveVersion"> & { schemaVersion?: number; saveVersion?: number };
 
@@ -42,16 +45,16 @@ function migrateMetric(metric: Partial<MetricPoint>, world: WorldState): MetricP
 
 export function migrateWorldState(raw: unknown): WorldState {
   const legacy = structuredClone(raw) as LegacyWorld;
-  if ((legacy.schemaVersion ?? 1) > 5 || (legacy.saveVersion ?? 1) > 5) {
+  if ((legacy.schemaVersion ?? 1) > 6 || (legacy.saveVersion ?? 1) > 6) {
     throw new Error("Сохранение создано более новой версией приложения");
   }
-  if (legacy.schemaVersion === 5 && legacy.saveVersion === 5) return legacy as WorldState;
+  if (legacy.schemaVersion === 6 && legacy.saveVersion === 6) return legacy as WorldState;
   const template = createWorld();
   const world = {
     ...template,
     ...legacy,
-    schemaVersion: 5 as const,
-    saveVersion: 5 as const,
+    schemaVersion: 6 as const,
+    saveVersion: 6 as const,
     goods: template.goods.map((good) => ({ ...good, ...(legacy.goods?.find((item) => item.id === good.id) ?? {}), essential: good.essential })),
     countries: template.countries.map((base) => ({ ...base, ...(legacy.countries?.find((item) => item.id === base.id) ?? {}) })),
     cities: template.cities.map((base) => ({ ...base, ...(legacy.cities?.find((item) => item.id === base.id) ?? {}) })),
@@ -78,6 +81,32 @@ export function migrateWorldState(raw: unknown): WorldState {
     occupations: legacy.occupations ?? template.occupations,
     player: { ...template.player, ...(legacy.player ?? {}) },
     nextFundingId: legacy.nextFundingId ?? 1,
+    derivativeContracts: [],
+    optionMarketSeries: [],
+    nettingSets: [],
+    clearingHouses: [],
+    clearingMemberAccounts: [],
+    clearedPositions: [],
+    derivativeMarginCalls: [],
+    derivativeExposureHistory: [],
+    sovereignBonds: [],
+    sovereignBondHoldings: [],
+    sovereignAuctions: [],
+    yieldCurveHistory: [],
+    governmentBudgets: [],
+    centralBankBalanceSheets: [],
+    monetaryPolicyDecisions: [],
+    depositInsuranceSchemes: [],
+    countryMacroStates: [],
+    macroHistory: [],
+    nextDerivativeId: 1,
+    nextDerivativeMarginCallId: 1,
+    nextNettingSetId: 1,
+    nextClearingPositionId: 1,
+    nextSovereignBondId: 1,
+    nextSovereignHoldingId: 1,
+    nextSovereignAuctionId: 1,
+    nextMonetaryDecisionId: 1,
   } as WorldState;
   world.centralBank = world.centralBanks.find((bank) => bank.id === world.centralBank.id) ?? world.centralBanks.find((bank) => bank.id === "central-bank-ru")!;
   const localBankId = (countryId: string, offset = 0): string => {
@@ -153,6 +182,8 @@ export function migrateWorldState(raw: unknown): WorldState {
       ownerCurrency.set(manager.ownerId, currencyForCountry(manager.countryId));
     }
     for (const fund of world.funds) ownerCurrency.set(fund.id, fund.currencyId);
+    for (const scheme of legacy.depositInsuranceSchemes ?? []) ownerCurrency.set(scheme.id, scheme.currencyId);
+    for (const ccp of legacy.clearingHouses ?? []) ownerCurrency.set(ccp.id, ccp.currencyId);
     for (const account of Object.values(world.ledger.accounts)) {
       if (!account.id.endsWith(":legacy-v4")) account.currency = ownerCurrency.get(account.ownerId) ?? account.currency;
     }
@@ -213,5 +244,8 @@ export function migrateWorldState(raw: unknown): WorldState {
     }
     if (!world.ledger.accounts[accountIds.productiveCapital(company.id)] && company.productiveCapital.bookValueCents > 0) seedNonCashAsset(world, company.id, accountIds.productiveCapital(company.id), "Производственный капитал", company.productiveCapital.bookValueCents);
   }
+  seedMacroeconomics(world);
+  seedClearingHouses(world);
+  seedDerivativeMarkets(world);
   return world;
 }
