@@ -19,6 +19,8 @@ export interface SaveManifest {
   elapsedMonths: number;
   transactionCount: number;
   eventCount: number;
+  approximateBytes: number;
+  writeDurationMs: number;
 }
 
 export interface PersistedUiState {
@@ -44,6 +46,8 @@ export interface PersistenceDiagnostics {
   saveCount: number;
   usageBytes: number | null;
   quotaBytes: number | null;
+  lastSaveDurationMs: number | null;
+  lastSaveBytes: number | null;
 }
 
 interface MetadataRow<T = unknown> {
@@ -135,6 +139,7 @@ export class SaveRepository {
   }
 
   async save(world: WorldState, label: string, id = "manual", metadataRows: MetadataRow[] = []): Promise<SaveManifest> {
+    const startedAt = performance.now();
     const database = await this.database();
     const transaction = database.transaction(
       ["manifests", "snapshots", "ledgerSegments", "eventSegments", "goodsSegments", "metadata"],
@@ -149,11 +154,13 @@ export class SaveRepository {
       elapsedMonths: world.clock.elapsedMonths,
       transactionCount: world.ledger.transactions.length,
       eventCount: world.events.length,
+      approximateBytes: world.diagnostics.saveBreakdown.totalBytes,
+      writeDurationMs: 0,
     };
     const { ledger, events, goodsMovements, ...rest } = world;
     const snapshot: WorldState = {
-      ...structuredClone(rest),
-      ledger: { ...structuredClone(ledger), transactions: [] },
+      ...rest,
+      ledger: { ...ledger, transactions: [] },
       events: [],
       goodsMovements: [],
     };
@@ -202,7 +209,20 @@ export class SaveRepository {
       stores.goods.put(segment);
     });
     await transactionDone(transaction);
+    manifest.writeDurationMs = Math.round((performance.now() - startedAt) * 10) / 10;
+    const finalize = database.transaction(["manifests", "metadata"], "readwrite");
+    finalize.objectStore("manifests").put(manifest);
+    finalize.objectStore("metadata").put({ key: "last-save-duration-ms", value: manifest.writeDurationMs });
+    finalize.objectStore("metadata").put({ key: "last-save-bytes", value: manifest.approximateBytes });
+    await transactionDone(finalize);
     return manifest;
+  }
+
+  async saveUiState(uiState: Omit<PersistedUiState, "savedAtIso">): Promise<void> {
+    const database = await this.database();
+    const transaction = database.transaction("metadata", "readwrite");
+    transaction.objectStore("metadata").put({ key: "active-ui-state", value: { ...uiState, savedAtIso: new Date().toISOString() } satisfies PersistedUiState });
+    await transactionDone(transaction);
   }
 
   async saveActive(world: WorldState, uiState: Omit<PersistedUiState, "savedAtIso">): Promise<SaveManifest> {
@@ -247,7 +267,7 @@ export class SaveRepository {
     snapshot.events = events;
     snapshot.goodsMovements = goodsMovements;
     if (manifest && (transactions.length !== manifest.transactionCount || events.length !== manifest.eventCount)) throw new Error("Сохранение неполно: нарушена целостность сегментов");
-    if (snapshot.schemaVersion < 6 || snapshot.saveVersion < 6) {
+    if (snapshot.schemaVersion < 7 || snapshot.saveVersion < 7) {
       const backupDatabase = await this.database();
       const backupTransaction = backupDatabase.transaction("migrationBackups", "readwrite");
       backupTransaction.objectStore("migrationBackups").put({ key: `${id}:${new Date().toISOString()}`, saveId: id, createdAtIso: new Date().toISOString(), snapshot: structuredClone(snapshot) });
@@ -273,9 +293,11 @@ export class SaveRepository {
   }
 
   async diagnostics(): Promise<PersistenceDiagnostics> {
-    const [activeWorldId, lastAutosaveIso, saves, estimate] = await Promise.all([
+    const [activeWorldId, lastAutosaveIso, lastSaveDurationMs, lastSaveBytes, saves, estimate] = await Promise.all([
       this.metadata<string>("active-world-id"),
       this.metadata<string>("last-autosave-iso"),
+      this.metadata<number>("last-save-duration-ms"),
+      this.metadata<number>("last-save-bytes"),
       this.list(),
       navigator.storage?.estimate?.() ?? Promise.resolve({ usage: undefined, quota: undefined }),
     ]);
@@ -286,6 +308,8 @@ export class SaveRepository {
       saveCount: saves.length,
       usageBytes: estimate.usage ?? null,
       quotaBytes: estimate.quota ?? null,
+      lastSaveDurationMs,
+      lastSaveBytes,
     };
   }
 }

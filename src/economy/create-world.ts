@@ -11,7 +11,9 @@ import type {
   Bank,
   Broker,
   CentralBank,
+  City,
   Company,
+  CountryEconomicProfile,
   CorporateBoard,
   EquityHolding,
   EquitySecurity,
@@ -21,6 +23,7 @@ import type {
   Household,
   Listing,
   MarketIndex,
+  MonetaryAreaEconomicProfile,
   Occupation,
   Person,
   SimulationScenario,
@@ -28,6 +31,7 @@ import type {
   WorldState,
 } from "../domain/model.ts";
 import { COUNTRY_ECONOMY_PACKS } from "../data/country-economies.ts";
+import { COUNTRY_ECONOMIC_PROFILES, MONETARY_AREA_ECONOMIC_PROFILES, getMonetaryAreaEconomicProfile } from "../data/country-economic-profiles.ts";
 import { CURRENCIES, MONETARY_AREAS, createFxPairs } from "../finance/currencies.ts";
 import { seedInstitutionalFinance } from "../finance/institutional.ts";
 import { seedLeverageFinance } from "../finance/leverage.ts";
@@ -108,15 +112,18 @@ function createHouseholds(people: Person[], banks: readonly Bank[]): Household[]
   });
 }
 
-function createCompanies(): Company[] {
+function createCompanies(profiles: readonly CountryEconomicProfile[], cities: readonly City[]): Company[] {
   return COUNTRY_ECONOMY_PACKS.flatMap((pack) => pack.companies.map((blueprint, localIndex) => ({ pack, blueprint, localIndex }))).map(({ pack, blueprint, localIndex }, index) => {
     const { name, goodId } = blueprint;
-    const productivityBps = 9_100 + (index % 9) * 210;
-    const wageCents = 32_000_00 + (index % 8) * 175_000;
+    const profile = profiles.find((item) => item.countryId === pack.countryId)!;
+    const city = cities.find((item) => item.id === blueprint.cityId)!;
+    const scaleBps = blueprint.sizeClass === "large" ? 11_500 : blueprint.sizeClass === "medium" ? 9_500 : 7_800;
+    const productivityBps = Math.round(profile.productivityIndexBps * (blueprint.representationTier === "A" ? 10_500 : blueprint.representationTier === "B" ? 9_800 : 9_200) / 10_000);
+    const wageCents = Math.round(city.baseMonthlyWageCents * (blueprint.representationTier === "A" ? 1.08 : 0.96));
     const good = GOODS.find((item) => item.id === goodId)!;
-    const priceCents = Math.round(good.basePriceCents * (0.93 + (index % 5) * 0.035));
-    const capacityMilliUnits = 190_000 + (index % 7) * 47_000;
-    const inventoryMilliUnits = Math.floor(capacityMilliUnits * (0.45 + (index % 3) * 0.08));
+    const priceCents = Math.round(good.basePriceCents * profile.productivityIndexBps / 10_000 * (blueprint.representationTier === "A" ? 1.03 : 0.98));
+    const capacityMilliUnits = Math.round(260_000 * scaleBps / 10_000);
+    const inventoryMilliUnits = Math.floor(capacityMilliUnits * (blueprint.sizeClass === "large" ? 0.5 : 0.43));
     const companyId = `company-${String(index + 1).padStart(3, "0")}`;
     return {
       id: companyId, name, goodId,
@@ -135,11 +142,11 @@ function createCompanies(): Company[] {
       distressMonths: 0, missedPayrollMonths: 0, foundedAtMonth: 0, closedAtMonth: null, closureReason: null,
       cityId: blueprint.cityId,
       productId: `product-${goodId}-${index + 1}`,
-      technologyBps: 8_200 + index * 170,
-      managementBps: 7_700 + (index % 4) * 350,
+      technologyBps: Math.round(profile.productivityIndexBps * (blueprint.representationTier === "A" ? 1.04 : 0.94)),
+      managementBps: blueprint.representationTier === "A" ? 9_200 : blueprint.representationTier === "B" ? 8_400 : 7_700,
       learningByDoingBps: 0,
-      qualityBps: 7_300 + (index % 5) * 420,
-      brandReputationBps: 5_800 + index * 270,
+      qualityBps: blueprint.representationTier === "A" ? 8_900 : blueprint.representationTier === "B" ? 8_000 : 7_300,
+      brandReputationBps: blueprint.listed ? 8_300 : blueprint.sizeClass === "large" ? 7_400 : 6_200,
       marketShareBps: 5_000,
       marginalCostCents: Math.round(priceCents * 0.72),
       capacityUtilizationBps: 0,
@@ -159,24 +166,31 @@ function createCompanies(): Company[] {
   });
 }
 
-function createInstitutions(policyRateBps: number): {
+function createInstitutions(scenario: SimulationScenario, profiles: readonly CountryEconomicProfile[], monetaryProfiles: readonly MonetaryAreaEconomicProfile[]): {
   banks: Bank[];
   governments: Government[];
   centralBanks: CentralBank[];
   exchanges: Exchange[];
   brokers: Broker[];
 } {
-  const centralBanks: CentralBank[] = COUNTRY_ECONOMY_PACKS.map((pack) => ({
+  const centralBanks: CentralBank[] = COUNTRY_ECONOMY_PACKS.map((pack) => {
+    const profile = profiles.find((item) => item.countryId === pack.countryId)!;
+    const monetary = monetaryProfiles.find((item) => item.monetaryAreaId === profile.monetaryAreaId) ?? getMonetaryAreaEconomicProfile(profile.monetaryAreaId);
+    const policyRateBps = monetary.policyRateBps + (scenario === "high-rates" ? 900 : 0);
+    return ({
     id: `central-bank-${pack.countryId}`,
     name: pack.centralBankName,
     countryId: pack.countryId,
     currencyId: pack.currencyId,
-    monetaryAreaId: `money-area-${pack.currencyId.toLowerCase()}`,
+    monetaryAreaId: profile.monetaryAreaId,
     setsPolicyRate: pack.currencyId !== "EUR",
-    policyRateBps: policyRateBps + (pack.countryId.charCodeAt(0) % 5) * 35,
-    inflationTargetBps: 400,
+    policyRateBps,
+    inflationTargetBps: monetary.inflationTargetBps,
     policyRateHistory: [{ elapsedMonth: 0, rateBps: policyRateBps }],
-  }));
+  });
+  });
+  const euroProfile = monetaryProfiles.find((item) => item.monetaryAreaId === "money-area-eur")!;
+  const euroRate = euroProfile.policyRateBps + (scenario === "high-rates" ? 900 : 0);
   centralBanks.push({
     id: "monetary-authority-eur",
     name: "Европейский центральный банк",
@@ -184,9 +198,9 @@ function createInstitutions(policyRateBps: number): {
     currencyId: "EUR",
     monetaryAreaId: "money-area-eur",
     setsPolicyRate: true,
-    policyRateBps,
-    inflationTargetBps: 200,
-    policyRateHistory: [{ elapsedMonth: 0, rateBps: policyRateBps }],
+    policyRateBps: euroRate,
+    inflationTargetBps: euroProfile.inflationTargetBps,
+    policyRateHistory: [{ elapsedMonth: 0, rateBps: euroRate }],
   });
   const banks: Bank[] = COUNTRY_ECONOMY_PACKS.flatMap((pack) => pack.banks.map((bank) => ({
     id: bank.id,
@@ -199,15 +213,18 @@ function createInstitutions(policyRateBps: number): {
     centralBankId: pack.currencyId === "EUR" ? "monetary-authority-eur" : `central-bank-${pack.countryId}`,
     representationTier: "A" as const,
   })));
-  const governments: Government[] = COUNTRY_ECONOMY_PACKS.map((pack, index) => ({
+  const governments: Government[] = COUNTRY_ECONOMY_PACKS.map((pack) => {
+    const profile = profiles.find((item) => item.countryId === pack.countryId)!;
+    return ({
     id: `government-${pack.countryId}`,
     countryId: pack.countryId,
     currencyId: pack.currencyId,
-    incomeTaxBps: 1_050 + (index % 5) * 95,
-    salesTaxBps: 700 + (index % 4) * 75,
-    corporateTaxBps: 1_550 + (index % 5) * 90,
-    monthlyUnemploymentBenefitCents: 10_500_00 + (index % 4) * 125_000,
-  }));
+    incomeTaxBps: profile.taxProfile.incomeTaxBps,
+    salesTaxBps: profile.taxProfile.consumptionTaxBps,
+    corporateTaxBps: profile.taxProfile.corporateTaxBps,
+    monthlyUnemploymentBenefitCents: Math.max(100_000, Math.round(profile.baselineNominalGdpMinor * 10_000 / Math.max(1, profile.population) * 0.28)),
+  });
+  });
   const exchanges: Exchange[] = COUNTRY_ECONOMY_PACKS.map((pack) => ({
     id: `exchange-${pack.countryId}`,
     name: pack.exchangeName,
@@ -324,19 +341,20 @@ function assignInitialEmployment(world: WorldState): void {
 }
 
 export function createWorld(scenario: SimulationScenario = "baseline"): WorldState {
-  const policyRateBps = scenario === "high-rates" ? 1_600 : 700;
-  const { banks, governments, centralBanks, exchanges, brokers } = createInstitutions(policyRateBps);
-  const cities = createCities(GOODS);
+  const countryEconomicProfiles = structuredClone(COUNTRY_ECONOMIC_PROFILES);
+  const monetaryAreaProfiles = structuredClone(MONETARY_AREA_ECONOMIC_PROFILES);
+  const { banks, governments, centralBanks, exchanges, brokers } = createInstitutions(scenario, countryEconomicProfiles, monetaryAreaProfiles);
+  const cities = createCities(GOODS, countryEconomicProfiles);
   const people = createPeople(cities.map((city) => city.id));
   const households = createHouseholds(people, banks);
-  const companies = createCompanies();
+  const companies = createCompanies(countryEconomicProfiles, cities);
   if (scenario === "supply-constraint") companies.forEach((company) => { company.capacityMilliUnits = Math.round(company.capacityMilliUnits * 0.72); company.productiveCapital.capacityMilliUnits = company.capacityMilliUnits; });
   if (scenario === "high-demand") households.forEach((household) => { household.consumptionPropensityBps = Math.min(9_800, household.consumptionPropensityBps + 900); });
   const countries = createCountries();
   const { universities, programs: universityPrograms } = createUniversities(banks.map((bank) => bank.id));
   const housingCohorts = createHousingCohorts(cities);
-  const populationCohorts = createPopulationCohorts(cities, banks.map((bank) => bank.id));
-  const firmCohorts = createFirmCohorts(cities, banks.map((bank) => bank.id));
+  const populationCohorts = createPopulationCohorts(cities, banks, countryEconomicProfiles);
+  const firmCohorts = createFirmCohorts(cities, banks, countryEconomicProfiles);
   const localBankId = (countryId: string, offset = 0) => {
     const options = banks.filter((bank) => bank.countryId === countryId);
     return options[offset % options.length].id;
@@ -363,7 +381,7 @@ export function createWorld(scenario: SimulationScenario = "baseline"): WorldSta
     }
   }
   const world: WorldState = {
-    schemaVersion: 6, saveVersion: 6, seed: "economic-world-v6", scenario,
+    schemaVersion: 7, saveVersion: 7, seed: "economic-world-v7", scenario,
     clock: { startYear: 2026, startMonth: 1, elapsedMonths: 0 }, ledger: createLedger(), goods: structuredClone(GOODS), goodsMovements: [], people, households, companies, banks,
     government: governments.find((item) => item.countryId === "ru")!,
     centralBank: centralBanks.find((item) => item.countryId === "ru")!,
@@ -377,10 +395,11 @@ export function createWorld(scenario: SimulationScenario = "baseline"): WorldSta
     occupations: structuredClone(OCCUPATIONS),
     player: { personId: "person-player", householdId: "household-001", profileId: "student", automaticBasicSpending: false, consumptionBudgetBps: 7_500, savingsTargetBps: 2_500, pendingJobOffer: null, jobApplications: [], activeEnrollment: null, completedCourseIds: [], completedLessonIds: [], monthlyHistory: [], timeline: [], commandLog: [], nextCommandId: 1, nextTimelineId: 1, currentCityId: "moscow", residencePropertyId: null, activeTravel: null, universityApplications: [], activeUniversityEnrollment: null, completedProgramIds: [], educationHistory: [], visitedCityIds: ["moscow"], visitedCountryIds: ["ru"], residenceHistory: [{ cityId: "moscow", fromMonth: 0, toMonth: null }], durableAssetIds: [], propertyIds: [], brokerageAccountIds: [], bankAccountIds: [], reportingCurrencyId: "RUB", foodPlanId: "basic" },
     events: [], metricsHistory: [], countryMetricsHistory: [], nextEventId: 1, nextGoodsMovementId: 1, nextLoanId: 1, nextFundingId: 1, nextCompanyId: companies.length + 1,
-    countries, cities, universities, universityPrograms, housingCohorts, properties: [], products: createProducts(), durableAssets: [], populationCohorts, firmCohorts,
+    countries, countryEconomicProfiles, monetaryAreaProfiles, cities, universities, universityPrograms, housingCohorts, properties: [], products: createProducts(), durableAssets: [], populationCohorts, firmCohorts,
     fidelity: { tierByEntityId: Object.fromEntries(people.map((person) => [person.id, person.fidelityTier])), relevanceByEntityId: { "person-player": 10_000 }, materializedPersonIds: [], budgets: { maxNamedPersons: 500, maxActivePersons: 200, maxFullCompanies: 120, maxActiveProperties: 300 }, activeCityIds: ["moscow"] },
     ledgerArchives: [],
-    diagnostics: { populationRepresented: 0, businessesRepresented: 0, highFidelityPersons: 0, materializedPersons: 0, explicitFirms: 0, firmCohorts: 0, materializedProperties: 0, housingUnitsRepresented: 0, ledgerHotTransactions: 0, ledgerArchivedTransactions: 0, estimatedSaveBytes: 0, deterministicWorkUnits: 0 },
+    history: { policy: { hotLedgerMonths: 6, detailedArchiveMonths: 60, playerDetailMonths: 120, marketDetailMonths: 24, companyReportMonths: 36, detailedMetricMonths: 24, derivativeDetailMonths: 24 }, importantLedgerTransactions: [], compactedLedgerRecords: [], compactedDerivativeRecords: [], compactedMarketRecords: [], companyAnnualRecords: [], compactedEventRecords: [], globalSeries: { months: [], columns: {} }, countrySeries: {}, lastCompactedMonth: 0 },
+    diagnostics: { populationRepresented: 0, businessesRepresented: 0, highFidelityPersons: 0, materializedPersons: 0, explicitFirms: 0, firmCohorts: 0, materializedProperties: 0, housingUnitsRepresented: 0, ledgerHotTransactions: 0, ledgerArchivedTransactions: 0, ledgerCompactedTransactions: 0, estimatedSaveBytes: 0, activeDerivativeContracts: 0, activeMarketOrders: 0, historyRecordCount: 0, memoryPressure: "normal", saveBreakdown: { totalBytes: 0, ledgerBytes: 0, marketsBytes: 0, historyBytes: 0, derivativesBytes: 0, companiesBytes: 0, populationBytes: 0, sovereignBytes: 0, otherBytes: 0 }, deterministicWorkUnits: 0 },
     nextMaterializedPersonId: 1, nextPropertyId: 1, nextDurableAssetId: 1, nextApplicationId: 1,
     equitySecurities: ownership.equitySecurities,
     equityHoldings: ownership.equityHoldings,

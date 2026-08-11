@@ -1,6 +1,6 @@
 {
   "name": "economic-world",
-  "version": "0.10.0",
+  "version": "0.10.5",
   "private": true,
   "description": "Детерминированная экономическая симуляция с двойной бухгалтерией",
   "type": "module",

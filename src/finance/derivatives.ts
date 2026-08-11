@@ -362,9 +362,19 @@ export function expireOptions(world: WorldState): number {
 export function createInterestRateSwap(world: WorldState, fixedPayerId: string, floatingPayerId: string, monetaryAreaId: string, notionalMinor: number, fixedRateBps: number, maturityMonths: number, paymentFrequencyMonths = 3): InterestRateSwapContract | null {
   const area = world.monetaryAreas.find((item) => item.id === monetaryAreaId);
   if (!area || notionalMinor <= 0 || fixedRateBps < 0 || maturityMonths < paymentFrequencyMonths || fixedPayerId === floatingPayerId || !currencyBankAccount(world, fixedPayerId, area.currencyId) || !currencyBankAccount(world, floatingPayerId, area.currencyId)) return null;
+  const id = contractId(world);
+  const marginMinor = Math.max(1, Math.round(notionalMinor * 300 / 10_000));
+  const fixedPledge = pledgeDerivativeCashCollateral(world, fixedPayerId, floatingPayerId, area.currencyId, marginMinor, id);
+  const floatingPledge = pledgeDerivativeCashCollateral(world, floatingPayerId, fixedPayerId, area.currencyId, marginMinor, id);
+  if (!fixedPledge || !floatingPledge) {
+    if (fixedPledge) fixedPledge.status = "released";
+    if (floatingPledge) floatingPledge.status = "released";
+    return null;
+  }
   const set = createNettingSet(world, fixedPayerId, floatingPayerId, area.currencyId);
+  set.collateralPledgeIds.push(fixedPledge.id, floatingPledge.id);
   const contract: InterestRateSwapContract = {
-    id: contractId(world), type: "interest-rate-swap", counterpartyIds: [fixedPayerId, floatingPayerId], underlying: { kind: "interest-rate", monetaryAreaId },
+    id, type: "interest-rate-swap", counterpartyIds: [fixedPayerId, floatingPayerId], underlying: { kind: "interest-rate", monetaryAreaId },
     notionalMinor: Math.floor(notionalMinor), currencyId: area.currencyId, startMonth: world.clock.elapsedMonths, maturityMonth: world.clock.elapsedMonths + maturityMonths, status: "active",
     collateralTerms: defaultCollateral(area.currencyId, 500, 350), settlementTerms: defaultSettlement("cash", paymentFrequencyMonths, true), nettingSetId: set.id, ccpId: null,
     lastMarkMinor: 0, transactionIds: [], fixedPayerId, floatingPayerId, fixedRateBps, referenceMonetaryAreaId: monetaryAreaId, paymentFrequencyMonths, lastPaymentMonth: world.clock.elapsedMonths,
@@ -394,7 +404,10 @@ export function settleInterestRateSwap(world: WorldState, id: string): { ok: boo
   contract.lastPaymentMonth = world.clock.elapsedMonths;
   contract.lastMarkMinor = floatingMinor - fixedMinor;
   if (settled.transactionId) contract.transactionIds.push(settled.transactionId);
-  if (world.clock.elapsedMonths >= contract.maturityMonth) contract.status = "matured";
+  if (world.clock.elapsedMonths >= contract.maturityMonth) {
+    contract.status = "matured";
+    for (const pledge of world.collateralPledges.filter((item) => item.referenceId === contract.id && item.status === "active")) pledge.status = "released";
+  }
   return { ok: true, netMinor: settled.netMinor, transactionId: settled.transactionId };
 }
 

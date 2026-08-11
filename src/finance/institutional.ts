@@ -11,6 +11,7 @@ import {
 } from "../core/ledger.ts";
 import type { Fund, FundMandate, WorldState } from "../domain/model.ts";
 import { openBrokerageAccount, placeOrder } from "../markets/exchange.ts";
+import { transferShares } from "../corporate/finance.ts";
 
 const UNIT_MICROS = 1_000_000;
 const INITIAL_NAV_PER_UNIT_MINOR = 10_000;
@@ -209,6 +210,13 @@ function defaultMandate(countryId: string): FundMandate {
   return { assetClasses: ["equity", "cash"], countryIds: [countryId], benchmarkIndexId: `index-${countryId}`, cashBufferBps: 1_500, maxPositionBps: 2_500, riskTargetBps: 5_000 };
 }
 
+function strategyFor(type: Fund["type"]) {
+  if (type === "hedge") return "HEDGE_MACRO" as const;
+  if (type === "pension") return "PENSION_CONSERVATIVE" as const;
+  if (type === "etf") return "INDEX_FUND" as const;
+  return "ACTIVE_LONG_ONLY" as const;
+}
+
 export function seedInstitutionalFinance(world: WorldState): void {
   const managerSeeds = [
     ["ru", "Север Капитал"], ["us", "Union Asset Management"], ["de", "Rhein Vermögen"],
@@ -240,7 +248,9 @@ export function seedInstitutionalFinance(world: WorldState): void {
         highWaterMarkMinorPerUnit: INITIAL_NAV_PER_UNIT_MINOR,
         managementFeeBps: type === "hedge" ? 180 : type === "pension" ? 45 : 90,
         performanceFeeBps: type === "hedge" ? 1_500 : 0,
-        mandate: defaultMandate(countryId),
+        mandate: { ...defaultMandate(countryId), assetClasses: type === "hedge" || type === "pension" ? ["equity", "sovereign-bond", "cash", "derivative"] : defaultMandate(countryId).assetClasses },
+        strategyProfileId: strategyFor(type),
+        primeBrokerIds: world.banks.filter((item) => item.countryId === countryId).slice(0, 2).map((item) => item.id),
         status: "active",
       };
       world.funds.push(fund);
@@ -254,6 +264,23 @@ export function seedInstitutionalFinance(world: WorldState): void {
         exchange.listedSecurityIds.push(fund.unitSecurityId);
         world.marketIndices.find((index) => index.exchangeId === exchange.id)?.constituentSecurityIds.push(fund.unitSecurityId);
       }
+    }
+  }
+  // Реальная стартовая мультивалютная позиция глобального hedge-фонда.
+  const globalFund = world.funds.find((fund) => fund.type === "hedge" && fund.currencyId === "USD");
+  const euroBank = world.banks.find((bank) => bank.baseCurrency === "EUR");
+  if (globalFund && euroBank) {
+    seedDeposit(world, globalFund.id, euroBank.id, 1_500_000_00);
+  }
+  for (const fund of world.funds.filter((item) => item.mandate.assetClasses.includes("derivative"))) {
+    const countryId = world.assetManagers.find((manager) => manager.id === fund.managerId)?.countryId;
+    const localListings = world.listings.filter((item) => world.exchanges.find((exchange) => exchange.id === item.exchangeId)?.countryId === countryId && !item.companyId.startsWith("fund-"));
+    const listing = localListings[1] ?? localListings[0];
+    const seller = listing && world.equityHoldings.find((holding) => holding.securityId === listing.securityId && holding.shares >= 300);
+    const sellerAccount = seller && world.bankAccounts.find((account) => account.ownerId === seller.ownerId && account.currencyId === fund.currencyId && account.status === "active");
+    if (listing && seller && sellerAccount) {
+      transferShares(world, listing.securityId, seller.ownerId, fund.id, 300, listing.lastPriceCents, "EQUITY_SECONDARY", { buyerBankAccountId: fund.bankAccountId, sellerBankAccountId: sellerAccount.id });
+      calculateFundNav(world, fund.id);
     }
   }
 }
