@@ -1,6 +1,6 @@
 {
   "name": "economic-world",
-  "version": "0.8.0",
+  "version": "0.10.0",
   "private": true,
   "description": "Детерминированная экономическая симуляция с двойной бухгалтерией",
   "type": "module",
@@ -12,6 +12,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "test": "node --experimental-strip-types --test tests/simulation.test.ts",
+    "benchmark:20y": "node --experimental-strip-types tests/long-run-benchmark.ts",
     "lint": "eslint src tests vite.config.ts"
   },
   "dependencies": {

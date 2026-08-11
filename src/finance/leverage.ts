@@ -36,7 +36,7 @@ function pledgedSecurityQuantity(world: WorldState, ownerId: string, securityId:
   return world.collateralPledges.filter((pledge) => pledge.ownerId === ownerId && pledge.assetType === "security" && pledge.assetId === securityId && pledge.status === "active").reduce((sum, pledge) => sum + pledge.quantity, 0);
 }
 
-export function pledgeSecurityCollateral(world: WorldState, ownerId: string, securedPartyId: string, securityId: string, quantity: number, purpose: "margin" | "repo" | "prime-brokerage"): CollateralPledge | null {
+export function pledgeSecurityCollateral(world: WorldState, ownerId: string, securedPartyId: string, securityId: string, quantity: number, purpose: "margin" | "repo" | "prime-brokerage" | "derivative-margin" | "central-bank"): CollateralPledge | null {
   const holding = world.equityHoldings.find((item) => item.ownerId === ownerId && item.securityId === securityId);
   const listing = listingFor(world, securityId);
   quantity = Math.floor(quantity);

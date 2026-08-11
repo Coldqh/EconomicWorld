@@ -22,6 +22,9 @@ import { processMarginRisk } from "../finance/leverage.ts";
 import { allocateConsumptionBudget } from "./consumer-choice.ts";
 import { runBankruptcyWaterfall, serviceCorporateBonds } from "../corporate/finance.ts";
 import { runMarketAgents } from "../markets/exchange.ts";
+import { processDerivativeMonth } from "../finance/derivatives.ts";
+import { settleFinancialPayment } from "../finance/financial-settlement.ts";
+import { runMacroeconomicMonth } from "./macroeconomics.ts";
 
 const clamp = (value: number, minimum: number, maximum: number): number => Math.min(maximum, Math.max(minimum, value));
 
@@ -234,7 +237,13 @@ function householdBudget(world: WorldState, household: Household): number {
   const spendableStock = Math.max(0, cash - desiredReserve);
   const propensity = household.id === world.player.householdId ? world.player.consumptionBudgetBps : household.consumptionPropensityBps;
   const expectedInflationEffect = clamp(10_000 + household.expectedInflationBps * 0.3, 9_000, 11_500);
-  return Math.min(Math.round(cash * 0.22), Math.round(((monthlyIncome * propensity) / 10_000 + spendableStock * 0.06) * expectedInflationEffect / 10_000));
+  const countryId = countryIdForCity(world, household.cityId);
+  const macro = world.countryMacroStates.find((state) => state.countryId === countryId);
+  const debtService = world.loans.filter((loan) => loan.borrowerId === household.id && loan.status === "active").reduce((sum, loan) => sum + Math.ceil(loan.remainingPrincipalCents / Math.max(1, loan.remainingMonths)) + Math.round(loan.remainingPrincipalCents * loan.annualRateBps / 10_000 / 12), 0);
+  const realDepositRateBps = (macro?.depositRateBps ?? 0) - household.expectedInflationBps;
+  const rateSavingsEffectBps = clamp(10_000 - Math.max(0, realDepositRateBps) * 0.45, 8_200, 10_500);
+  const debtBurdenEffectBps = clamp(10_000 - Math.round(debtService * 4_000 / Math.max(1, monthlyIncome)), 5_500, 10_000);
+  return Math.min(Math.round(cash * 0.22), Math.round(((monthlyIncome * propensity) / 10_000 + spendableStock * 0.06) * expectedInflationEffect / 10_000 * rateSavingsEffectBps / 10_000 * debtBurdenEffectBps / 10_000));
 }
 
 function chooseSeller(world: WorldState, household: Household, goodId: string): Company | undefined {
@@ -254,19 +263,19 @@ function chooseSeller(world: WorldState, household: Household, goodId: string): 
   })[0];
 }
 
-function sellFinalGood(world: WorldState, payerId: string, seller: Company, budget: number, reason: "CONSUMPTION" | "CAPITAL", destinationId: string): number {
+function sellFinalGood(world: WorldState, payerId: string, seller: Company, budget: number, reason: "CONSUMPTION" | "CAPITAL" | "PUBLIC_CAPITAL", destinationId: string): number {
   const quantity = Math.min(seller.inventoryMilliUnits, Math.floor((budget * 1_000) / Math.max(1, seller.priceCents)));
   const gross = Math.floor((quantity * seller.priceCents) / 1_000);
   if (quantity <= 0 || gross <= 0) return 0;
-  const kind = reason === "CAPITAL" ? "CAPITAL_INVESTMENT" : "GOODS_CLEARING";
-  const payerAccount = reason === "CAPITAL" ? accountIds.productiveCapital(payerId) : accountIds.operatingExpense(payerId);
-  ensureAccount(world.ledger, payerAccount, payerId, reason === "CAPITAL" ? "Производственный капитал" : "Потребление", reason === "CAPITAL" ? "asset" : "expense", currencyForEntity(world, payerId));
+  const kind = reason === "CAPITAL" ? "CAPITAL_INVESTMENT" : reason === "PUBLIC_CAPITAL" ? "PUBLIC_INVESTMENT" : "GOODS_CLEARING";
+  const payerAccount = reason === "CAPITAL" ? accountIds.productiveCapital(payerId) : reason === "PUBLIC_CAPITAL" ? accountIds.infrastructure(payerId) : accountIds.operatingExpense(payerId);
+  ensureAccount(world.ledger, payerAccount, payerId, reason === "CAPITAL" ? "Производственный капитал" : reason === "PUBLIC_CAPITAL" ? "Инфраструктурный капитал" : "Потребление", reason === "CONSUMPTION" ? "expense" : "asset", currencyForEntity(world, payerId));
   const destinationName = world.households.find((item) => item.id === destinationId)?.displayName
     ?? world.companies.find((item) => item.id === destinationId)?.name
     ?? (world.governments.some((government) => government.id === destinationId) ? "Правительство" : destinationId);
   const tx = settleDepositPayment(world, payerId, seller.id, gross, kind, `${destinationName} ← ${seller.name}`, payerAccount, accountIds.operatingIncome(seller.id));
   if (!tx) return 0;
-  const moved = consumeSellerInventory(world, seller, quantity, reason, destinationId, [tx]);
+  const moved = consumeSellerInventory(world, seller, quantity, reason === "PUBLIC_CAPITAL" ? "CAPITAL" : reason, destinationId, [tx]);
   seller.lastGrossRevenueCents += gross;
   if (world.governments.some((government) => government.id === payerId)) seller.lastGovernmentSalesCents += gross;
   else if (reason === "CONSUMPTION") seller.lastHouseholdSalesCents += gross;
@@ -342,13 +351,27 @@ function clearHouseholdMarket(world: WorldState): void {
 
 function governmentPurchases(world: WorldState): void {
   for (const government of world.governments) {
-    const budget = Math.min(depositOf(world, government.id) / 80, 180_000_00);
+    const fiscal = world.governmentBudgets.find((item) => item.governmentId === government.id);
+    const latest = [...world.countryMetricsHistory].reverse().find((point) => point.countryId === government.countryId);
+    const baseline = latest?.nominalGdpMinor ?? 120_000_000_00;
+    const budget = Math.min(depositOf(world, government.id) * 0.18, Math.max(2_000_00, Math.round(baseline * (fiscal?.governmentConsumptionTargetBps ?? 1_500) / 10_000)));
     for (const goodId of ["services", "goods"] as const) {
       const seller = suppliersFor(world, goodId, government.countryId)[0];
       if (!seller) continue;
       const spent = sellFinalGood(world, government.id, seller, Math.floor(budget / 2), "CONSUMPTION", government.id);
       world.nationalAccounts.current.governmentConsumptionCents += spent;
       world.nationalAccounts.current.governmentConsumptionByGoodCents[goodId] += spent;
+    }
+    const investmentBudget = Math.min(depositOf(world, government.id) * 0.06, Math.max(500_00, Math.round(baseline * (fiscal?.publicInvestmentTargetBps ?? 300) / 10_000)));
+    const capitalSeller = suppliersFor(world, "goods", government.countryId)[0];
+    if (capitalSeller && investmentBudget > 0) {
+      const invested = sellFinalGood(world, government.id, capitalSeller, investmentBudget, "PUBLIC_CAPITAL", government.id);
+      world.nationalAccounts.current.capitalFormationCents += invested;
+    }
+    if (isQuarterEnd(world.clock)) {
+      const university = world.universities.find((item) => world.cities.find((city) => city.id === item.cityId)?.countryId === government.countryId);
+      const grant = university ? Math.min(depositOf(world, government.id), Math.max(100_00, Math.round(baseline * (fiscal?.educationFundingBps ?? 350) / 10_000 / 3))) : 0;
+      if (university && grant > 0) settleFinancialPayment(world, government.id, university.id, government.currencyId, grant, "EDUCATION", `Финансирование образования · ${government.countryId}`);
     }
   }
 }
@@ -376,11 +399,17 @@ function investInCapital(world: WorldState): void {
   if (!isQuarterEnd(world.clock)) return;
   for (const buyer of activeCompanies(world)) {
     const utilization = buyer.lastProductionMilliUnits / Math.max(1, buyer.capacityMilliUnits);
+    const macro = world.countryMacroStates.find((state) => state.countryId === buyer.headquartersCountryId);
+    const costOfCapitalBps = macro?.averageLoanRateBps ?? 1_000;
+    const demandCoverage = buyer.lastSalesMilliUnits / Math.max(1, buyer.lastProductionMilliUnits);
     const cashBuffer = buyer.wageCents * Math.max(3, buyer.employees.length) * 2;
-    if (utilization < 0.78 || depositOf(world, buyer.id) < cashBuffer) continue;
+    const requiredUtilization = clamp(0.68 + costOfCapitalBps / 40_000 + (macro?.lendingStandardsBps ?? 4_000) / 100_000, 0.72, 0.92);
+    if (utilization < requiredUtilization || demandCoverage < 0.58) continue;
+    if (depositOf(world, buyer.id) < cashBuffer && (macro?.lendingStandardsBps ?? 10_000) < 7_500) issueLoan(world, buyer.bankId, buyer.id, cashBuffer, 84, Math.round((macro?.lendingStandardsBps ?? 4_000) / 10));
+    if (depositOf(world, buyer.id) < cashBuffer) continue;
     const seller = suppliersFor(world, "goods", buyer.headquartersCountryId).find((item) => item.id !== buyer.id);
     if (!seller) continue;
-    const budget = Math.min(Math.round(depositOf(world, buyer.id) * 0.06), 1_200_000_00);
+    const budget = Math.min(Math.round(depositOf(world, buyer.id) * clamp(900 - costOfCapitalBps / 4, 250, 850) / 10_000), 1_200_000_00);
     const spent = sellFinalGood(world, buyer.id, seller, budget, "CAPITAL", buyer.id);
     if (spent <= 0) continue;
     buyer.productiveCapital.acquisitionCostCents += spent;
@@ -435,27 +464,6 @@ function collectCorporateTax(world: WorldState): void {
     const tax = Math.min(depositOf(world, company.id), Math.max(0, Math.round(annualProfit * government.corporateTaxBps / 10_000)));
     const tx = tax > 0 ? transferDeposit(world, company.id, government.id, tax, "CORPORATE_TAX", `Налог на прибыль: ${company.name}`) : null;
     if (tx) { company.lastTaxCents += tax; company.lastOperatingExpenseCents += tax; }
-  }
-}
-
-function updateCentralBankPolicy(world: WorldState): void {
-  if (!isQuarterEnd(world.clock)) return;
-  for (const centralBank of world.centralBanks.filter((bank) => bank.setsPolicyRate)) {
-    const area = world.monetaryAreas.find((item) => item.id === centralBank.monetaryAreaId);
-    const local = world.countryMetricsHistory.filter((point) => point.elapsedMonth === world.clock.elapsedMonths && area?.memberCountryIds.includes(point.countryId));
-    const inflation = local.length ? Math.round(local.reduce((sum, point) => sum + point.inflationBps, 0) / local.length) : centralBank.inflationTargetBps;
-    const unemployment = local.length ? Math.round(local.reduce((sum, point) => sum + point.unemploymentBps, 0) / local.length) : 500;
-    const oldRate = centralBank.policyRateBps;
-    const labourAdjustment = unemployment > 800 ? -25 : unemployment < 400 ? 15 : 0;
-    const newRate = clamp(oldRate + clamp(Math.round((inflation - centralBank.inflationTargetBps) * 0.18) + labourAdjustment, -100, 125), 0, 2_500);
-    if (newRate === oldRate) continue;
-    centralBank.policyRateBps = newRate;
-    centralBank.policyRateHistory.push({ elapsedMonth: world.clock.elapsedMonths, rateBps: newRate });
-    emitSimpleEvent(world, "InterestRateChanged", "Ключевая ставка изменена", `${centralBank.name}: ${(oldRate / 100).toFixed(2)}% → ${(newRate / 100).toFixed(2)}%`, [centralBank.id], "attention", [], { oldRateBps: oldRate, newRateBps: newRate, inflationBps: inflation });
-  }
-  for (const nationalBank of world.centralBanks.filter((bank) => !bank.setsPolicyRate)) {
-    const authority = world.centralBanks.find((bank) => bank.id === world.monetaryAreas.find((area) => area.id === nationalBank.monetaryAreaId)?.monetaryAuthorityId);
-    if (authority) nationalBank.policyRateBps = authority.policyRateBps;
   }
 }
 
@@ -516,15 +524,16 @@ export function stepMonth(world: WorldState): void {
   runInstitutionalFinance(world);
   if (isQuarterEnd(world.clock)) runMarketAgents(world);
   processMarginRisk(world);
+  processDerivativeMonth(world);
   foundCompanyIfNeeded(world);
   recognizeMonthlySalesCosts(world);
+  runMacroeconomicMonth(world);
   const metric = collectMetrics(world);
   world.metricsHistory.push(metric);
   world.countryMetricsHistory.push(...collectCountryMetrics(world));
   recordPlayerMonth(world);
   progressPlayerWorld(world);
   closeMonthlyAccounting(world);
-  updateCentralBankPolicy(world);
   emitSimpleEvent(world, "MonthClosed", "Месяц закрыт", formatSimulationDate(world.clock), [], "info", [], { nominalGdpCents: metric.nominalGdpCents, annualInflationBps: metric.annualInflationBps, unemploymentBps: metric.unemploymentBps });
   world.clock.elapsedMonths += 1;
   migratePopulationCohorts(world);

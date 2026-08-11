@@ -58,7 +58,10 @@ export interface LedgerAccount {
     | "fund-unit"
     | "margin-loan"
     | "collateral"
-    | "repo";
+    | "repo"
+    | "derivative"
+    | "sovereign-bond"
+    | "infrastructure";
   currency: string;
 }
 
@@ -75,6 +78,7 @@ export type TransactionKind =
   | "INCOME_TAX"
   | "SALES_TAX"
   | "CORPORATE_TAX"
+  | "PROPERTY_TAX"
   | "SOCIAL_TRANSFER"
   | "GOODS_CLEARING"
   | "INPUT_PURCHASE"
@@ -135,7 +139,28 @@ export type TransactionKind =
   | "REPO_OPEN"
   | "REPO_REPAYMENT"
   | "COLLATERAL_PLEDGE"
-  | "PRIME_BROKER_LOSS";
+  | "PRIME_BROKER_LOSS"
+  | "DERIVATIVE_PREMIUM"
+  | "DERIVATIVE_SETTLEMENT"
+  | "FUTURES_INITIAL_MARGIN"
+  | "FUTURES_VARIATION_MARGIN"
+  | "SWAP_SETTLEMENT"
+  | "TRS_SETTLEMENT"
+  | "CDS_PREMIUM"
+  | "CDS_SETTLEMENT"
+  | "FX_FORWARD_SETTLEMENT"
+  | "DERIVATIVE_DEFAULT"
+  | "SOVEREIGN_ISSUE"
+  | "SOVEREIGN_COUPON"
+  | "SOVEREIGN_REPAYMENT"
+  | "SOVEREIGN_RESTRUCTURE"
+  | "SOVEREIGN_WRITE_DOWN"
+  | "PUBLIC_INVESTMENT"
+  | "OPEN_MARKET_PURCHASE"
+  | "OPEN_MARKET_SALE"
+  | "QE"
+  | "QT"
+  | "DEPOSIT_INSURANCE";
 
 export interface LedgerTransaction {
   id: string;
@@ -235,7 +260,17 @@ export type EventType =
   | "ShortCovered"
   | "RepoOpened"
   | "RepoRepaid"
-  | "PrimeBrokerLoss";
+  | "PrimeBrokerLoss"
+  | "DerivativeCollateralPledged"
+  | "ForwardCreated"
+  | "FutureNovated"
+  | "DerivativeMarginCall"
+  | "ClearingMemberDefault"
+  | "TrsForcedUnwind"
+  | "SovereignAuctionFailed"
+  | "SovereignBondIssued"
+  | "SovereignDefault"
+  | "LenderOfLastResort";
 
 export interface DomainEvent {
   id: string;
@@ -481,6 +516,7 @@ export interface BankFunding {
   annualRateBps: number;
   issuedAtMonth: number;
   kind: "interbank" | "central-bank";
+  collateralPledgeId?: string | null;
   status: "active" | "repaid";
 }
 
@@ -1109,7 +1145,7 @@ export interface FxDealer {
 }
 
 export interface FundMandate {
-  assetClasses: Array<"equity" | "bond" | "cash" | "private-equity">;
+  assetClasses: Array<"equity" | "bond" | "cash" | "private-equity" | "derivative" | "sovereign-bond">;
   countryIds: string[];
   benchmarkIndexId: string | null;
   cashBufferBps: number;
@@ -1167,15 +1203,16 @@ export interface InvestmentBankMandate {
 
 export interface CollateralPledge {
   id: string;
+  referenceId?: string | null;
   ownerId: string;
   securedPartyId: string;
-  assetType: "security" | "cash";
+  assetType: "security" | "cash" | "sovereign-bond";
   assetId: string;
   quantity: number;
   currencyId: string;
   haircutBps: number;
   markedValueMinor: number;
-  purpose: "margin" | "repo" | "prime-brokerage";
+  purpose: "margin" | "repo" | "prime-brokerage" | "derivative-margin" | "central-bank";
   status: "active" | "released" | "liquidated";
 }
 
@@ -1252,11 +1289,380 @@ export interface PrimeBrokerExposure {
   status: "active" | "liquidating" | "closed" | "loss";
 }
 
+export type UnderlyingReference =
+  | { kind: "equity"; securityId: string }
+  | { kind: "bond"; bondId: string }
+  | { kind: "index"; indexId: string }
+  | { kind: "currency-pair"; pairId: string }
+  | { kind: "interest-rate"; monetaryAreaId: string }
+  | { kind: "credit"; obligationId: string };
+
+export interface DerivativeCollateralTerms {
+  initialMarginBps: number;
+  maintenanceMarginBps: number;
+  variationMargin: boolean;
+  collateralCurrencyId: string;
+}
+
+export interface DerivativeSettlementTerms {
+  mode: "cash" | "physical";
+  frequencyMonths: number;
+  nettingEnabled: boolean;
+}
+
+interface DerivativeContractBase {
+  id: string;
+  counterpartyIds: [string, string];
+  underlying: UnderlyingReference;
+  notionalMinor: number;
+  currencyId: string;
+  startMonth: number;
+  maturityMonth: number;
+  status: "active" | "margin-call" | "matured" | "exercised" | "expired" | "defaulted" | "terminated";
+  collateralTerms: DerivativeCollateralTerms;
+  settlementTerms: DerivativeSettlementTerms;
+  nettingSetId: string | null;
+  ccpId: string | null;
+  lastMarkMinor: number;
+  transactionIds: string[];
+}
+
+export interface ForwardContract extends DerivativeContractBase {
+  type: "forward" | "fx-forward";
+  buyerId: string;
+  sellerId: string;
+  quantity: number;
+  forwardPriceMinor: number;
+}
+
+export interface FuturesContract extends DerivativeContractBase {
+  type: "future";
+  exchangeId: string;
+  longId: string;
+  shortId: string;
+  contractSize: number;
+  quantity: number;
+  initialPriceMinor: number;
+  lastSettlementPriceMinor: number;
+  initialMarginMinor: number;
+}
+
+export interface OptionContract extends DerivativeContractBase {
+  type: "option";
+  seriesId: string;
+  holderId: string;
+  writerId: string;
+  optionType: "call" | "put";
+  exerciseStyle: "european" | "american";
+  strikeMinor: number;
+  contractMultiplier: number;
+  quantity: number;
+  premiumPerContractMinor: number;
+  carryingValueMinor: number;
+}
+
+export interface InterestRateSwapContract extends DerivativeContractBase {
+  type: "interest-rate-swap";
+  fixedPayerId: string;
+  floatingPayerId: string;
+  fixedRateBps: number;
+  referenceMonetaryAreaId: string;
+  paymentFrequencyMonths: number;
+  lastPaymentMonth: number;
+}
+
+export interface TotalReturnSwapContract extends DerivativeContractBase {
+  type: "total-return-swap";
+  receiverId: string;
+  payerId: string;
+  securityId: string;
+  quantity: number;
+  referencePriceMinor: number;
+  lastReferencePriceMinor: number;
+  financingSpreadBps: number;
+  accruedDividendMinor: number;
+  hedgeBrokerageAccountId: string | null;
+  hedgeQuantity: number;
+}
+
+export interface CreditDefaultSwapContract extends DerivativeContractBase {
+  type: "credit-default-swap";
+  protectionBuyerId: string;
+  protectionSellerId: string;
+  referenceObligationId: string;
+  premiumBps: number;
+  recoveryBps: number;
+  paymentFrequencyMonths: number;
+  lastPremiumMonth: number;
+  creditEvents: Array<"default" | "failure-to-pay" | "bankruptcy">;
+  speculative: boolean;
+}
+
+export interface FxSwapContract extends DerivativeContractBase {
+  type: "fx-swap";
+  partyAId: string;
+  partyBId: string;
+  pairId: string;
+  baseAmountMinor: number;
+  spotRatePpm: number;
+  forwardRatePpm: number;
+  nearLegSettled: boolean;
+}
+
+export type DerivativeContract = ForwardContract | FuturesContract | OptionContract | InterestRateSwapContract | TotalReturnSwapContract | CreditDefaultSwapContract | FxSwapContract;
+
+export interface OptionMarketSeries {
+  id: string;
+  exchangeId: string;
+  underlyingSecurityId: string;
+  currencyId: string;
+  expirationMonth: number;
+  strikeMinor: number;
+  optionType: "call" | "put";
+  exerciseStyle: "european" | "american";
+  contractMultiplier: number;
+  bidMinor: number | null;
+  askMinor: number | null;
+  lastMinor: number | null;
+  impliedVolatilityBps: number | null;
+  volume: number;
+  openInterest: number;
+}
+
+export interface NettingSet {
+  id: string;
+  partyAId: string;
+  partyBId: string;
+  currencyId: string;
+  contractIds: string[];
+  collateralPledgeIds: string[];
+  closeOutNetting: boolean;
+  status: "active" | "closed" | "defaulted";
+}
+
+export interface ClearingHouse {
+  id: string;
+  name: string;
+  countryId: string;
+  currencyId: string;
+  exchangeIds: string[];
+  bankAccountId: string;
+  defaultFundMinor: number;
+  ownCapitalMinor: number;
+  status: "active" | "recovery" | "defaulted";
+}
+
+export interface ClearingMemberAccount {
+  id: string;
+  clearingHouseId: string;
+  memberId: string;
+  initialMarginMinor: number;
+  variationMarginMinor: number;
+  defaultFundContributionMinor: number;
+  netExposureMinor: number;
+  status: "active" | "margin-call" | "defaulted" | "closed";
+}
+
+export interface ClearedPosition {
+  id: string;
+  clearingHouseId: string;
+  contractId: string;
+  memberId: string;
+  side: "long" | "short";
+  quantity: number;
+  netQuantity: number;
+  lastSettlementPriceMinor: number;
+  status: "open" | "closed" | "defaulted";
+}
+
+export interface DerivativeMarginCall {
+  id: string;
+  contractId: string;
+  debtorId: string;
+  creditorId: string;
+  requiredMinor: number;
+  collateralMinor: number;
+  issuedAtMonth: number;
+  deadlineMonth: number;
+  status: "open" | "met" | "liquidating" | "defaulted";
+}
+
+export interface DerivativeExposureSnapshot {
+  institutionId: string;
+  elapsedMonth: number;
+  grossNotionalMinor: number;
+  grossMarketValueMinor: number;
+  netExposureMinor: number;
+  collateralPostedMinor: number;
+  collateralReceivedMinor: number;
+  potentialExposureMinor: number;
+}
+
+export type SovereignMaturityBucket = "short" | "2y" | "5y" | "10y" | "long";
+
+export interface SovereignBond {
+  id: string;
+  governmentId: string;
+  countryId: string;
+  currencyId: string;
+  maturityBucket: SovereignMaturityBucket;
+  faceValueMinor: number;
+  outstandingFaceValueMinor: number;
+  couponBps: number;
+  issuePriceMinor: number;
+  marketPriceMinor: number;
+  yieldBps: number;
+  issuedAtMonth: number;
+  maturityMonth: number;
+  missedPayments: number;
+  status: "active" | "matured" | "defaulted" | "restructured";
+}
+
+export interface SovereignBondHolding {
+  id: string;
+  bondId: string;
+  holderId: string;
+  faceValueMinor: number;
+  bookValueMinor: number;
+  couponsReceivedMinor: number;
+}
+
+export interface SovereignAuction {
+  id: string;
+  governmentId: string;
+  countryId: string;
+  currencyId: string;
+  maturityBucket: SovereignMaturityBucket;
+  targetFaceValueMinor: number;
+  allocatedFaceValueMinor: number;
+  clearingYieldBps: number | null;
+  bidCount: number;
+  announcedAtMonth: number;
+  settledAtMonth: number | null;
+  status: "announced" | "settled" | "failed" | "cancelled";
+}
+
+export interface YieldCurveSnapshot {
+  countryId: string;
+  elapsedMonth: number;
+  points: Array<{ maturityMonths: number; yieldBps: number }>;
+}
+
+export interface GovernmentBudgetState {
+  governmentId: string;
+  countryId: string;
+  currencyId: string;
+  cashBankAccountId: string;
+  propertyTaxBps: number;
+  governmentConsumptionTargetBps: number;
+  publicInvestmentTargetBps: number;
+  educationFundingBps: number;
+  personalTaxRevenueMinor: number;
+  corporateTaxRevenueMinor: number;
+  consumptionTaxRevenueMinor: number;
+  propertyTaxRevenueMinor: number;
+  totalRevenueMinor: number;
+  governmentConsumptionMinor: number;
+  publicInvestmentMinor: number;
+  transfersMinor: number;
+  educationSpendingMinor: number;
+  interestSpendingMinor: number;
+  totalSpendingMinor: number;
+  primaryBalanceMinor: number;
+  budgetBalanceMinor: number;
+  publicDebtMinor: number;
+  debtDueNext12MonthsMinor: number;
+  averageMaturityMonths: number;
+  infrastructureCapitalMinor: number;
+  fiscalStressBps: number;
+}
+
+export interface CentralBankBalanceSheetState {
+  centralBankId: string;
+  currencyId: string;
+  governmentSecuritiesMinor: number;
+  bankLendingMinor: number;
+  otherAssetsMinor: number;
+  bankReservesMinor: number;
+  currencyInCirculationMinor: number;
+  governmentDepositsMinor: number;
+  equityMinor: number;
+  qePurchasesMinor: number;
+  qtSalesMinor: number;
+}
+
+export interface MonetaryPolicyDecision {
+  id: string;
+  centralBankId: string;
+  elapsedMonth: number;
+  previousRateBps: number;
+  newRateBps: number;
+  observedInflationBps: number;
+  outputGapBps: number;
+  unemploymentBps: number;
+  financialStressBps: number;
+  neutralRateBps: number;
+  reason: string;
+}
+
+export interface DepositInsuranceScheme {
+  id: string;
+  countryId: string;
+  currencyId: string;
+  coverageLimitMinor: number;
+  fundBankAccountId: string;
+  fundBalanceMinor: number;
+  premiumBps: number;
+}
+
+export interface CountryMacroState {
+  countryId: string;
+  currencyId: string;
+  potentialOutputMinor: number;
+  outputGapBps: number;
+  businessCycle: "expansion" | "slowdown" | "recession" | "recovery";
+  inflationExpectationsBps: number;
+  centralBankCredibilityBps: number;
+  creditGrowthBps: number;
+  creditToGdpBps: number;
+  defaultRateBps: number;
+  lendingStandardsBps: number;
+  leverageBps: number;
+  depositRateBps: number;
+  averageLoanRateBps: number;
+  sovereignRiskBps: number;
+  tenYearYieldBps: number;
+  demandPressureBps: number;
+  wagePressureBps: number;
+  inputPressureBps: number;
+  housingServicesPressureBps: number;
+}
+
+export interface MacroMonthlyPoint extends CountryMacroState {
+  elapsedMonth: number;
+  nominalGdpMinor: number;
+  realGdpMinor: number;
+  gdpGrowthBps: number;
+  inflationBps: number;
+  unemploymentBps: number;
+  policyRateBps: number;
+  budgetBalanceMinor: number;
+  primaryBalanceMinor: number;
+  publicDebtMinor: number;
+  debtToGdpBps: number;
+  governmentConsumptionMinor: number;
+  publicInvestmentMinor: number;
+  consumptionContributionMinor: number;
+  investmentContributionMinor: number;
+  governmentContributionMinor: number;
+  inventoryContributionMinor: number;
+}
+
 export type SimulationScenario = "baseline" | "high-demand" | "supply-constraint" | "high-rates" | "bank-liquidity-stress";
 
 export interface WorldState {
-  schemaVersion: 5;
-  saveVersion: 5;
+  schemaVersion: 6;
+  saveVersion: 6;
   seed: string;
   scenario: SimulationScenario;
   clock: SimulationClock;
@@ -1335,6 +1741,24 @@ export interface WorldState {
   shortPositions: ShortPosition[];
   repoAgreements: RepoAgreement[];
   primeBrokerExposures: PrimeBrokerExposure[];
+  derivativeContracts: DerivativeContract[];
+  optionMarketSeries: OptionMarketSeries[];
+  nettingSets: NettingSet[];
+  clearingHouses: ClearingHouse[];
+  clearingMemberAccounts: ClearingMemberAccount[];
+  clearedPositions: ClearedPosition[];
+  derivativeMarginCalls: DerivativeMarginCall[];
+  derivativeExposureHistory: DerivativeExposureSnapshot[];
+  sovereignBonds: SovereignBond[];
+  sovereignBondHoldings: SovereignBondHolding[];
+  sovereignAuctions: SovereignAuction[];
+  yieldCurveHistory: YieldCurveSnapshot[];
+  governmentBudgets: GovernmentBudgetState[];
+  centralBankBalanceSheets: CentralBankBalanceSheetState[];
+  monetaryPolicyDecisions: MonetaryPolicyDecision[];
+  depositInsuranceSchemes: DepositInsuranceScheme[];
+  countryMacroStates: CountryMacroState[];
+  macroHistory: MacroMonthlyPoint[];
   nextSecurityId: number;
   nextHoldingId: number;
   nextBondId: number;
@@ -1354,11 +1778,19 @@ export interface WorldState {
   nextSecuritiesLoanId: number;
   nextShortPositionId: number;
   nextRepoId: number;
+  nextDerivativeId: number;
+  nextDerivativeMarginCallId: number;
+  nextNettingSetId: number;
+  nextClearingPositionId: number;
+  nextSovereignBondId: number;
+  nextSovereignHoldingId: number;
+  nextSovereignAuctionId: number;
+  nextMonetaryDecisionId: number;
 }
 
 export interface InvariantResult {
   id: string;
-  section: "Национальные счета" | "Бухгалтерия" | "Товары" | "Деньги" | "Валюты" | "Кредит" | "Ликвидность банков" | "Игрок" | "Население" | "География" | "Жильё" | "Образование" | "Производительность" | "Собственность" | "Рынки" | "Фонды" | "Обеспечение";
+  section: "Национальные счета" | "Бухгалтерия" | "Товары" | "Деньги" | "Валюты" | "Кредит" | "Ликвидность банков" | "Игрок" | "Население" | "География" | "Жильё" | "Образование" | "Производительность" | "Собственность" | "Рынки" | "Фонды" | "Обеспечение" | "Деривативы" | "Клиринг" | "Государственный долг" | "Денежная политика";
   title: string;
   ok: boolean;
   detail: string;

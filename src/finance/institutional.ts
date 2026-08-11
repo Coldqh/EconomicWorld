@@ -23,9 +23,19 @@ export function calculateFundNav(world: WorldState, fundId: string): { assetsMin
     const listing = world.listings.find((item) => item.securityId === holding.securityId);
     return sum + holding.shares * (listing?.lastPriceCents ?? Math.round(holding.costBasisCents / Math.max(1, holding.shares)));
   }, 0);
+  const corporateBondsMinor = world.bondHoldings
+    .filter((holding) => holding.holderId === fund.id && holding.faceValueCents > 0)
+    .reduce((sum, holding) => sum + holding.costBasisCents, 0);
+  const sovereignBondsMinor = world.sovereignBondHoldings
+    .filter((holding) => holding.holderId === fund.id && holding.faceValueMinor > 0)
+    .reduce((sum, holding) => {
+      const bond = world.sovereignBonds.find((item) => item.id === holding.bondId);
+      if (!bond || bond.outstandingFaceValueMinor <= 0) return sum;
+      return sum + Math.round(bond.marketPriceMinor * holding.faceValueMinor / bond.outstandingFaceValueMinor);
+    }, 0);
   const liabilitiesMinor = world.marginAccounts.filter((account) => account.ownerId === fund.id && account.status !== "closed").reduce((sum, account) => sum + account.borrowedMinor, 0)
     + world.repoAgreements.filter((repo) => repo.cashBorrowerId === fund.id && repo.status === "active").reduce((sum, repo) => sum + repo.cashAmountMinor, 0);
-  const assetsMinor = cashMinor + securitiesMinor;
+  const assetsMinor = cashMinor + securitiesMinor + corporateBondsMinor + sovereignBondsMinor;
   const navMinor = assetsMinor - liabilitiesMinor;
   const navPerUnitMinor = fund.unitsOutstandingMicros > 0 ? Math.max(0, Math.round(navMinor * UNIT_MICROS / fund.unitsOutstandingMicros)) : INITIAL_NAV_PER_UNIT_MINOR;
   fund.navMinor = navMinor;

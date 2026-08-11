@@ -1,5 +1,5 @@
 import { useId, useMemo, useState } from "react";
-import type { OhlcvBar } from "../domain/model.ts";
+import type { OhlcvBar, YieldCurveSnapshot } from "../domain/model.ts";
 
 const WIDTH = 720;
 const HEIGHT = 250;
@@ -79,6 +79,32 @@ export function LineAreaChart({
       {active && <div className="chart-tooltip"><span>{label ?? "—"}</span><strong>{format(active.value)}</strong></div>}
     </div>
   );
+}
+
+export function YieldCurveChart({ snapshots, ariaLabel }: { snapshots: YieldCurveSnapshot[]; ariaLabel: string }) {
+  const [historyOffset, setHistoryOffset] = useState(0);
+  const available = snapshots.slice(-60);
+  const offset = Math.min(historyOffset, Math.max(0, available.length - 1));
+  const snapshot = available.at(-(offset + 1));
+  if (!snapshot) return <div className="yield-curve-chart empty-chart" role="img" aria-label={`${ariaLabel}: нет данных`}>Нет данных</div>;
+  const width = 720;
+  const height = 250;
+  const points = snapshot.points;
+  const maxMaturity = Math.max(1, ...points.map((point) => point.maturityMonths));
+  const minYield = Math.min(...points.map((point) => point.yieldBps));
+  const maxYield = Math.max(...points.map((point) => point.yieldBps));
+  const spread = Math.max(100, maxYield - minYield);
+  const x = (maturity: number) => 34 + maturity / maxMaturity * 640;
+  const y = (yieldBps: number) => 24 + (1 - (yieldBps - minYield) / spread) * 170;
+  const polyline = points.map((point) => `${x(point.maturityMonths)},${y(point.yieldBps)}`).join(" ");
+  return <div className="yield-curve-chart">
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={ariaLabel}>
+      {[0, 1, 2, 3].map((step) => <line key={step} className="chart-gridline" x1="34" x2="674" y1={24 + step * 56.7} y2={24 + step * 56.7} />)}
+      <polyline className="yield-line" points={polyline} />
+      {points.map((point) => <g key={point.maturityMonths}><circle className="yield-point" cx={x(point.maturityMonths)} cy={y(point.yieldBps)} r="5" /><text className="yield-label" x={x(point.maturityMonths)} y="224" textAnchor="middle">{point.maturityMonths < 24 ? `${point.maturityMonths}м` : `${Math.round(point.maturityMonths / 12)}г`}</text><text className="yield-value" x={x(point.maturityMonths)} y={y(point.yieldBps) - 11} textAnchor="middle">{(point.yieldBps / 100).toFixed(1)}%</text></g>)}
+    </svg>
+    <footer><span>{snapshot.elapsedMonth + 1} месяц</span>{available.length > 1 && <label>История<input type="range" min="0" max={available.length - 1} value={offset} onChange={(event) => setHistoryOffset(Number(event.target.value))} /></label>}</footer>
+  </div>;
 }
 
 export function MiniTrendChart({

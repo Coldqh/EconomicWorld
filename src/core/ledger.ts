@@ -86,6 +86,18 @@ export const accountIds = {
   marginLoanLiability: (ownerId: string, marginAccountId: string) => `${ownerId}:liability:margin-loan:${marginAccountId}`,
   repoAsset: (lenderId: string, repoId: string) => `${lenderId}:asset:repo:${repoId}`,
   repoLiability: (borrowerId: string, repoId: string) => `${borrowerId}:liability:repo:${repoId}`,
+  derivativeAsset: (ownerId: string, contractId: string) => `${ownerId}:asset:derivative:${contractId}`,
+  derivativeLiability: (ownerId: string, contractId: string) => `${ownerId}:liability:derivative:${contractId}`,
+  derivativeIncome: (ownerId: string, currencyId: string) => `${ownerId}:income:derivative:${currencyId}`,
+  derivativeExpense: (ownerId: string, currencyId: string) => `${ownerId}:expense:derivative:${currencyId}`,
+  sovereignBondAsset: (ownerId: string, bondId: string) => `${ownerId}:asset:sovereign-bond:${bondId}`,
+  sovereignBondLiability: (governmentId: string, bondId: string) => `${governmentId}:liability:sovereign-bond:${bondId}`,
+  sovereignInterestIncome: (ownerId: string, currencyId: string) => `${ownerId}:income:sovereign-interest:${currencyId}`,
+  sovereignInterestExpense: (governmentId: string, currencyId: string) => `${governmentId}:expense:sovereign-interest:${currencyId}`,
+  sovereignLoss: (ownerId: string, currencyId: string) => `${ownerId}:expense:sovereign-loss:${currencyId}`,
+  sovereignRestructuringGain: (governmentId: string, currencyId: string) => `${governmentId}:income:sovereign-restructure:${currencyId}`,
+  infrastructure: (governmentId: string) => `${governmentId}:asset:infrastructure`,
+  publicInvestmentExpense: (governmentId: string) => `${governmentId}:expense:public-investment`,
 };
 
 export function createLedger(): LedgerState {
@@ -114,6 +126,9 @@ function instrumentFor(
   if (id.includes(":investment")) return "investment";
   if (id.includes(":security:")) return "security";
   if (id.includes(":bond:")) return "bond";
+  if (id.includes(":sovereign-bond:")) return "sovereign-bond";
+  if (id.includes(":derivative:")) return "derivative";
+  if (id.includes(":infrastructure")) return "infrastructure";
   if (id.includes(":goodwill:")) return "goodwill";
   if (id.includes(":monetary-base")) return "monetary-base";
   if (category === "equity") return "equity";
