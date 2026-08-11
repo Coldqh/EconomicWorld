@@ -1,4 +1,4 @@
-import { accountIds, balanceOf } from "../core/ledger.ts";
+import { accountIds, balanceOf, transactionsSince } from "../core/ledger.ts";
 import type { WorldState } from "../domain/model.ts";
 
 export function bankReserveCents(world: WorldState, bankId: string): number {
@@ -13,8 +13,7 @@ export function bankDepositLiabilitiesCents(world: WorldState, bankId: string): 
 
 export function bankExpectedPaymentsCents(world: WorldState, bankId: string): number {
   const deposits = bankDepositLiabilitiesCents(world, bankId);
-  const recentExternal = world.ledger.transactions
-    .filter((transaction) => transaction.elapsedMonth >= world.clock.elapsedMonths - 2)
+  const recentExternal = transactionsSince(world, world.clock.elapsedMonths - 2)
     .flatMap((transaction) => transaction.entries)
     .filter((entry) => entry.accountId === accountIds.bankReserve(bankId) && entry.side === "credit")
     .reduce((sum, entry) => sum + entry.amountCents, 0);

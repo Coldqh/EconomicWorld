@@ -1,6 +1,7 @@
 import type {
   City,
   Country,
+  CountryEconomicProfile,
   HousingCohort,
   ProductDefinition,
   University,
@@ -102,25 +103,32 @@ export function createCountries(): Country[] {
   }));
 }
 
-export function createCities(goods: readonly { id: string; basePriceCents: number }[]): City[] {
-  return CITY_SEEDS.map(([id, countryId, name, latitude, longitude, population, wage, industries], index) => ({
+export function createCities(goods: readonly { id: string; basePriceCents: number }[], profiles: readonly CountryEconomicProfile[]): City[] {
+  const seededPopulationByCountry = Object.fromEntries(profiles.map((profile) => [profile.countryId, CITY_SEEDS.filter((city) => city[1] === profile.countryId).reduce((sum, city) => sum + city[5], 0)]));
+  return CITY_SEEDS.map(([id, countryId, name, latitude, longitude, seededPopulation, wage, industries]) => {
+    const profile = profiles.find((item) => item.countryId === countryId)!;
+    const population = Math.round(profile.population * seededPopulation / Math.max(1, seededPopulationByCountry[countryId]));
+    const wageLevel = Math.round(wage * profile.productivityIndexBps / 10_000);
+    const priceLevel = (profile.housingCostIndexBps * 0.35 + profile.productivityIndexBps * 0.65) / 10_000;
+    return ({
     id,
     countryId,
     name,
     latitude,
     longitude,
     population,
-    baseMonthlyWageCents: wage,
-    transportCostPerKmCents: 16 + (index % 5) * 3,
+    baseMonthlyWageCents: wageLevel,
+    transportCostPerKmCents: Math.round(14 + Math.abs(latitude) / 9),
     logisticsCapacityMilliUnits: 2_000_000 + population * 3,
-    localPriceByGoodCents: Object.fromEntries(goods.map((good, goodIndex) => [good.id, Math.round(good.basePriceCents * (0.82 + (index % 7) * 0.055 + goodIndex * 0.008))])),
-    medianIncomeCents: wage,
-    employmentBps: 8_900 - (index % 6) * 130,
-    costOfLivingCents: Math.round(wage * (0.62 + (index % 5) * 0.035)),
-    housingVacancyBps: 450 + (index % 8) * 90,
+    localPriceByGoodCents: Object.fromEntries(goods.map((good) => [good.id, Math.round(good.basePriceCents * priceLevel * (good.id === "housing" ? 1.08 : 1))])),
+    medianIncomeCents: wageLevel,
+    employmentBps: 10_000 - profile.unemploymentBps,
+    costOfLivingCents: Math.round(wageLevel * profile.housingCostIndexBps / 16_000),
+    housingVacancyBps: profile.housingVacancyBps,
     majorIndustries: [...industries],
     universityIds: UNIVERSITY_SEEDS.filter((university) => university[4] === id).map((university) => university[0]),
-  }));
+  });
+  });
 }
 
 export function createUniversities(bankIds: readonly string[]): { universities: University[]; programs: UniversityProgram[] } {
@@ -165,12 +173,12 @@ export function createUniversities(bankIds: readonly string[]): { universities: 
 }
 
 export function createHousingCohorts(cities: readonly City[]): HousingCohort[] {
-  return cities.flatMap((city, index) => {
+  return cities.flatMap((city) => {
     const monthlyBase = Math.round(city.costOfLivingCents * 0.42);
     const unitBase = Math.max(1_500, Math.round(city.population / 2_800));
     return [
       { id: `housing-${city.id}-rent`, cityId: city.id, type: "rental-apartment" as const, qualityBps: 6_600, averageSizeSqm: 46, totalUnits: unitBase, availableUnits: Math.round(unitBase * city.housingVacancyBps / 10_000), monthlyRentCents: monthlyBase, salePriceCents: monthlyBase * 190, constructionCostCents: monthlyBase * 135, ownerSectorId: `housing-sector:${city.id}` },
-      { id: `housing-${city.id}-owned`, cityId: city.id, type: "owned-apartment" as const, qualityBps: 7_800, averageSizeSqm: 68, totalUnits: Math.round(unitBase * 0.7), availableUnits: Math.max(2, Math.round(unitBase * city.housingVacancyBps / 15_000)), monthlyRentCents: Math.round(monthlyBase * 1.35), salePriceCents: monthlyBase * (225 + index % 4 * 12), constructionCostCents: monthlyBase * 160, ownerSectorId: `housing-sector:${city.id}` },
+      { id: `housing-${city.id}-owned`, cityId: city.id, type: "owned-apartment" as const, qualityBps: 7_800, averageSizeSqm: 68, totalUnits: Math.round(unitBase * 0.7), availableUnits: Math.max(2, Math.round(unitBase * city.housingVacancyBps / 15_000)), monthlyRentCents: Math.round(monthlyBase * 1.35), salePriceCents: monthlyBase * 240, constructionCostCents: monthlyBase * 160, ownerSectorId: `housing-sector:${city.id}` },
       { id: `housing-${city.id}-house`, cityId: city.id, type: "house" as const, qualityBps: 8_400, averageSizeSqm: 128, totalUnits: Math.round(unitBase * 0.25), availableUnits: Math.max(1, Math.round(unitBase * city.housingVacancyBps / 32_000)), monthlyRentCents: monthlyBase * 2, salePriceCents: monthlyBase * 390, constructionCostCents: monthlyBase * 275, ownerSectorId: `housing-sector:${city.id}` },
     ];
   });

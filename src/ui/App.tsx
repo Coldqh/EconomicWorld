@@ -438,10 +438,22 @@ function Ledger({ world, openWhy }: { world: WorldState; openWhy: (title: string
   return <><Section title="Общий реестр" meta={`${world.ledger.transactions.length.toLocaleString("ru-RU")} операций`} /><div className="ledger-grid"><article className="panel ledger-list"><label className="search"><span>Поиск</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Номер, тип или назначение" /></label><TransactionRows world={world} transactions={filtered} select={setSelectedId} selectedId={selected?.id} /></article><article className="panel transaction-detail">{selected ? <><header><div><span>{selected.id} · {selected.elapsedMonth + 1} месяц</span><h2>{TX_LABELS[selected.kind]}</h2></div><strong>{transactionLabel(world, selected)}</strong></header><button className="memo" onClick={() => openWhy(TX_LABELS[selected.kind], selected.memo)}>Причина операции</button><div className="entry-head"><span>Счёт</span><span>Дебет</span><span>Кредит</span></div>{selected.entries.map((entry, index) => { const account = world.ledger.accounts[entry.accountId]; return <div className="entry-row" key={`${entry.accountId}-${index}`}><span><b>{account?.name}</b><small>{entityLabel(world, account?.ownerId ?? "")}</small></span><span>{entry.side === "debit" ? currencyMoney(entry.amountCents, account?.currency ?? "RUB") : "—"}</span><span>{entry.side === "credit" ? currencyMoney(entry.amountCents, account?.currency ?? "RUB") : "—"}</span></div>; })}<footer>Проводка сбалансирована</footer></> : <p className="empty">Операций пока нет.</p>}</article></div></>;
 }
 
+function countLabels<T>(rows: readonly T[], key: (row: T) => string): Array<readonly [string, number]> {
+  const counts = new Map<string, number>();
+  for (const row of rows) counts.set(key(row), (counts.get(key(row)) ?? 0) + 1);
+  return [...counts.entries()].sort((left, right) => right[1] - left[1]);
+}
+
 function Control({ world }: { world: WorldState }) {
+  const [tab, setTab] = useState<"performance" | "save" | "ledger" | "finance" | "countries">("performance");
   const invariants = checkInvariants(world);
   const events = world.events.filter((event) => event.type !== "MonthClosed" && event.type !== "AccountingPeriodClosed").slice(-12).reverse();
   const diagnostics = world.diagnostics;
+  const breakdown = diagnostics.saveBreakdown;
+  const derivativeRecords = [...world.derivativeContracts.map((contract) => ({ type: contract.type, motive: contract.decision?.motive ?? "Без мотива" })), ...world.history.compactedDerivativeRecords.map((contract) => ({ type: contract.type, motive: contract.motive ?? "Без мотива" }))];
+  const derivativesByType = countLabels(derivativeRecords, (contract) => contract.type);
+  const derivativesByMotive = countLabels(derivativeRecords, (contract) => contract.motive);
+  const saveRows = [["Реестр", breakdown.ledgerBytes], ["Рынки", breakdown.marketsBytes], ["История", breakdown.historyBytes], ["Деривативы", breakdown.derivativesBytes], ["Компании", breakdown.companiesBytes], ["Население", breakdown.populationBytes], ["Госдолг", breakdown.sovereignBytes], ["Прочее", breakdown.otherBytes]] as const;
   return <>
     <Section title="Контроль" meta={`${invariants.filter((item) => item.ok).length}/${invariants.length} проверок пройдено`} />
     <section className="kpi-grid four">
@@ -450,6 +462,14 @@ function Control({ world }: { world: WorldState }) {
       <Kpi label="Горячий реестр" value={diagnostics.ledgerHotTransactions.toLocaleString("ru-RU")} note={`${diagnostics.ledgerArchivedTransactions.toLocaleString("ru-RU")} в архиве`} open={() => undefined} />
       <Kpi label="Размер сохранения" value={`${number.format(diagnostics.estimatedSaveBytes / 1_000_000)} МБ`} note={`${diagnostics.deterministicWorkUnits} расчётных единиц`} open={() => undefined} />
     </section>
+    <div className="diagnostic-tabs" role="tablist">
+      {[["performance", "Производительность"], ["save", "Сохранение"], ["ledger", "Реестр"], ["finance", "Автономные финансы"], ["countries", "Данные стран"]].map(([id, label]) => <button className={tab === id ? "active" : ""} key={id} onClick={() => setTab(id as typeof tab)}>{label}</button>)}
+    </div>
+    {tab === "performance" && <section className="diagnostic-grid"><article className="panel diagnostic-card"><header className="panel-title"><h2>Память</h2><span>{diagnostics.memoryPressure === "normal" ? "Норма" : diagnostics.memoryPressure === "elevated" ? "Повышена" : "Высокая"}</span></header><dl><div><dt>Размер мира</dt><dd>{number.format(diagnostics.estimatedSaveBytes / 1_000_000)} МБ</dd></div><div><dt>Расчётные единицы</dt><dd>{diagnostics.deterministicWorkUnits.toLocaleString("ru-RU")}</dd></div><div><dt>Записи истории</dt><dd>{diagnostics.historyRecordCount.toLocaleString("ru-RU")}</dd></div><div><dt>Активные заявки</dt><dd>{diagnostics.activeMarketOrders.toLocaleString("ru-RU")}</dd></div></dl></article><article className="panel diagnostic-card"><header className="panel-title"><h2>Масштаб</h2><span>{world.clock.elapsedMonths} мес.</span></header><dl><div><dt>Население</dt><dd>{diagnostics.populationRepresented.toLocaleString("ru-RU")}</dd></div><div><dt>Фирмы</dt><dd>{diagnostics.businessesRepresented.toLocaleString("ru-RU")}</dd></div><div><dt>Подробные персоны</dt><dd>{diagnostics.highFidelityPersons}</dd></div><div><dt>Подробные компании</dt><dd>{diagnostics.explicitFirms}</dd></div></dl></article></section>}
+    {tab === "save" && <article className="panel diagnostic-card"><header className="panel-title"><h2>Состав сохранения</h2><span>{number.format(breakdown.totalBytes / 1_000_000)} МБ</span></header><div className="diagnostic-table">{saveRows.map(([label, bytes]) => <div key={label}><span>{label}</span><strong>{number.format(bytes / 1_000_000)} МБ</strong><i style={{ width: `${Math.max(1, bytes * 100 / Math.max(1, breakdown.totalBytes))}%` }} /></div>)}</div></article>}
+    {tab === "ledger" && <section className="diagnostic-grid"><article className="panel diagnostic-card"><header className="panel-title"><h2>Уровни реестра</h2><span>Сбалансировано</span></header><dl><div><dt>Горячий</dt><dd>{world.ledger.transactions.length.toLocaleString("ru-RU")}</dd></div><div><dt>Важные детали</dt><dd>{world.history.importantLedgerTransactions.length.toLocaleString("ru-RU")}</dd></div><div><dt>Сжатые операции</dt><dd>{diagnostics.ledgerCompactedTransactions.toLocaleString("ru-RU")}</dd></div><div><dt>Сжатые группы</dt><dd>{world.history.compactedLedgerRecords.length.toLocaleString("ru-RU")}</dd></div></dl></article><article className="panel diagnostic-card"><header className="panel-title"><h2>Глубина</h2><span>{world.history.policy.hotLedgerMonths}/{world.history.policy.playerDetailMonths} мес.</span></header><dl><div><dt>Горячий период</dt><dd>{world.history.policy.hotLedgerMonths} мес.</dd></div><div><dt>Детали игрока</dt><dd>{world.history.policy.playerDetailMonths} мес.</dd></div><div><dt>Рынки</dt><dd>{world.history.policy.marketDetailMonths} мес.</dd></div><div><dt>Отчёты компаний</dt><dd>{world.history.policy.companyReportMonths} мес.</dd></div></dl></article></section>}
+    {tab === "finance" && <section className="diagnostic-grid"><article className="panel diagnostic-card"><header className="panel-title"><h2>Контракты</h2><span>{derivativeRecords.length}</span></header><div className="diagnostic-list">{derivativesByType.map(([label, count]) => <div key={label}><span>{label}</span><strong>{count}</strong></div>)}</div></article><article className="panel diagnostic-card"><header className="panel-title"><h2>Мотивы</h2><span>{diagnostics.activeDerivativeContracts} активных</span></header><div className="diagnostic-list">{derivativesByMotive.map(([label, count]) => <div key={label}><span>{label}</span><strong>{count}</strong></div>)}</div></article></section>}
+    {tab === "countries" && <article className="panel diagnostic-card"><header className="panel-title"><h2>Профили стран</h2><span>{world.countryEconomicProfiles.length}</span></header><div className="country-data-table"><header><span>Страна</span><span>Население</span><span>Инфляция</span><span>Безработица</span><span>Источник</span></header>{world.countryEconomicProfiles.map((profile) => <div key={profile.countryId}><strong>{profile.countryId.toUpperCase()}</strong><span>{number.format(profile.population / 1_000_000)} млн</span><span>{percent(profile.inflationBps)}</span><span>{percent(profile.unemploymentBps)}</span><span>{profile.metadata.sourceType} · {profile.baseYear}</span></div>)}</div></article>}
     <section className="invariant-grid">{invariants.map((item) => <article className={`invariant ${item.ok ? "pass" : "fail"}`} key={item.id}><span>{item.ok ? "Норма" : "Ошибка"}</span><div><small>{item.section}</small><h2>{item.title}</h2><p>{item.detail}</p></div></article>)}</section>
     <article className="panel"><header className="panel-title"><h2>Причинные события</h2><span>{world.events.length}</span></header><div className="event-grid">{events.map((event) => <article key={event.id}><i className={event.severity} /><span><b>{event.title}</b><small>{event.detail}</small></span><time>{event.elapsedMonth + 1}м</time></article>)}</div></article>
   </>;
@@ -469,7 +489,7 @@ function Settings({ repository, updateState, autosaveState, checkUpdate, updateN
   const [persistence, setPersistence] = useState<PersistenceDiagnostics | null>(null);
   const [worker, setWorker] = useState<{ controlled: boolean; state: string; scriptUrl: string | null; cacheNames: string[] } | null>(null);
   useEffect(() => { void Promise.all([repository.diagnostics(), serviceWorkerDiagnostics()]).then(([storage, serviceWorker]) => { setPersistence(storage); setWorker(serviceWorker); }); }, [repository, updateState, autosaveState]);
-  return <><Section title="Настройки" meta={`Версия ${APP_BUILD.version}`} /><section className="settings-grid"><article className="panel settings-card"><header className="panel-title"><h2>Приложение</h2><span>{UPDATE_LABELS[updateState]}</span></header><dl><div><dt>Версия</dt><dd>{APP_BUILD.version}</dd></div><div><dt>Сборка</dt><dd>{APP_BUILD.buildId}</dd></div><div><dt>Коммит</dt><dd>{APP_BUILD.commit}</dd></div><div><dt>Дата сборки</dt><dd>{new Date(APP_BUILD.buildDate).toLocaleString("ru-RU")}</dd></div></dl><footer><button onClick={checkUpdate}>Проверить</button><button className="primary" onClick={updateNow}>Обновить сейчас</button><button className="danger" onClick={forceUpdate}>Принудительно обновить</button></footer></article><article className="panel settings-card"><header className="panel-title"><h2>Сохранение</h2><span>{autosaveState}</span></header><dl><div><dt>Активный мир</dt><dd>{persistence?.activeWorldId ?? "—"}</dd></div><div><dt>Последняя запись</dt><dd>{persistence?.lastAutosaveIso ? new Date(persistence.lastAutosaveIso).toLocaleString("ru-RU") : "—"}</dd></div><div><dt>Схема хранилища</dt><dd>{persistence?.databaseVersion ?? "—"}</dd></div><div><dt>Использовано</dt><dd>{persistence?.usageBytes ? `${number.format(persistence.usageBytes / 1_000_000)} МБ` : "—"}</dd></div></dl></article><article className="panel settings-card"><header className="panel-title"><h2>Офлайн</h2><span>{worker?.controlled ? "Активен" : "Подготовка"}</span></header><dl><div><dt>Service Worker</dt><dd>{worker?.state ?? "—"}</dd></div><div><dt>Кэши приложения</dt><dd>{worker?.cacheNames.filter((name) => name.startsWith("economic-world-app-")).length ?? 0}</dd></div><div><dt>Сценарий</dt><dd>{worker?.scriptUrl?.split("/").at(-1) ?? "—"}</dd></div><div><dt>Данные мира</dt><dd>IndexedDB не очищается при обновлении</dd></div></dl></article></section></>;
+  return <><Section title="Настройки" meta={`Версия ${APP_BUILD.version}`} /><section className="settings-grid"><article className="panel settings-card"><header className="panel-title"><h2>Приложение</h2><span>{UPDATE_LABELS[updateState]}</span></header><dl><div><dt>Версия</dt><dd>{APP_BUILD.version}</dd></div><div><dt>Сборка</dt><dd>{APP_BUILD.buildId}</dd></div><div><dt>Коммит</dt><dd>{APP_BUILD.commit}</dd></div><div><dt>Дата сборки</dt><dd>{new Date(APP_BUILD.buildDate).toLocaleString("ru-RU")}</dd></div></dl><footer><button onClick={checkUpdate}>Проверить</button><button className="primary" onClick={updateNow}>Обновить сейчас</button><button className="danger" onClick={forceUpdate}>Принудительно обновить</button></footer></article><article className="panel settings-card"><header className="panel-title"><h2>Сохранение</h2><span>{autosaveState}</span></header><dl><div><dt>Активный мир</dt><dd>{persistence?.activeWorldId ?? "—"}</dd></div><div><dt>Последняя запись</dt><dd>{persistence?.lastAutosaveIso ? new Date(persistence.lastAutosaveIso).toLocaleString("ru-RU") : "—"}</dd></div><div><dt>Время записи</dt><dd>{persistence?.lastSaveDurationMs != null ? `${number.format(persistence.lastSaveDurationMs)} мс` : "—"}</dd></div><div><dt>Размер мира</dt><dd>{persistence?.lastSaveBytes ? `${number.format(persistence.lastSaveBytes / 1_000_000)} МБ` : "—"}</dd></div><div><dt>Схема хранилища</dt><dd>{persistence?.databaseVersion ?? "—"}</dd></div><div><dt>Использовано</dt><dd>{persistence?.usageBytes ? `${number.format(persistence.usageBytes / 1_000_000)} МБ` : "—"}</dd></div></dl></article><article className="panel settings-card"><header className="panel-title"><h2>Офлайн</h2><span>{worker?.controlled ? "Активен" : "Подготовка"}</span></header><dl><div><dt>Service Worker</dt><dd>{worker?.state ?? "—"}</dd></div><div><dt>Кэши приложения</dt><dd>{worker?.cacheNames.filter((name) => name.startsWith("economic-world-app-")).length ?? 0}</dd></div><div><dt>Сценарий</dt><dd>{worker?.scriptUrl?.split("/").at(-1) ?? "—"}</dd></div><div><dt>Данные мира</dt><dd>IndexedDB не очищается при обновлении</dd></div></dl></article></section></>;
 }
 
 function Onboarding({ world, complete }: { world: WorldState; complete: (name: string, profile: string) => void }) {
@@ -500,6 +520,8 @@ export function App() {
   const [updateState, setUpdateState] = useState<UpdateState>("current");
   const autosaveTimer = useRef<number | null>(null);
   const autosaveChain = useRef<Promise<unknown>>(Promise.resolve());
+  const lastCheckpointMonth = useRef(0);
+  const viewRef = useRef<View>(view);
   const activeRun = useRef<SimulationRun | null>(null);
   const moreDragStart = useRef<number | null>(null);
   const repository = useMemo(() => new SaveRepository(), []);
@@ -512,9 +534,9 @@ export function App() {
     const cityId = snapshot.player.currentCityId;
     const countryId = snapshot.cities.find((city) => city.id === cityId)?.countryId;
     setAutosaveState("Сохранение…");
-    autosaveChain.current = autosaveChain.current.then(() => repository.saveActive(snapshot, { route: view, cityId, countryId })).then(() => setAutosaveState("Сохранено")).catch(() => setAutosaveState("Ошибка сохранения"));
+    autosaveChain.current = autosaveChain.current.then(() => repository.saveActive(snapshot, { route: viewRef.current, cityId, countryId })).then(() => { lastCheckpointMonth.current = snapshot.clock.elapsedMonths; setAutosaveState("Сохранено"); }).catch(() => setAutosaveState("Ошибка сохранения"));
     await autosaveChain.current;
-  }, [repository, view]);
+  }, [repository]);
 
   useEffect(() => { repository.list().then(setSaves).catch(() => setSaves([])); }, [repository]);
   useEffect(() => {
@@ -522,6 +544,7 @@ export function App() {
     void repository.loadActive().then((restored) => {
       if (!active || !restored) return;
       worldRef.current = restored.world;
+      lastCheckpointMonth.current = restored.world.clock.elapsedMonths;
       setWorld(restored.world);
       if (restored.uiState && NAV.some((item) => item.id === restored.uiState!.route)) setView(restored.uiState.route as View);
       setNotice(restored.recovered ? "Восстановлена резервная контрольная точка" : "Активный мир восстановлен");
@@ -532,11 +555,21 @@ export function App() {
     void registerAppServiceWorker(() => setUpdateState("available"));
   }, []);
   useEffect(() => {
+    viewRef.current = view;
+    if (restoring) return;
+    const snapshot = worldRef.current;
+    const cityId = snapshot.player.currentCityId;
+    const countryId = snapshot.cities.find((city) => city.id === cityId)?.countryId;
+    const timer = window.setTimeout(() => { void repository.saveUiState({ route: view, cityId, countryId }); }, 250);
+    return () => window.clearTimeout(timer);
+  }, [view, restoring, repository]);
+  useEffect(() => {
     if (restoring) return;
     if (autosaveTimer.current !== null) window.clearTimeout(autosaveTimer.current);
-    autosaveTimer.current = window.setTimeout(() => { void saveActiveNow(); }, 900);
+    const simulationCheckpointDue = world.clock.elapsedMonths - lastCheckpointMonth.current >= 3;
+    autosaveTimer.current = window.setTimeout(() => { void saveActiveNow(); }, simulationCheckpointDue ? 3_000 : 30_000);
     return () => { if (autosaveTimer.current !== null) window.clearTimeout(autosaveTimer.current); };
-  }, [world, view, restoring, saveActiveNow]);
+  }, [world, restoring, saveActiveNow]);
   const advance = useCallback(async (months: number, pause = true) => {
     if (busy) return;
     setBusy(true); if (pause) setPlaying(false); setProgress(0);

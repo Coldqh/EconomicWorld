@@ -17,12 +17,13 @@ import { recordPlayerMonth } from "../player/system.ts";
 import { progressPlayerWorld } from "../player/world-commands.ts";
 import { compactLedgerHistory, migratePopulationCohorts, updateAggregateEconomies, updateWorldDiagnostics } from "../world/systems.ts";
 import { collectCountryMetrics, collectMetrics } from "./metrics.ts";
-import { runInstitutionalFinance } from "../finance/institutional.ts";
+import { calculateFundNav, runInstitutionalFinance } from "../finance/institutional.ts";
 import { processMarginRisk } from "../finance/leverage.ts";
 import { allocateConsumptionBudget } from "./consumer-choice.ts";
 import { runBankruptcyWaterfall, serviceCorporateBonds } from "../corporate/finance.ts";
 import { runMarketAgents } from "../markets/exchange.ts";
 import { processDerivativeMonth } from "../finance/derivatives.ts";
+import { runAutonomousDerivativeDecisions } from "../finance/autonomous-derivatives.ts";
 import { settleFinancialPayment } from "../finance/financial-settlement.ts";
 import { runMacroeconomicMonth } from "./macroeconomics.ts";
 
@@ -523,8 +524,10 @@ export function stepMonth(world: WorldState): void {
   collectCorporateTax(world);
   runInstitutionalFinance(world);
   if (isQuarterEnd(world.clock)) runMarketAgents(world);
+  for (const fund of world.funds) calculateFundNav(world, fund.id);
   processMarginRisk(world);
   processDerivativeMonth(world);
+  runAutonomousDerivativeDecisions(world);
   foundCompanyIfNeeded(world);
   recognizeMonthlySalesCosts(world);
   runMacroeconomicMonth(world);

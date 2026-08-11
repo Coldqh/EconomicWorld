@@ -5,6 +5,7 @@ import {
   ensureAccount,
   entityBook,
   postTransaction,
+  transactionsForMonth,
 } from "../core/ledger.ts";
 import { emitSimpleEvent } from "../core/events.ts";
 import type { Company, CompanyFinancialReport, TransactionKind, WorldState } from "../domain/model.ts";
@@ -35,10 +36,7 @@ function companyCashFlows(world: WorldState): Map<string, CompanyCashFlow> {
   }
   const byCompany = new Map<string, CompanyCashFlow>();
   const financingKinds = new Set<TransactionKind>(["LOAN_ISSUED", "LOAN_PRINCIPAL", "CAPITAL_CONTRIBUTION"]);
-  for (let index = world.ledger.transactions.length - 1; index >= 0; index -= 1) {
-    const transaction = world.ledger.transactions[index];
-    if (transaction.elapsedMonth < world.clock.elapsedMonths) break;
-    if (transaction.elapsedMonth > world.clock.elapsedMonths) continue;
+  for (const transaction of transactionsForMonth(world, world.clock.elapsedMonths)) {
     for (const entry of transaction.entries) {
       const companyId = companyIdsByDeposit.get(entry.accountId);
       if (!companyId) continue;

@@ -503,6 +503,25 @@ input[type="range"] { width: 100%; accent-color: var(--mint); }
 .derivative-ticket { display: grid; gap: 10px; margin-bottom: 10px; padding-bottom: 14px; }
 .derivative-ticket > button { justify-self: end; margin-right: 14px; }
 
+.diagnostic-tabs { display: flex; gap: 6px; margin: 0 0 10px; overflow-x: auto; scrollbar-width: none; }
+.diagnostic-tabs button { flex: 0 0 auto; min-height: 42px; }
+.diagnostic-tabs button.active { color: var(--mint); border-color: var(--mint); background: var(--raised); }
+.diagnostic-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; margin-bottom: 10px; }
+.diagnostic-card { margin-bottom: 10px; padding-bottom: 14px; }
+.diagnostic-card dl { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 1px; margin: 0 14px; background: var(--border); }
+.diagnostic-card dl div { min-width: 0; display: grid; gap: 6px; padding: 12px; background: var(--surface); }
+.diagnostic-card dt { color: var(--dim); font-size: 12px; }
+.diagnostic-card dd { margin: 0; font: 700 15px ui-monospace,monospace; overflow-wrap: anywhere; }
+.diagnostic-table, .diagnostic-list { display: grid; gap: 1px; margin: 0 14px; background: var(--border); }
+.diagnostic-table > div, .diagnostic-list > div { position: relative; display: grid; grid-template-columns: 1fr auto; gap: 12px; padding: 11px 12px; overflow: hidden; background: var(--surface); }
+.diagnostic-table span, .diagnostic-list span { position: relative; z-index: 1; color: var(--muted); }
+.diagnostic-table strong, .diagnostic-list strong { position: relative; z-index: 1; font: 700 13px ui-monospace,monospace; }
+.diagnostic-table i { position: absolute; inset: auto auto 0 0; height: 2px; background: var(--cyan); }
+.country-data-table { margin: 0 14px; overflow-x: auto; }
+.country-data-table > header, .country-data-table > div { min-width: 680px; display: grid; grid-template-columns: 80px 1fr 1fr 1fr 1.3fr; gap: 10px; align-items: center; padding: 10px 8px; border-bottom: 1px solid var(--border); }
+.country-data-table > header { color: var(--dim); font: 700 11px ui-monospace,monospace; text-transform: uppercase; }
+.country-data-table > div { font: 13px ui-monospace,monospace; }
+
 ::-webkit-scrollbar { width: 8px; height: 8px; } ::-webkit-scrollbar-track { background: var(--deep); } ::-webkit-scrollbar-thumb { background: var(--border-strong); }
 
 @media (max-width: 1120px) {
@@ -563,6 +582,7 @@ input[type="range"] { width: 100%; accent-color: var(--mint); }
   .government-layout, .central-bank-layout { grid-template-columns: 1fr; }
   .government-layout .auction-panel, .central-bank-layout > :last-child { grid-column: auto; }
   .derivative-access dl { grid-template-columns: repeat(2,1fr); }
+  .diagnostic-grid { grid-template-columns: 1fr; }
   .yield-curve-chart { min-height: 220px; padding-inline: 4px; }
   .market-filters { display: block; }
   .market-filters .filter-bar { width: 100%; }
@@ -635,6 +655,8 @@ input[type="range"] { width: 100%; accent-color: var(--mint); }
   .derivative-access { padding: 8px; }
   .option-chain-head, .option-chain-row { min-width: 690px; grid-template-columns: 115px 52px 135px 115px 52px 105px; }
   .boot-sequence > div { min-height: 47px; font-size: 11px; }
+  .diagnostic-card dl { grid-template-columns: 1fr 1fr; margin-inline: 10px; }
+  .diagnostic-table, .diagnostic-list, .country-data-table { margin-inline: 10px; }
 }
 
 @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }

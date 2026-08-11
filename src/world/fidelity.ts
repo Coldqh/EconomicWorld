@@ -45,7 +45,7 @@ export function materializePerson(world: WorldState, cohortId: string, important
     skillBps: Math.round(Object.values(person.skills).reduce((sum, value) => sum + value, 0) / SKILLS.length),
     productivityBps: 8_000,
     consumptionPropensityBps: cohort.incomeBand === "low" ? 8_800 : cohort.incomeBand === "middle" ? 7_900 : 6_900,
-    savingsPreferenceBps: cohort.incomeBand === "high" ? 3_200 : 1_800,
+    savingsPreferenceBps: cohort.incomeBand === "wealthy" ? 3_600 : cohort.incomeBand === "affluent" ? 2_900 : 1_800,
     liquidityPreferenceBps: 1_500,
     essentialBudgetBps: 5_000,
     priceSensitivityBps: 8_500,

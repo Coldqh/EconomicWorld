@@ -45,16 +45,16 @@ function migrateMetric(metric: Partial<MetricPoint>, world: WorldState): MetricP
 
 export function migrateWorldState(raw: unknown): WorldState {
   const legacy = structuredClone(raw) as LegacyWorld;
-  if ((legacy.schemaVersion ?? 1) > 6 || (legacy.saveVersion ?? 1) > 6) {
+  if ((legacy.schemaVersion ?? 1) > 7 || (legacy.saveVersion ?? 1) > 7) {
     throw new Error("Сохранение создано более новой версией приложения");
   }
-  if (legacy.schemaVersion === 6 && legacy.saveVersion === 6) return legacy as WorldState;
+  if (legacy.schemaVersion === 7 && legacy.saveVersion === 7) return legacy as WorldState;
   const template = createWorld();
   const world = {
     ...template,
     ...legacy,
-    schemaVersion: 6 as const,
-    saveVersion: 6 as const,
+    schemaVersion: 7 as const,
+    saveVersion: 7 as const,
     goods: template.goods.map((good) => ({ ...good, ...(legacy.goods?.find((item) => item.id === good.id) ?? {}), essential: good.essential })),
     countries: template.countries.map((base) => ({ ...base, ...(legacy.countries?.find((item) => item.id === base.id) ?? {}) })),
     cities: template.cities.map((base) => ({ ...base, ...(legacy.cities?.find((item) => item.id === base.id) ?? {}) })),
@@ -108,6 +108,12 @@ export function migrateWorldState(raw: unknown): WorldState {
     nextSovereignAuctionId: 1,
     nextMonetaryDecisionId: 1,
   } as WorldState;
+  world.diagnostics = { ...template.diagnostics, ...(legacy.diagnostics ?? {}) };
+  world.history = { ...template.history, ...(legacy.history ?? {}), policy: { ...template.history.policy, ...(legacy.history?.policy ?? {}) } };
+  for (const fund of world.funds) {
+    fund.strategyProfileId ??= fund.type === "hedge" ? "HEDGE_MACRO" : fund.type === "pension" ? "PENSION_CONSERVATIVE" : fund.type === "etf" ? "INDEX_FUND" : "ACTIVE_LONG_ONLY";
+    fund.primeBrokerIds ??= world.banks.filter((bank) => bank.countryId === world.assetManagers.find((manager) => manager.id === fund.managerId)?.countryId).slice(0, 2).map((bank) => bank.id);
+  }
   world.centralBank = world.centralBanks.find((bank) => bank.id === world.centralBank.id) ?? world.centralBanks.find((bank) => bank.id === "central-bank-ru")!;
   const localBankId = (countryId: string, offset = 0): string => {
     const banks = world.banks.filter((bank) => bank.countryId === countryId);

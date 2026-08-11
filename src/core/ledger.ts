@@ -3,12 +3,75 @@ import type {
   LedgerAccount,
   LedgerEntry,
   LedgerState,
+  LedgerTransaction,
   TransactionKind,
   WorldState,
 } from "../domain/model.ts";
 import { emitSimpleEvent } from "./events.ts";
 
 const ownerAccountIndex = new WeakMap<LedgerState, Map<string, string[]>>();
+
+interface LedgerTransactionIndex {
+  source: LedgerTransaction[];
+  indexedLength: number;
+  byMonth: Map<number, LedgerTransaction[]>;
+  byAccount: Map<string, LedgerTransaction[]>;
+  byCurrency: Map<string, LedgerTransaction[]>;
+  byKind: Map<TransactionKind, LedgerTransaction[]>;
+  byEntity: Map<string, LedgerTransaction[]>;
+}
+
+const transactionIndexes = new WeakMap<LedgerState, LedgerTransactionIndex>();
+
+function pushIndexed<T>(map: Map<T, LedgerTransaction[]>, key: T, transaction: LedgerTransaction): void {
+  const values = map.get(key) ?? [];
+  values.push(transaction);
+  map.set(key, values);
+}
+
+function transactionIndex(world: WorldState): LedgerTransactionIndex {
+  let index = transactionIndexes.get(world.ledger);
+  if (!index || index.source !== world.ledger.transactions) {
+    index = { source: world.ledger.transactions, indexedLength: 0, byMonth: new Map(), byAccount: new Map(), byCurrency: new Map(), byKind: new Map(), byEntity: new Map() };
+    transactionIndexes.set(world.ledger, index);
+  }
+  for (let position = index.indexedLength; position < world.ledger.transactions.length; position += 1) {
+    const transaction = world.ledger.transactions[position];
+    pushIndexed(index.byMonth, transaction.elapsedMonth, transaction);
+    pushIndexed(index.byKind, transaction.kind, transaction);
+    const entryAccountIds = new Set(transaction.entries.map((entry) => entry.accountId));
+    const currencies = new Set<string>();
+    const entities = new Set<string>();
+    for (const accountId of entryAccountIds) {
+      pushIndexed(index.byAccount, accountId, transaction);
+      const account = world.ledger.accounts[accountId];
+      if (account) { currencies.add(account.currency); entities.add(account.ownerId); }
+    }
+    for (const currency of currencies) pushIndexed(index.byCurrency, currency, transaction);
+    for (const entity of entities) pushIndexed(index.byEntity, entity, transaction);
+  }
+  index.indexedLength = world.ledger.transactions.length;
+  return index;
+}
+
+export function transactionsForMonth(world: WorldState, elapsedMonth: number): readonly LedgerTransaction[] {
+  return transactionIndex(world).byMonth.get(elapsedMonth) ?? [];
+}
+
+export function transactionsSince(world: WorldState, elapsedMonth: number): LedgerTransaction[] {
+  const index = transactionIndex(world);
+  const result: LedgerTransaction[] = [];
+  for (let month = elapsedMonth; month <= world.clock.elapsedMonths; month += 1) result.push(...(index.byMonth.get(month) ?? []));
+  return result;
+}
+
+export function transactionsForAccount(world: WorldState, accountId: string): readonly LedgerTransaction[] {
+  return transactionIndex(world).byAccount.get(accountId) ?? [];
+}
+
+export function transactionsForEntity(world: WorldState, entityId: string): readonly LedgerTransaction[] {
+  return transactionIndex(world).byEntity.get(entityId) ?? [];
+}
 
 function indexedAccountIds(ledger: LedgerState, ownerId: string): string[] {
   let index = ownerAccountIndex.get(ledger);

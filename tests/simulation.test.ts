@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { accountIds, balanceOf, bankAccountBalance, bankAccountsForOwner, entityBook, openBankAccount, seedDeposit, sumAccounts, transferBankAccountBalance } from "../src/core/ledger.ts";
+import { accountIds, balanceOf, bankAccountBalance, bankAccountsForOwner, entityBook, openBankAccount, postTransaction, seedDeposit, sumAccounts, transferBankAccountBalance } from "../src/core/ledger.ts";
 import { createWorld } from "../src/economy/create-world.ts";
 import { checkInvariants } from "../src/economy/invariants.ts";
 import { deterministicFingerprint } from "../src/economy/metrics.ts";
@@ -21,6 +21,12 @@ import { applyClearingDefaultWaterfall, createNettingSet, settleBilateralNet, se
 import { impliedVolatilityBps, valueEuropeanOption } from "../src/finance/option-pricing.ts";
 import { collectPropertyTaxes, createSovereignAuction, openMarketPurchase, openMarketSale, payDepositInsurance, recalculateGovernmentBudgets, requestLenderOfLastResort, restructureSovereignBond, runMonetaryPolicy, runSovereignAuction, serviceSovereignDebt, updateSovereignValuations } from "../src/economy/macroeconomics.ts";
 import { settleFinancialPayment } from "../src/finance/financial-settlement.ts";
+import { approvePrimeBrokerCapacity, createFxHedgeForFund, runAutonomousDerivativeDecisions } from "../src/finance/autonomous-derivatives.ts";
+import { getCountryEconomicProfile } from "../src/data/country-economic-profiles.ts";
+import { compareCalibrationSeries } from "../src/economy/calibration.ts";
+import { compactLedgerHistory } from "../src/world/systems.ts";
+import { createCities } from "../src/world/catalog.ts";
+import { createPopulationCohorts } from "../src/world/cohorts.ts";
 import type { WorldState } from "../src/domain/model.ts";
 
 function localMarket(world: WorldState, countryId = "ru") {
@@ -36,8 +42,8 @@ function depositMoney(world: WorldState): number {
 
 test("фазы 3 и 4 создают масштабный географический мир", () => {
   const world = createWorld();
-  assert.equal(world.schemaVersion, 6);
-  assert.equal(world.saveVersion, 6);
+  assert.equal(world.schemaVersion, 7);
+  assert.equal(world.saveVersion, 7);
   assert.equal(world.households.length, 100);
   assert.equal(world.people.length, 100);
   assert.equal(world.companies.length, 77);
@@ -210,12 +216,30 @@ test("старое сохранение мигрирует в мультивал
   delete legacy.fxTrades;
   delete legacy.fxDealers;
   const migrated = migrateWorldState(legacy);
-  assert.equal(migrated.schemaVersion, 6);
+  assert.equal(migrated.schemaVersion, 7);
   assert.ok(bankAccountsForOwner(migrated, migrated.player.householdId, "RUB").length > 0);
   assert.ok(migrated.bankAccounts.every((account) => migrated.ledger.accounts[account.ledgerDepositAccountId]));
   assert.equal(migrated.player.personId, "person-player");
   assert.ok(migrated.companies.some((company) => company.id === dynamicCompany.id));
   assert.deepEqual(checkInvariants(migrated).filter((item) => !item.ok), []);
+});
+
+test("сохранение v6 мигрирует в v7 с профилями, историей и стратегиями фондов", () => {
+  const legacy = structuredClone(createWorld()) as unknown as Record<string, unknown>;
+  legacy.schemaVersion = 6;
+  legacy.saveVersion = 6;
+  delete legacy.countryEconomicProfiles;
+  delete legacy.monetaryAreaProfiles;
+  delete legacy.history;
+  const funds = legacy.funds as Array<Record<string, unknown>>;
+  for (const fund of funds) { delete fund.strategyProfileId; delete fund.primeBrokerIds; }
+  const migrated = migrateWorldState(legacy);
+  assert.equal(migrated.schemaVersion, 7);
+  assert.equal(migrated.countryEconomicProfiles.length, migrated.countries.length);
+  assert.ok(migrated.history.policy.hotLedgerMonths > 0);
+  assert.ok(migrated.funds.every((fund) => fund.strategyProfileId && fund.primeBrokerIds.length > 0));
+  assert.deepEqual(checkInvariants(migrated).filter((item) => !item.ok), []);
+  assert.equal(deterministicFingerprint(migrateWorldState(JSON.parse(JSON.stringify(migrated)))), deterministicFingerprint(migrated));
 });
 
 test("RUB и USD существуют одновременно, а FX сохраняет каждую валюту", () => {
@@ -527,6 +551,7 @@ test("IRS платит только чистую разницу фиксиров
   const world = createWorld();
   const { banks } = localMarket(world);
   const contract = createInterestRateSwap(world, banks[0].id, banks[1].id, "money-area-rub", 10_000_000_00, 600, 12, 3)!;
+  assert.equal(world.collateralPledges.filter((pledge) => pledge.referenceId === contract.id && pledge.status === "active").length, 2);
   world.clock.elapsedMonths = 3;
   const result = settleInterestRateSwap(world, contract.id);
   assert.equal(result.ok, true);
@@ -792,21 +817,116 @@ test("суверенный дефолт и реструктуризация со
   assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
 });
 
+test("профили стран явные, а неизвестная страна получает маркированный fallback", () => {
+  const world = createWorld();
+  const ru = world.countryEconomicProfiles.find((profile) => profile.countryId === "ru")!;
+  const us = world.countryEconomicProfiles.find((profile) => profile.countryId === "us")!;
+  const jp = world.countryEconomicProfiles.find((profile) => profile.countryId === "jp")!;
+  assert.equal(ru.metadata.sourceType, "CALIBRATED");
+  assert.ok(us.population > ru.population);
+  assert.ok(jp.governmentDebtToGdpBps > us.governmentDebtToGdpBps);
+  assert.equal(getCountryEconomicProfile("test-country").metadata.sourceType, "SYNTHETIC_FALLBACK");
+  assert.ok(world.populationCohorts.reduce((sum, cohort) => sum + cohort.populationCount, 0) > 900_000_000);
+});
+
+test("10 млн жителей остаются четырьмя когортами на город, а не миллионами Household", () => {
+  const world = createWorld();
+  const profiles = structuredClone(world.countryEconomicProfiles);
+  profiles.find((profile) => profile.countryId === "ru")!.population = 10_000_000;
+  const cities = createCities(world.goods, profiles);
+  const cohorts = createPopulationCohorts(cities, world.banks, profiles).filter((cohort) => cohort.countryId === "ru");
+  assert.equal(cohorts.reduce((sum, cohort) => sum + cohort.populationCount, 0), 10_000_000);
+  assert.equal(cohorts.length, 12);
+  assert.equal(world.households.length, 100);
+});
+
+test("FX-хедж возникает только при реальной валютной позиции", () => {
+  const world = createWorld();
+  const local = world.funds.find((fund) => fund.currencyId === "RUB" && fund.type === "pension")!;
+  const global = world.funds.find((fund) => fund.currencyId === "USD" && fund.type === "hedge")!;
+  assert.equal(createFxHedgeForFund(world, local), null);
+  const hedge = createFxHedgeForFund(world, global)!;
+  assert.equal(hedge.type, "fx-forward");
+  assert.equal(hedge.decision?.motive, "FX_HEDGE");
+  assert.ok(hedge.decision?.targetExposureMinor);
+});
+
+test("погашенный FX-хедж продлевается с явной связью rollover", () => {
+  const world = createWorld();
+  const fund = world.funds.find((item) => item.currencyId === "USD" && item.type === "hedge")!;
+  const first = createFxHedgeForFund(world, fund)!;
+  runMonths(world, 7);
+  const rolled = world.derivativeContracts.find((contract) => contract.decision?.rolledFromId === first.id);
+  assert.equal(first.status, "matured");
+  assert.ok(rolled);
+  assert.equal(first.decision?.rolledToId, rolled?.id);
+  assert.equal(rolled?.decision?.motive, "FX_HEDGE");
+});
+
+test("прайм-брокер принимает позицию в лимите и отклоняет чрезмерную", () => {
+  const world = createWorld();
+  const fund = world.funds.find((item) => item.type === "hedge")!;
+  const primeBrokerId = fund.primeBrokerIds[0];
+  assert.equal(approvePrimeBrokerCapacity(world, fund.id, primeBrokerId, 100_000).approved, true);
+  assert.equal(approvePrimeBrokerCapacity(world, fund.id, primeBrokerId, 1_000_000_000_000).approved, false);
+  runAutonomousDerivativeDecisions(world);
+  const trs = world.derivativeContracts.find((contract) => contract.type === "total-return-swap" && contract.decision?.initiatedById === fund.id);
+  assert.ok(trs);
+  assert.ok(trs?.counterpartyIds.some((id) => fund.primeBrokerIds.includes(id)));
+  assert.ok(fund.primeBrokerIds.includes(String(trs?.decision?.decisionInputs.primeBrokerId)));
+});
+
+test("автономный фонд покупает защиту, платит премию и оставляет реальную delta-заявку", () => {
+  const world = createWorld();
+  const premiumBefore = world.ledger.transactions.filter((transaction) => transaction.kind === "DERIVATIVE_PREMIUM").length;
+  const created = runAutonomousDerivativeDecisions(world);
+  assert.ok(created > 0);
+  assert.ok(world.derivativeContracts.some((contract) => contract.type === "option" && contract.decision?.motive === "EQUITY_HEDGE"));
+  assert.ok(world.derivativeContracts.some((contract) => contract.type === "option" && contract.decision?.motive === "COVERED_INCOME"));
+  assert.ok(world.ledger.transactions.filter((transaction) => transaction.kind === "DERIVATIVE_PREMIUM").length > premiumBefore);
+  const hedgeFund = world.funds.find((fund) => fund.type === "hedge")!;
+  const brokerageIds = new Set(world.brokerageAccounts.filter((account) => account.ownerId === hedgeFund.id).map((account) => account.id));
+  assert.ok([...world.marketOrders, ...world.archivedMarketOrders].some((order) => brokerageIds.has(order.brokerageAccountId)));
+});
+
+test("трёхуровневый реестр сохраняет важную операцию и баланс сжатых групп", () => {
+  const world = createWorld();
+  const playerId = world.player.householdId;
+  const transactionId = postTransaction(world, "LOAN_DEFAULT", "Проверка важной операции", [
+    { accountId: accountIds.operatingExpense(playerId), side: "debit", amountCents: 10_000 },
+    { accountId: accountIds.openingEquity(playerId), side: "credit", amountCents: 10_000 },
+  ]);
+  runMonths(world, 12);
+  compactLedgerHistory(world);
+  assert.ok(world.history.importantLedgerTransactions.some((transaction) => transaction.id === transactionId));
+  assert.ok(world.history.compactedLedgerRecords.length > 0);
+  assert.ok(world.history.compactedLedgerRecords.every((record) => record.totalDebitMinor === record.totalCreditMinor));
+});
+
+test("калибровка считает ошибки и направление тренда", () => {
+  const result = compareCalibrationSeries({ id: "ru-gdp", countryId: "ru", metric: "gdp", months: [0, 1, 2], values: [100, 110, 105], metadata: { sourceType: "ESTIMATED", baseYear: 2024 } }, new Map([[0, 100], [1, 108], [2, 104]]));
+  assert.equal(result.observations, 3);
+  assert.ok(result.rootMeanSquaredError > 0);
+  assert.equal(result.trendDirectionAccuracyBps, 10_000);
+});
+
 test("автономный мир проходит 20 лет с архивированием истории", { timeout: 90_000 }, () => {
   const world = createWorld();
-  const { exchange, listing, banks } = localMarket(world);
-  createFuture(world, banks[0].id, banks[1].id, { kind: "equity", securityId: listing.securityId }, exchange.id, 2, 10, 120);
-  createInterestRateSwap(world, banks[0].id, banks[1].id, "money-area-rub", 10_000_000_00, 700, 120, 3);
   const started = Date.now();
   runMonths(world, 240);
   const elapsedMs = Date.now() - started;
   assert.equal(world.clock.elapsedMonths, 240);
-  assert.equal(world.metricsHistory.length, 240);
+  assert.ok(world.metricsHistory.length <= world.history.policy.detailedMetricMonths);
+  assert.equal(world.history.globalSeries.months.length + world.metricsHistory.length, 240);
   assert.ok(world.ledgerArchives.length > 0);
   assert.ok(world.diagnostics.ledgerArchivedTransactions > world.diagnostics.ledgerHotTransactions);
+  assert.ok(world.history.compactedLedgerRecords.length > 0);
+  assert.ok(world.derivativeContracts.length + world.history.compactedDerivativeRecords.length > 20);
+  assert.ok(world.derivativeContracts.some((contract) => contract.decision));
   assert.ok(world.events.some((event) => event.type === "CompanyBankrupt"));
   assert.ok(world.events.some((event) => event.type === "CompanyFounded"));
   assert.ok(world.companies.length >= 100);
+  assert.ok(world.diagnostics.estimatedSaveBytes < 25_000_000);
   assert.ok(elapsedMs < 60_000, `20 лет рассчитаны за ${elapsedMs} мс`);
   assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
 });

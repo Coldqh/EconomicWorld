@@ -18,6 +18,23 @@ export interface MonetaryArea {
   memberCountryIds: string[];
 }
 
+export type BaselineSourceType = "CALIBRATED" | "REAL_DATA" | "ESTIMATED" | "SYNTHETIC_FALLBACK";
+
+export interface BaselineMetadata {
+  sourceType: BaselineSourceType;
+  baseYear: number;
+  sourceNote?: string;
+  fieldSources?: Record<string, BaselineSourceType>;
+}
+
+export interface MonetaryAreaEconomicProfile {
+  monetaryAreaId: string;
+  policyRateBps: number;
+  inflationTargetBps: number;
+  reserveRequirementBps: number;
+  metadata: BaselineMetadata;
+}
+
 export interface BankAccount {
   id: string;
   ownerId: string;
@@ -186,6 +203,88 @@ export interface LedgerArchiveSegment {
   debitCents: number;
   creditCents: number;
   kindCounts: Partial<Record<TransactionKind, number>>;
+}
+
+export interface CompactedLedgerRecord {
+  id: string;
+  fromMonth: number;
+  toMonth: number;
+  sourceAccountGroup: string;
+  destinationAccountGroup: string;
+  currencyId: string;
+  totalDebitMinor: number;
+  totalCreditMinor: number;
+  transactionCount: number;
+  category: TransactionKind;
+  accountGroupNetFlows: Record<string, number>;
+  checksum: string;
+}
+
+export interface CompactedDerivativeRecord {
+  id: string;
+  type: DerivativeContract["type"];
+  counterpartyGroups: [string, string];
+  notionalMinor: number;
+  currencyId: string;
+  openedAtMonth: number;
+  closedAtMonth: number;
+  realizedPnlMinor: number;
+  motive: DerivativeMotive | null;
+  defaulted: boolean;
+  rolledToId: string | null;
+}
+
+export interface CompactedMarketRecord {
+  elapsedMonth: number;
+  securityId: string;
+  orderCount: number;
+  tradeCount: number;
+  volume: number;
+  turnoverMinor: number;
+}
+
+export interface CompactCompanyAnnualRecord {
+  companyId: string;
+  year: number;
+  revenueMinor: number;
+  netIncomeMinor: number;
+  assetsMinor: number;
+  liabilitiesMinor: number;
+  equityMinor: number;
+}
+
+export interface CompactEventRecord {
+  elapsedMonth: number;
+  type: EventType;
+  count: number;
+}
+
+export interface CompactNumericSeries {
+  months: number[];
+  columns: Record<string, number[]>;
+}
+
+export interface HistoryRetentionPolicy {
+  hotLedgerMonths: number;
+  detailedArchiveMonths: number;
+  playerDetailMonths: number;
+  marketDetailMonths: number;
+  companyReportMonths: number;
+  detailedMetricMonths: number;
+  derivativeDetailMonths: number;
+}
+
+export interface HistoryState {
+  policy: HistoryRetentionPolicy;
+  importantLedgerTransactions: LedgerTransaction[];
+  compactedLedgerRecords: CompactedLedgerRecord[];
+  compactedDerivativeRecords: CompactedDerivativeRecord[];
+  compactedMarketRecords: CompactedMarketRecord[];
+  companyAnnualRecords: CompactCompanyAnnualRecord[];
+  compactedEventRecords: CompactEventRecord[];
+  globalSeries: CompactNumericSeries;
+  countrySeries: Record<string, CompactNumericSeries>;
+  lastCompactedMonth: number;
 }
 
 export interface SimulationClock {
@@ -650,6 +749,44 @@ export interface Country {
   industries: string[];
 }
 
+export interface CountryEconomicProfile {
+  countryId: string;
+  baseYear: number;
+  population: number;
+  workingAgeShareBps: number;
+  populationGrowthBps: number;
+  dependencyRatioBps: number;
+  baselineNominalGdpMinor: number;
+  baselineRealGdpIndexBps: number;
+  inflationBps: number;
+  unemploymentBps: number;
+  governmentDebtToGdpBps: number;
+  budgetBalanceToGdpBps: number;
+  averageDebtMaturityMonths: number;
+  monetaryAreaId: string;
+  incomeLevel: "upper-middle" | "high";
+  householdDebtToGdpBps: number;
+  privateCreditToGdpBps: number;
+  industryWeightsBps: Record<string, number>;
+  taxProfile: {
+    incomeTaxBps: number;
+    consumptionTaxBps: number;
+    corporateTaxBps: number;
+    propertyTaxBps: number;
+  };
+  governmentSpendingShareBps: number;
+  publicInvestmentShareBps: number;
+  educationSpendingShareBps: number;
+  savingsRateBps: number;
+  housingCostIndexBps: number;
+  housingVacancyBps: number;
+  productivityIndexBps: number;
+  bankingDepthBps: number;
+  bankConcentrationBps: number;
+  depositInsuranceCoverageMinor: number;
+  metadata: BaselineMetadata;
+}
+
 export interface City {
   id: string;
   countryId: string;
@@ -810,7 +947,7 @@ export interface PopulationCohort {
   ageBand: "18-24" | "25-34" | "35-49" | "50-64" | "65+";
   education: Person["educationLevel"];
   occupationFamily: Occupation["family"];
-  incomeBand: "low" | "middle" | "high";
+  incomeBand: "low" | "middle" | "affluent" | "wealthy";
   householdType: "single" | "couple" | "family";
   populationCount: number;
   employedCount: number;
@@ -820,6 +957,12 @@ export interface PopulationCohort {
   consumptionPreferencesBps: Record<ConsumptionCategory, number>;
   housingDistributionBps: Record<string, number>;
   bankingDistributionBps: Record<string, number>;
+  aggregateWealthCents: number;
+  aggregateDebtCents: number;
+  creditAccessBps: number;
+  savingsRateBps: number;
+  priceSensitivityBps: number;
+  durableStock: { installedUnits: number; averageAgeMonths: number; replacementRateBps: number; premiumShareBps: number };
   lastConsumptionCents: number;
   lastIncomeCents: number;
 }
@@ -866,8 +1009,26 @@ export interface WorldDiagnostics {
   housingUnitsRepresented: number;
   ledgerHotTransactions: number;
   ledgerArchivedTransactions: number;
+  ledgerCompactedTransactions: number;
   estimatedSaveBytes: number;
+  activeDerivativeContracts: number;
+  activeMarketOrders: number;
+  historyRecordCount: number;
+  memoryPressure: "normal" | "elevated" | "high";
+  saveBreakdown: SaveSizeBreakdown;
   deterministicWorkUnits: number;
+}
+
+export interface SaveSizeBreakdown {
+  totalBytes: number;
+  ledgerBytes: number;
+  marketsBytes: number;
+  historyBytes: number;
+  derivativesBytes: number;
+  companiesBytes: number;
+  populationBytes: number;
+  sovereignBytes: number;
+  otherBytes: number;
 }
 
 export interface PlayerMonthlySnapshot {
@@ -1179,6 +1340,8 @@ export interface Fund {
   managementFeeBps: number;
   performanceFeeBps: number;
   mandate: FundMandate;
+  strategyProfileId: InstitutionStrategyProfileId;
+  primeBrokerIds: string[];
   status: "active" | "liquidating" | "closed";
 }
 
@@ -1297,6 +1460,23 @@ export type UnderlyingReference =
   | { kind: "interest-rate"; monetaryAreaId: string }
   | { kind: "credit"; obligationId: string };
 
+export type DerivativeMotive = "FX_HEDGE" | "RATE_HEDGE" | "EQUITY_HEDGE" | "COVERED_INCOME" | "SPECULATION" | "RELATIVE_VALUE" | "FUNDING" | "SYNTHETIC_EXPOSURE" | "CREDIT_HEDGE" | "RISK_TRANSFER";
+
+export type InstitutionStrategyProfileId = "PENSION_CONSERVATIVE" | "INDEX_FUND" | "ACTIVE_LONG_ONLY" | "HEDGE_RELATIVE_VALUE" | "HEDGE_MACRO" | "BANK_ALM" | "CORPORATE_TREASURY";
+
+export interface DerivativeDecisionMetadata {
+  motive: DerivativeMotive;
+  initiatedById: string;
+  strategyProfileId: InstitutionStrategyProfileId;
+  targetExposureMinor: number;
+  expectedBenefitMinor: number;
+  expectedCostMinor: number;
+  hedgeRatioBps: number;
+  decisionInputs: Record<string, number | string | boolean>;
+  rolledFromId?: string;
+  rolledToId?: string;
+}
+
 export interface DerivativeCollateralTerms {
   initialMarginBps: number;
   maintenanceMarginBps: number;
@@ -1325,6 +1505,7 @@ interface DerivativeContractBase {
   ccpId: string | null;
   lastMarkMinor: number;
   transactionIds: string[];
+  decision?: DerivativeDecisionMetadata;
 }
 
 export interface ForwardContract extends DerivativeContractBase {
@@ -1661,8 +1842,8 @@ export interface MacroMonthlyPoint extends CountryMacroState {
 export type SimulationScenario = "baseline" | "high-demand" | "supply-constraint" | "high-rates" | "bank-liquidity-stress";
 
 export interface WorldState {
-  schemaVersion: 6;
-  saveVersion: 6;
+  schemaVersion: 7;
+  saveVersion: 7;
   seed: string;
   scenario: SimulationScenario;
   clock: SimulationClock;
@@ -1694,6 +1875,8 @@ export interface WorldState {
   nextFundingId: number;
   nextCompanyId: number;
   countries: Country[];
+  countryEconomicProfiles: CountryEconomicProfile[];
+  monetaryAreaProfiles: MonetaryAreaEconomicProfile[];
   cities: City[];
   universities: University[];
   universityPrograms: UniversityProgram[];
@@ -1705,6 +1888,7 @@ export interface WorldState {
   firmCohorts: FirmCohort[];
   fidelity: FidelityState;
   ledgerArchives: LedgerArchiveSegment[];
+  history: HistoryState;
   diagnostics: WorldDiagnostics;
   nextMaterializedPersonId: number;
   nextPropertyId: number;
