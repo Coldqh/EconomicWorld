@@ -1,4 +1,4 @@
-import type { BaselineMetadata } from "../domain/model.ts";
+import type { BaselineMetadata, CalibratedParameterSet } from "../domain/model.ts";
 
 export interface ReferenceSeries {
   id: string;
@@ -7,6 +7,63 @@ export interface ReferenceSeries {
   months: number[];
   values: number[];
   metadata: BaselineMetadata;
+  years?: number[];
+  frequency?: "annual" | "quarterly" | "monthly";
+}
+
+export function absoluteCalendarMonth(year: number, month = 1): number {
+  return year * 12 + month - 1;
+}
+
+export function elapsedMonthForCalendarPeriod(startYear: number, startMonth: number, year: number, month = 1): number {
+  return absoluteCalendarMonth(year, month) - absoluteCalendarMonth(startYear, startMonth);
+}
+
+export function alignReferenceSeriesToWorld(reference: ReferenceSeries, startYear: number, startMonth: number): ReferenceSeries {
+  if (!reference.years?.length) return { ...reference, months: [...reference.months], values: [...reference.values] };
+  const periodMonths = reference.frequency === "quarterly" ? reference.months.map((month) => month % 12 + 1) : reference.frequency === "monthly" ? reference.months.map((month) => month % 12 + 1) : reference.years.map(() => 12);
+  return { ...reference, months: reference.years.map((year, index) => elapsedMonthForCalendarPeriod(startYear, startMonth, year, periodMonths[index])), values: [...reference.values] };
+}
+
+export interface CalibrationSearchResult {
+  bestParameters: CalibratedParameterSet;
+  baselineParameters: CalibratedParameterSet;
+  trainingErrorBps: number;
+  validationErrorBps: number;
+  baselineTrainingErrorBps: number;
+  iterations: number;
+}
+
+export type CalibrationObjective = (parameters: CalibratedParameterSet, split: "training" | "validation") => number;
+
+const PARAMETER_BOUNDS: Record<keyof CalibratedParameterSet, readonly [number, number, number]> = {
+  consumptionIncomeElasticityBps: [6_000, 12_000, 500], investmentRateSensitivityBps: [1_500, 8_000, 500], priceAdjustmentSpeedBps: [400, 3_000, 200], wageAdjustmentSpeedBps: [300, 2_200, 150], creditDemandSensitivityBps: [2_000, 8_500, 500], employmentAdjustmentSpeedBps: [250, 2_000, 125],
+};
+
+export function searchCalibratedParameters(initial: CalibratedParameterSet, objective: CalibrationObjective, passes = 2): CalibrationSearchResult {
+  let best = { ...initial };
+  const baselineTrainingErrorBps = objective(initial, "training");
+  let bestTraining = baselineTrainingErrorBps;
+  let iterations = 1;
+  for (let pass = 0; pass < passes; pass += 1) {
+    for (const key of Object.keys(PARAMETER_BOUNDS) as Array<keyof CalibratedParameterSet>) {
+      const [minimum, maximum, baseStep] = PARAMETER_BOUNDS[key];
+      const step = Math.max(1, Math.round(baseStep / (pass + 1)));
+      const candidates = [best[key] - step, best[key] + step, minimum, maximum].map((value) => Math.max(minimum, Math.min(maximum, value)));
+      for (const value of [...new Set(candidates)]) {
+        const candidate = { ...best, [key]: value };
+        const training = objective(candidate, "training");
+        iterations += 1;
+        const regularization = Math.round(Math.abs(value - initial[key]) * 20 / Math.max(1, maximum - minimum));
+        if (training + regularization < bestTraining) { best = candidate; bestTraining = training + regularization; }
+      }
+    }
+  }
+  return { bestParameters: best, baselineParameters: { ...initial }, trainingErrorBps: bestTraining, validationErrorBps: objective(best, "validation"), baselineTrainingErrorBps, iterations };
+}
+
+export function simulatedMetricSeries(metric: string, points: readonly { elapsedMonth: number; gdpGrowthBps: number; inflationBps: number; unemploymentBps: number; creditToGdpBps: number }[]): ReadonlyMap<number, number> {
+  return new Map(points.map((point) => [point.elapsedMonth, metric === "gdpGrowthBps" ? point.gdpGrowthBps : metric === "inflationBps" ? point.inflationBps : metric === "unemploymentBps" ? point.unemploymentBps : metric === "creditToGdpBps" ? point.creditToGdpBps : 0]));
 }
 
 export interface CalibrationResult {
@@ -76,8 +133,8 @@ export function compareCalibrationSeries(reference: ReferenceSeries, simulated: 
 export function splitReferenceSeries(reference: ReferenceSeries, trainingShareBps = 7_000): { training: ReferenceSeries; validation: ReferenceSeries } {
   const splitAt = Math.max(1, Math.min(reference.months.length - 1, Math.floor(reference.months.length * trainingShareBps / 10_000)));
   return {
-    training: { ...reference, id: `${reference.id}:training`, months: reference.months.slice(0, splitAt), values: reference.values.slice(0, splitAt) },
-    validation: { ...reference, id: `${reference.id}:validation`, months: reference.months.slice(splitAt), values: reference.values.slice(splitAt) },
+    training: { ...reference, id: `${reference.id}:training`, months: reference.months.slice(0, splitAt), years: reference.years?.slice(0, splitAt), values: reference.values.slice(0, splitAt) },
+    validation: { ...reference, id: `${reference.id}:validation`, months: reference.months.slice(splitAt), years: reference.years?.slice(splitAt), values: reference.values.slice(splitAt) },
   };
 }
 

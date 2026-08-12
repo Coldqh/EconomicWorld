@@ -1,4 +1,6 @@
 import type { BaselineSourceType } from "../../domain/model.ts";
+import { baselineRatePpm, convertMinorAtRate } from "../../finance/currencies.ts";
+import { HISTORICAL_MACRO_OBSERVATIONS, historicalNominalScale } from "./historical-baselines.ts";
 
 export interface SourceMetadata {
   source: string;
@@ -24,6 +26,13 @@ export interface CountryDataPack {
   reservesUsd: number;
   urbanizationBps: number;
   workingAgeShareBps: number;
+  governmentDebtToGdpBps: number;
+  privateCreditToGdpBps: number;
+  bankingAssetsToGdpBps: number;
+  savingsRateBps: number;
+  labourParticipationBps: number;
+  employmentElasticityBps: number;
+  tradeOpennessBps: number;
   sources: Record<string, SourceMetadata>;
 }
 
@@ -42,6 +51,20 @@ const sources = (): Record<string, SourceMetadata> => ({
   reservesUsd: wdi("FI.RES.TOTL.CD", "current USD", "USD"), urbanizationBps: estimated("basis points"), workingAgeShareBps: estimated("basis points"),
 });
 
+const STRUCTURAL_BASELINES: Record<string, Pick<CountryDataPack, "governmentDebtToGdpBps" | "privateCreditToGdpBps" | "bankingAssetsToGdpBps" | "savingsRateBps" | "labourParticipationBps" | "employmentElasticityBps">> = {
+  ru: { governmentDebtToGdpBps: 2_050, privateCreditToGdpBps: 6_000, bankingAssetsToGdpBps: 10_500, savingsRateBps: 2_800, labourParticipationBps: 6_200, employmentElasticityBps: 3_800 },
+  de: { governmentDebtToGdpBps: 6_300, privateCreditToGdpBps: 8_500, bankingAssetsToGdpBps: 14_000, savingsRateBps: 2_900, labourParticipationBps: 6_100, employmentElasticityBps: 3_300 },
+  fr: { governmentDebtToGdpBps: 11_000, privateCreditToGdpBps: 10_500, bankingAssetsToGdpBps: 17_000, savingsRateBps: 2_600, labourParticipationBps: 5_600, employmentElasticityBps: 3_500 },
+  gb: { governmentDebtToGdpBps: 10_100, privateCreditToGdpBps: 13_000, bankingAssetsToGdpBps: 20_000, savingsRateBps: 1_900, labourParticipationBps: 6_300, employmentElasticityBps: 4_200 },
+  us: { governmentDebtToGdpBps: 12_200, privateCreditToGdpBps: 18_000, bankingAssetsToGdpBps: 18_500, savingsRateBps: 1_850, labourParticipationBps: 6_270, employmentElasticityBps: 4_800 },
+  jp: { governmentDebtToGdpBps: 25_200, privateCreditToGdpBps: 18_500, bankingAssetsToGdpBps: 23_000, savingsRateBps: 3_100, labourParticipationBps: 6_250, employmentElasticityBps: 2_200 },
+  ca: { governmentDebtToGdpBps: 10_700, privateCreditToGdpBps: 17_000, bankingAssetsToGdpBps: 21_000, savingsRateBps: 2_200, labourParticipationBps: 6_550, employmentElasticityBps: 4_100 },
+  it: { governmentDebtToGdpBps: 14_000, privateCreditToGdpBps: 8_000, bankingAssetsToGdpBps: 13_500, savingsRateBps: 2_750, labourParticipationBps: 4_950, employmentElasticityBps: 2_700 },
+  es: { governmentDebtToGdpBps: 10_500, privateCreditToGdpBps: 9_000, bankingAssetsToGdpBps: 14_000, savingsRateBps: 2_100, labourParticipationBps: 5_850, employmentElasticityBps: 4_600 },
+  nl: { governmentDebtToGdpBps: 4_600, privateCreditToGdpBps: 16_000, bankingAssetsToGdpBps: 22_000, savingsRateBps: 3_000, labourParticipationBps: 6_700, employmentElasticityBps: 3_900 },
+  kr: { governmentDebtToGdpBps: 5_100, privateCreditToGdpBps: 20_000, bankingAssetsToGdpBps: 19_000, savingsRateBps: 3_400, labourParticipationBps: 6_450, employmentElasticityBps: 3_600 },
+};
+
 export const REAL_COUNTRY_PACKS: CountryDataPack[] = [
   ["ru","RUS",143826130,2046284838151.09,587,308,465937815839.194,379986343205.999,597217063819.197,7540,6700],
   ["de","DEU",83287273,4562207532490.28,595,307,1960255682615.72,1779045873341.21,322699586274.527,7780,6480],
@@ -54,10 +77,15 @@ export const REAL_COUNTRY_PACKS: CountryDataPack[] = [
   ["es","ESP",48352528,1619481980719.64,353,1218,612433794394.128,550315993015.696,103088315527.743,8100,6500],
   ["nl","NLD",17877117,1135475867551,384,354,993383113411.782,880497587437.271,69829689143.2849,9290,6570],
   ["kr","KOR",51712619,1844800934391.54,360,268,762299062736.35,755197457229.567,420930029064.025,8150,7100],
-].map(([countryId, iso3, population, nominalGdpUsd, inflationBps, unemploymentBps, exportsUsd, importsUsd, reservesUsd, urbanizationBps, workingAgeShareBps]) => ({
-  countryId: String(countryId), iso3: String(iso3), population: Number(population), nominalGdpUsd: Number(nominalGdpUsd), inflationBps: Number(inflationBps), unemploymentBps: Number(unemploymentBps),
-  exportsUsd: Number(exportsUsd), importsUsd: Number(importsUsd), reservesUsd: Number(reservesUsd), urbanizationBps: Number(urbanizationBps), workingAgeShareBps: Number(workingAgeShareBps), sources: sources(),
-}));
+].map(([countryId, iso3, population, nominalGdpUsd, inflationBps, unemploymentBps, exportsUsd, importsUsd, reservesUsd, urbanizationBps, workingAgeShareBps]) => {
+  const id = String(countryId);
+  const structure = STRUCTURAL_BASELINES[id];
+  return {
+    countryId: id, iso3: String(iso3), population: Number(population), nominalGdpUsd: Number(nominalGdpUsd), inflationBps: Number(inflationBps), unemploymentBps: Number(unemploymentBps),
+    exportsUsd: Number(exportsUsd), importsUsd: Number(importsUsd), reservesUsd: Number(reservesUsd), urbanizationBps: Number(urbanizationBps), workingAgeShareBps: Number(workingAgeShareBps),
+    ...structure, tradeOpennessBps: Math.round((Number(exportsUsd) + Number(importsUsd)) * 10_000 / Number(nominalGdpUsd)), sources: sources(),
+  };
+});
 
 export const REAL_ENTITY_NAMES: Record<string, { banks: string[]; companies: string[] }> = {
   ru: { banks: ["Сбербанк", "ВТБ"], companies: ["Газпром", "Яндекс"] }, de: { banks: ["Deutsche Bank", "Commerzbank"], companies: ["Siemens", "SAP"] },
@@ -68,15 +96,24 @@ export const REAL_ENTITY_NAMES: Record<string, { banks: string[]; companies: str
   kr: { banks: ["KB Kookmin Bank", "Shinhan Bank"], companies: ["Samsung Electronics", "Hyundai Motor"] },
 };
 
-export function applyCountryPackToProfiles<T extends { countryId: string; population: number; baselineNominalGdpMinor: number; inflationBps: number; unemploymentBps: number; workingAgeShareBps: number; metadata: { sourceType: BaselineSourceType; baseYear: number; sourceNote?: string } }>(profiles: T[]): void {
+const COUNTRY_CURRENCY: Record<string, string> = { ru: "RUB", de: "EUR", fr: "EUR", gb: "GBP", us: "USD", jp: "JPY", ca: "CAD", it: "EUR", es: "EUR", nl: "EUR", kr: "KRW" };
+
+export function applyCountryPackToProfiles<T extends { countryId: string; population: number; baselineNominalGdpMinor: number; inflationBps: number; unemploymentBps: number; workingAgeShareBps: number; governmentDebtToGdpBps: number; privateCreditToGdpBps: number; bankingDepthBps: number; savingsRateBps: number; metadata: { sourceType: BaselineSourceType; baseYear: number; sourceNote?: string } }>(profiles: T[], referenceYear = 2023): void {
   for (const profile of profiles) {
     const pack = REAL_COUNTRY_PACKS.find((item) => item.countryId === profile.countryId);
     if (!pack) continue;
     profile.population = pack.population;
-    profile.baselineNominalGdpMinor = Math.round(pack.nominalGdpUsd * 100);
-    profile.inflationBps = pack.inflationBps;
-    profile.unemploymentBps = pack.unemploymentBps;
+    const currencyId = COUNTRY_CURRENCY[profile.countryId] ?? "USD";
+    const usdMinor = Math.round(pack.nominalGdpUsd * historicalNominalScale(profile.countryId, referenceYear) * 100);
+    profile.baselineNominalGdpMinor = convertMinorAtRate(usdMinor, "USD", currencyId, baselineRatePpm("USD", currencyId));
+    const historical = HISTORICAL_MACRO_OBSERVATIONS[profile.countryId]?.find((item) => item.year === referenceYear);
+    profile.inflationBps = historical?.inflationBps ?? pack.inflationBps;
+    profile.unemploymentBps = historical?.unemploymentBps ?? pack.unemploymentBps;
     profile.workingAgeShareBps = pack.workingAgeShareBps;
-    profile.metadata = { sourceType: "REAL_DATA", baseYear: 2023, sourceNote: "World Bank WDI, статический нормализованный набор v1" };
+    profile.governmentDebtToGdpBps = pack.governmentDebtToGdpBps;
+    profile.privateCreditToGdpBps = pack.privateCreditToGdpBps;
+    profile.bankingDepthBps = pack.bankingAssetsToGdpBps;
+    profile.savingsRateBps = pack.savingsRateBps;
+    profile.metadata = { sourceType: historical || referenceYear === 2023 ? "REAL_DATA" : "ESTIMATED", baseYear: referenceYear, sourceNote: historical ? `World Bank WDI, исторический baseline ${referenceYear}` : `World Bank WDI 2023, обратная оценка baseline ${referenceYear}` };
   }
 }

@@ -45,17 +45,31 @@ function migrateMetric(metric: Partial<MetricPoint>, world: WorldState): MetricP
 
 export function migrateWorldState(raw: unknown): WorldState {
   const legacy = structuredClone(raw) as LegacyWorld;
-  if ((legacy.schemaVersion ?? 1) > 8 || (legacy.saveVersion ?? 1) > 8) {
+  if ((legacy.schemaVersion ?? 1) > 9 || (legacy.saveVersion ?? 1) > 9) {
     throw new Error("Сохранение создано более новой версией приложения");
   }
-  if (legacy.schemaVersion === 8 && legacy.saveVersion === 8) return legacy as WorldState;
+  if (legacy.schemaVersion === 9 && legacy.saveVersion === 9) return legacy as WorldState;
+  if (legacy.schemaVersion === 8 && legacy.saveVersion === 8) {
+    const template = createWorld();
+    return {
+      ...legacy,
+      schemaVersion: 9 as const,
+      saveVersion: 9 as const,
+      baselineReference: { ...template.baselineReference, ...(legacy.baselineReference ?? {}), replayObservedExternalShocks: false },
+      companies: (legacy.companies ?? template.companies).map((company) => ({ ...company, baselineFinancials: null })),
+      banks: (legacy.banks ?? template.banks).map((bank) => ({ ...bank, baselineFinancials: null })),
+      firmCohorts: (legacy.firmCohorts ?? template.firmCohorts).map((cohort) => ({ ...template.firmCohorts.find((item) => item.id === cohort.id), ...cohort })),
+      countryScaleReconciliations: [], realWorldInitializationReports: [], tradeSectors: [], logisticsSectors: [], bankingSectorCohorts: [], sovereignHolderCohorts: [],
+      calibratedParameters: template.calibratedParameters, countryCalibratedParameters: {}, policyInterventions: [], macroContributionEvents: [], physicalCommodityFlows: [], externalClaims: [],
+    } as WorldState;
+  }
   if (legacy.schemaVersion === 7 && legacy.saveVersion === 7) {
     const template = createWorld();
     const migrated = {
       ...template,
       ...legacy,
-      schemaVersion: 8 as const,
-      saveVersion: 8 as const,
+      schemaVersion: 9 as const,
+      saveVersion: 9 as const,
       baselineReference: template.baselineReference,
       companies: (legacy.companies ?? template.companies).map((company) => ({ ...company, globalInputConstraintBps: company.globalInputConstraintBps ?? 10_000 })),
       history: {
@@ -80,8 +94,8 @@ export function migrateWorldState(raw: unknown): WorldState {
   const world = {
     ...template,
     ...legacy,
-    schemaVersion: 8 as const,
-    saveVersion: 8 as const,
+    schemaVersion: 9 as const,
+    saveVersion: 9 as const,
     goods: template.goods.map((good) => ({ ...good, ...(legacy.goods?.find((item) => item.id === good.id) ?? {}), essential: good.essential })),
     countries: template.countries.map((base) => ({ ...base, ...(legacy.countries?.find((item) => item.id === base.id) ?? {}) })),
     cities: template.cities.map((base) => ({ ...base, ...(legacy.cities?.find((item) => item.id === base.id) ?? {}) })),

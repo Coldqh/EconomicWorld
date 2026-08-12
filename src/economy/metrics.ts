@@ -1,5 +1,5 @@
 import { calculateNationalAccounts } from "../accounting/national-accounts.ts";
-import { bankAccountBalance, sumAccounts } from "../core/ledger.ts";
+import { bankAccountBalance, sumAccountsByCategoryInstrument } from "../core/ledger.ts";
 import type { CountryMetricPoint, MetricPoint, WorldState } from "../domain/model.ts";
 
 function averagePriceForGood(world: WorldState, goodId: string): number {
@@ -27,7 +27,7 @@ export function collectMetrics(world: WorldState): MetricPoint {
   const annualInflationBps = twelveMonthsAgo?.cpiBps ? Math.round(((cpiBps - twelveMonthsAgo.cpiBps) * 10_000) / twelveMonthsAgo.cpiBps) : 0;
   const employedHouseholds = world.households.filter((household) => household.employerId).length;
   const unemploymentBps = Math.round(((world.households.length - employedHouseholds) * 10_000) / Math.max(1, world.households.length));
-  const depositMoneyCents = sumAccounts(world, (account) => account.category === "asset" && account.instrument === "deposit");
+  const depositMoneyCents = sumAccountsByCategoryInstrument(world, "asset", "deposit");
   const loanStockCents = world.loans.filter((loan) => loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
   const national = calculateNationalAccounts(world);
   const realGdpGrowthBps = previous?.realGdpCents ? Math.round(((national.realGdpCents - previous.realGdpCents) * 10_000) / previous.realGdpCents) : 0;
@@ -101,7 +101,10 @@ export function collectCountryMetrics(world: WorldState): CountryMetricPoint[] {
     const companies = world.companies.filter((company) => company.headquartersCountryId === country.id);
     const households = world.households.filter((household) => world.cities.find((city) => city.id === household.cityId)?.countryId === country.id);
     const cohorts = world.populationCohorts.filter((cohort) => cohort.countryId === country.id);
-    const nominalGdpMinor = companies.reduce((sum, company) => sum + Math.max(0, company.lastGrossRevenueCents - company.lastIntermediateConsumptionCents), 0);
+    const reconciliation = world.countryScaleReconciliations.find((item) => item.countryId === country.id);
+    const explicitCurrent = companies.reduce((sum, company) => sum + Math.max(0, company.lastGrossRevenueCents - company.lastIntermediateConsumptionCents), 0);
+    const cohortValueAdded = world.firmCohorts.filter((item) => item.countryId === country.id).reduce((sum, item) => sum + item.valueAddedMinor, 0);
+    const nominalGdpMinor = reconciliation ? Math.max(1, reconciliation.explicitCompanyValueAddedMinor + cohortValueAdded + reconciliation.publicOtherValueAddedMinor + reconciliation.logisticsValueAddedMinor + Math.round(explicitCurrent * 0.05)) : explicitCurrent;
     const pricePoints = world.cities.filter((city) => city.countryId === country.id).flatMap((city) => Object.entries(city.localPriceByGoodCents));
     const cpiBps = pricePoints.length ? Math.round(pricePoints.reduce((sum, [goodId, price]) => sum + price * 10_000 / Math.max(1, world.goods.find((good) => good.id === goodId)?.basePriceCents ?? price), 0) / pricePoints.length) : 10_000;
     const previous = [...world.countryMetricsHistory].reverse().find((point) => point.countryId === country.id);
@@ -114,7 +117,8 @@ export function collectCountryMetrics(world: WorldState): CountryMetricPoint[] {
     const labourForce = households.length + cohorts.reduce((sum, cohort) => sum + cohort.populationCount, 0);
     const employment = employedNamed + employedAggregate;
     const depositMoneyMinor = world.bankAccounts.filter((account) => country.bankIds.includes(account.bankId) && account.currencyId === country.currencyReference).reduce((sum, account) => sum + bankAccountBalance(world, account.id), 0);
-    const creditMinor = world.loans.filter((loan) => country.bankIds.includes(loan.lenderBankId) && loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
+    const calibratedCredit = world.banks.filter((bank) => bank.countryId === country.id).reduce((sum, bank) => sum + (bank.baselineFinancials?.loansMinor ?? 0), 0) + (world.bankingSectorCohorts.find((item) => item.countryId === country.id)?.loansMinor ?? 0);
+    const creditMinor = calibratedCredit + world.loans.filter((loan) => country.bankIds.includes(loan.lenderBankId) && loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
     return {
       countryId: country.id,
       currencyId: country.currencyReference,
@@ -130,7 +134,7 @@ export function collectCountryMetrics(world: WorldState): CountryMetricPoint[] {
       creditMinor,
       activeCompanies: companies.filter((company) => company.active).length,
       productionMilliUnits: companies.reduce((sum, company) => sum + company.lastProductionMilliUnits, 0),
-      consumptionMinor: households.reduce((sum, household) => sum + Object.values(household.lastSpendingByCategoryCents).reduce((subtotal, value) => subtotal + value, 0), 0),
+      consumptionMinor: reconciliation?.householdConsumptionMinor ?? households.reduce((sum, household) => sum + Object.values(household.lastSpendingByCategoryCents).reduce((subtotal, value) => subtotal + value, 0), 0),
     };
   });
 }

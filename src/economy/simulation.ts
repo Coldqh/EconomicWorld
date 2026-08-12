@@ -239,6 +239,7 @@ function householdBudget(world: WorldState, household: Household): number {
   const desiredReserve = Math.round(monthlyIncome * (1.2 + household.liquidityPreferenceBps / 5_000));
   const spendableStock = Math.max(0, cash - desiredReserve);
   const propensity = household.id === world.player.householdId ? world.player.consumptionBudgetBps : household.consumptionPropensityBps;
+  const consumptionElasticity = world.countryCalibratedParameters[countryIdForCity(world, household.cityId)]?.consumptionIncomeElasticityBps ?? world.calibratedParameters.consumptionIncomeElasticityBps;
   const expectedInflationEffect = clamp(10_000 + household.expectedInflationBps * 0.3, 9_000, 11_500);
   const countryId = countryIdForCity(world, household.cityId);
   const macro = world.countryMacroStates.find((state) => state.countryId === countryId);
@@ -246,7 +247,7 @@ function householdBudget(world: WorldState, household: Household): number {
   const realDepositRateBps = (macro?.depositRateBps ?? 0) - household.expectedInflationBps;
   const rateSavingsEffectBps = clamp(10_000 - Math.max(0, realDepositRateBps) * 0.45, 8_200, 10_500);
   const debtBurdenEffectBps = clamp(10_000 - Math.round(debtService * 4_000 / Math.max(1, monthlyIncome)), 5_500, 10_000);
-  return Math.min(Math.round(cash * 0.22), Math.round(((monthlyIncome * propensity) / 10_000 + spendableStock * 0.06) * expectedInflationEffect / 10_000 * rateSavingsEffectBps / 10_000 * debtBurdenEffectBps / 10_000));
+  return Math.min(Math.round(cash * 0.22), Math.round(((monthlyIncome * propensity * consumptionElasticity) / 100_000_000 + spendableStock * 0.06) * expectedInflationEffect / 10_000 * rateSavingsEffectBps / 10_000 * debtBurdenEffectBps / 10_000));
 }
 
 function chooseSeller(world: WorldState, household: Household, goodId: string): Company | undefined {
@@ -406,7 +407,8 @@ function investInCapital(world: WorldState): void {
     const costOfCapitalBps = macro?.averageLoanRateBps ?? 1_000;
     const demandCoverage = buyer.lastSalesMilliUnits / Math.max(1, buyer.lastProductionMilliUnits);
     const cashBuffer = buyer.wageCents * Math.max(3, buyer.employees.length) * 2;
-    const requiredUtilization = clamp(0.68 + costOfCapitalBps / 40_000 + (macro?.lendingStandardsBps ?? 4_000) / 100_000, 0.72, 0.92);
+    const investmentSensitivity = world.countryCalibratedParameters[buyer.headquartersCountryId]?.investmentRateSensitivityBps ?? world.calibratedParameters.investmentRateSensitivityBps;
+    const requiredUtilization = clamp(0.68 + costOfCapitalBps * investmentSensitivity / 180_000_000 + (macro?.lendingStandardsBps ?? 4_000) / 100_000, 0.72, 0.92);
     if (utilization < requiredUtilization || demandCoverage < 0.58) continue;
     if (depositOf(world, buyer.id) < cashBuffer && (macro?.lendingStandardsBps ?? 10_000) < 7_500) issueLoan(world, buyer.bankId, buyer.id, cashBuffer, 84, Math.round((macro?.lendingStandardsBps ?? 4_000) / 10));
     if (depositOf(world, buyer.id) < cashBuffer) continue;
@@ -436,13 +438,18 @@ function updatePricesAndExpectations(world: WorldState): void {
     const costPressureBps = clamp(Math.round((unitCost * 10_000) / Math.max(1, previous)) - 7_200, -300, 500);
     const demandPressureBps = clamp(Math.round((salesRatio - 0.45) * 1_100), -180, 280);
     const inventoryPressureBps = clamp(Math.round((0.9 - stockRatio) * 260), -220, 220);
-    const changeBps = clamp(costPressureBps + demandPressureBps + inventoryPressureBps, -280, 420);
+    const adjustmentSpeed = world.countryCalibratedParameters[company.headquartersCountryId]?.priceAdjustmentSpeedBps ?? world.calibratedParameters.priceAdjustmentSpeedBps;
+    const changeBps = clamp(Math.round((costPressureBps + demandPressureBps + inventoryPressureBps) * adjustmentSpeed / 1_200), -280, 420);
     company.priceCents = Math.max(Math.round(goodById(world, company.goodId).basePriceCents * 0.45), Math.round(previous * (10_000 + changeBps) / 10_000));
     if (Math.abs(company.priceCents - previous) / previous >= 0.015) emitSimpleEvent(world, "PriceChanged", "Цена изменена", company.name, [company.id], changeBps > 0 ? "attention" : "info", [], { previousPriceCents: previous, priceCents: company.priceCents, costPressureBps, demandPressureBps, inventoryPressureBps });
   }
   const latestInflation = world.metricsHistory.at(-1)?.annualInflationBps ?? world.centralBank.inflationTargetBps;
   for (const household of world.households) household.expectedInflationBps = Math.round(household.expectedInflationBps * 0.76 + latestInflation * 0.24);
-  if (isQuarterEnd(world.clock)) for (const company of activeCompanies(world)) company.wageCents = Math.max(20_000_00, Math.round(company.wageCents * (10_000 + clamp(Math.round((latestInflation - world.centralBank.inflationTargetBps) / 4), -100, 180)) / 10_000));
+  if (isQuarterEnd(world.clock)) for (const company of activeCompanies(world)) {
+    const wageSpeed = world.countryCalibratedParameters[company.headquartersCountryId]?.wageAdjustmentSpeedBps ?? world.calibratedParameters.wageAdjustmentSpeedBps;
+    const wageChangeBps = Math.round(clamp(Math.round((latestInflation - world.centralBank.inflationTargetBps) / 4), -100, 180) * wageSpeed / 850);
+    company.wageCents = Math.max(20_000_00, Math.round(company.wageCents * (10_000 + wageChangeBps) / 10_000));
+  }
 }
 
 function updateDistressAndBankruptcies(world: WorldState): void {
@@ -481,6 +488,7 @@ function foundCompanyIfNeeded(world: WorldState): void {
   const securityId = `security-${id}`;
   const boardId = `board-${id}`;
   const company: Company = { id, name: `Новая ${good.shortName} ${world.nextCompanyId}`, goodId: good.id, ownerHouseholdId: founder.id, bankId: founder.bankId, active: true, employees: [], wageCents: founder.reservationWageCents, priceCents: good.basePriceCents, capacityMilliUnits: 80_000, productivityBps: 9_000, inventoryMilliUnits: 0, inventoryValueCents: 0, inputInventoryMilliUnits: Object.fromEntries(world.goods.map((item) => [item.id, 0])), inputInventoryValueCents: Object.fromEntries(world.goods.map((item) => [item.id, 0])), productiveCapital: { acquisitionCostCents: capital, bookValueCents: capital, accumulatedDepreciationCents: 0, usefulLifeMonths: 180, capacityMilliUnits: 80_000 }, retainedEarningsCents: 0, financialReports: [], lastProductionMilliUnits: 0, lastSalesMilliUnits: 0, lastGrossRevenueCents: 0, lastOperatingExpenseCents: 0, lastCogsCents: 0, lastIntermediateConsumptionCents: 0, lastIntermediateConsumptionBaseCents: 0, lastWagesCents: 0, lastDepreciationCents: 0, lastInterestCents: 0, lastTaxCents: 0, lastCapitalInvestmentCents: 0, lastHouseholdSalesCents: 0, lastGovernmentSalesCents: 0, distressMonths: 0, missedPayrollMonths: 0, foundedAtMonth: world.clock.elapsedMonths, closedAtMonth: null, closureReason: null, cityId: founder.cityId, productId: `product-${good.id}-${id}`, technologyBps: 8_000, managementBps: 7_500, learningByDoingBps: 0, qualityBps: 7_000, brandReputationBps: 4_000, marketShareBps: 0, marginalCostCents: Math.round(good.basePriceCents * 0.72), capacityUtilizationBps: 0, occupationFamilyNeeds: { production: 4, management: 1, sales: 1 }, headquartersCountryId: countryId, headquartersCityId: founder.cityId, industry: good.name, representationTier: "A", sizeClass: "small", corporateStatus: "private", equitySecurityId: securityId, boardId, parentCompanyId: null, subsidiaryIds: [], goodwillCents: 0, globalInputConstraintBps: 10_000 };
+  company.baselineFinancials = null;
   world.companies.push(company);
   world.countries.find((country) => country.id === countryId)?.companyIds.push(id);
   world.equitySecurities.push({ id: securityId, companyId: id, className: "Обыкновенные акции", currencyId: world.countries.find((country) => country.id === countryId)!.currencyReference, sharesOutstanding: 100_000, votesPerShare: 1, status: "private" });

@@ -44,7 +44,7 @@ export function createPopulationCohorts(cities: readonly City[], banks: readonly
       incomeBand: profile.income,
       householdType: profile.household,
       populationCount,
-      employedCount: Math.round(populationCount * profile.employed / 10_000),
+      employedCount: Math.round(populationCount * (10_000 - country.unemploymentBps) / 10_000),
       averageMonthlyIncomeCents,
       wealthDistribution: { medianCents: medianWealth, p90Cents: medianWealth * (profileIndex + 3) },
       skillDistribution: Object.fromEntries(SKILLS.map((skill, skillIndex) => [skill, { mean: 1_000 + profileIndex * 550 + (skillIndex % 3) * 120, spread: 450 + profileIndex * 90 }])) as PopulationCohort["skillDistribution"],
@@ -86,6 +86,11 @@ export function createFirmCohorts(cities: readonly City[], banks: readonly Bank[
       inventoryMilliUnits: employment * (180 + industryIndex * 50),
       profitsCents: Math.round(monthlyRevenue * 0.09),
       productivityBps: Math.round(country.productivityIndexBps * (9_300 + industryIndex * 350) / 10_000),
+      populationEquivalent: Math.max(1, Math.round(city.population / Math.max(1, city.majorIndustries.length))),
+      firmCountEquivalent: firmCount,
+      outputScaleBps: 10_000,
+      valueAddedMinor: Math.round(monthlyRevenue * 0.52),
+      intermediateConsumptionMinor: Math.round(monthlyRevenue * 0.48),
     };
   }));
 }

@@ -1,9 +1,16 @@
 import { gdpReconciliationTolerance } from "../accounting/national-accounts.ts";
-import { accountIds, balanceOf, entityBook, sumAccounts } from "../core/ledger.ts";
+import { accountIds, balanceOf, entityBook, sumAccounts, sumAccountsByCategoryInstrument, sumAccountsByCurrencyCategoryInstrument } from "../core/ledger.ts";
 import type { InvariantResult, LedgerAccount, WorldState } from "../domain/model.ts";
 
 function result(section: InvariantResult["section"], id: string, title: string, ok: boolean, detail: string, differenceCents?: number): InvariantResult {
   return { section, id, title, ok, detail, differenceCents };
+}
+
+function monetaryValuesMatch(left: number, right: number): boolean {
+  // REAL_WORLD stocks can exceed Number.MAX_SAFE_INTEGER after aggregation in
+  // low-value currencies.  Individual entries remain integral; this tolerance
+  // only absorbs the few ULPs introduced while summing macro balances.
+  return Math.abs(left - right) <= Math.max(1, Math.ceil(Math.max(Math.abs(left), Math.abs(right)) * Number.EPSILON * 32));
 }
 
 export function checkInvariants(world: WorldState): InvariantResult[] {
@@ -13,13 +20,13 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const mixedCurrencyTransaction = world.ledger.transactions.find((transaction) => new Set(transaction.entries.map((entry) => world.ledger.accounts[entry.accountId]?.currency)).size !== 1);
   results.push(result("Бухгалтерия", "single-currency-legs", "Каждая проводка выражена в одной валюте", !mixedCurrencyTransaction, mixedCurrencyTransaction?.id ?? "FX исполняется двумя связанными ledger-ногами"));
 
-  const depositAssets = sumAccounts(world, (account) => account.category === "asset" && account.instrument === "deposit");
-  const depositLiabilities = sumAccounts(world, (account) => account.category === "liability" && account.instrument === "deposit");
-  results.push(result("Деньги", "deposit-mirror", "Депозиты имеют банковскую сторону", depositAssets === depositLiabilities, `Клиенты / банки: ${(depositAssets / 100).toLocaleString("ru-RU")} ₽`, depositAssets - depositLiabilities));
+  const depositAssets = sumAccountsByCategoryInstrument(world, "asset", "deposit");
+  const depositLiabilities = sumAccountsByCategoryInstrument(world, "liability", "deposit");
+  results.push(result("Деньги", "deposit-mirror", "Депозиты имеют банковскую сторону", monetaryValuesMatch(depositAssets, depositLiabilities), `Клиенты / банки: ${(depositAssets / 100).toLocaleString("ru-RU")} ₽`, depositAssets - depositLiabilities));
   const currencyDepositMismatch = world.currencies.find((currency) => {
-    const assets = sumAccounts(world, (account) => account.currency === currency.id && account.category === "asset" && account.instrument === "deposit");
-    const liabilities = sumAccounts(world, (account) => account.currency === currency.id && account.category === "liability" && account.instrument === "deposit");
-    return assets !== liabilities;
+    const assets = sumAccountsByCurrencyCategoryInstrument(world, currency.id, "asset", "deposit");
+    const liabilities = sumAccountsByCurrencyCategoryInstrument(world, currency.id, "liability", "deposit");
+    return !monetaryValuesMatch(assets, liabilities);
   });
   results.push(result("Деньги", "deposit-mirror-by-currency", "Депозиты сверены по каждой валюте", !currencyDepositMismatch, currencyDepositMismatch?.id ?? `${world.currencies.length} валют сверены`));
 
@@ -50,7 +57,9 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   for (const ownerId of owners) {
     const book = entityBook(world, ownerId);
     const difference = book.assets + book.expenses - book.liabilities - book.equity - book.income;
-    if (difference !== 0) { brokenBook = ownerId; bookDifference = difference; break; }
+    const grossBook = Math.max(Math.abs(book.assets), Math.abs(book.liabilities), Math.abs(book.equity), Math.abs(book.income), Math.abs(book.expenses));
+    const bookTolerance = Math.max(1, Math.ceil(grossBook * Number.EPSILON * 64));
+    if (Math.abs(difference) > bookTolerance) { brokenBook = ownerId; bookDifference = difference; break; }
   }
   results.push(result("Бухгалтерия", "accounting-equation", "Балансовые уравнения выполняются", !brokenBook, brokenBook ? `Не сходится книга ${brokenBook}` : `${owners.length} книг прошли проверку`, bookDifference));
 
@@ -112,7 +121,7 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const brokenUniversity = world.universities.find((university) => !world.cities.some((city) => city.id === university.cityId) || university.programIds.some((id) => !world.universityPrograms.some((program) => program.id === id)));
   results.push(result("Образование", "universities", "Вузы, программы и места согласованы", !brokenProgram && !brokenUniversity, `${world.universities.length} вузов · ${world.universityPrograms.length} программ`));
 
-  const archiveIssue = world.ledgerArchives.find((archive) => archive.debitCents !== archive.creditCents);
+  const archiveIssue = world.ledgerArchives.find((archive) => !monetaryValuesMatch(archive.debitCents, archive.creditCents));
   const budgetIssue = world.fidelity.materializedPersonIds.length > world.fidelity.budgets.maxActivePersons;
   results.push(result("Производительность", "fidelity-budget", "Уровни детализации укладываются в бюджет", !budgetIssue, `${world.fidelity.materializedPersonIds.length}/${world.fidelity.budgets.maxActivePersons} материализованных персон`));
   results.push(result("Бухгалтерия", "ledger-archives", "Архивы реестра сбалансированы", !archiveIssue, `${world.ledgerArchives.length} архивных сегментов`));
@@ -190,8 +199,8 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const brokenClearingMember = world.clearingMemberAccounts.find((account) => !world.clearingHouses.some((house) => house.id === account.clearingHouseId) || account.initialMarginMinor < 0 || account.defaultFundContributionMinor < 0);
   results.push(result("Клиринг", "clearing-positions", "Клиринг сохраняет нулевую сумму позиций", !brokenClearedFuture && !brokenClearingMember, brokenClearedFuture?.id ?? brokenClearingMember?.id ?? `${world.clearingHouses.length} клиринговых домов`));
 
-  const brokenSovereignRegistry = world.sovereignBonds.find((bond) => world.sovereignBondHoldings.filter((holding) => holding.bondId === bond.id).reduce((sum, holding) => sum + holding.faceValueMinor, 0) !== bond.outstandingFaceValueMinor);
-  const brokenGovernmentBudget = world.governmentBudgets.find((budget) => budget.publicDebtMinor !== world.sovereignBonds.filter((bond) => bond.governmentId === budget.governmentId && (bond.status === "active" || bond.status === "restructured")).reduce((sum, bond) => sum + bond.outstandingFaceValueMinor, 0));
+  const brokenSovereignRegistry = world.sovereignBonds.find((bond) => !monetaryValuesMatch(world.sovereignBondHoldings.filter((holding) => holding.bondId === bond.id).reduce((sum, holding) => sum + holding.faceValueMinor, 0), bond.outstandingFaceValueMinor));
+  const brokenGovernmentBudget = world.governmentBudgets.find((budget) => !monetaryValuesMatch(budget.publicDebtMinor, world.sovereignBonds.filter((bond) => bond.governmentId === budget.governmentId && (bond.status === "active" || bond.status === "restructured")).reduce((sum, bond) => sum + bond.outstandingFaceValueMinor, 0)));
   results.push(result("Государственный долг", "sovereign-registry", "Государственный долг сверен с держателями", !brokenSovereignRegistry && !brokenGovernmentBudget, brokenSovereignRegistry?.id ?? brokenGovernmentBudget?.governmentId ?? `${world.sovereignBonds.length} выпусков`));
 
   const brokenYieldCurve = world.countries.find((country) => {
@@ -206,7 +215,7 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   results.push(result("Товары", "resource-conservation", "Добываемые запасы не создаются из ничего", !negativeResource, negativeResource?.id ?? `${world.resourceDeposits.length} месторождений сверены`));
   const badTrade = world.tradeFlows.find((flow) => flow.quantityMilliUnits <= 0 || flow.exporterCountryId === flow.importerCountryId || flow.status === "settled" && flow.paymentTransactionIds.length === 0);
   results.push(result("Товары", "trade-goods-money", "Поставка имеет товарную и денежную ноги", !badTrade, badTrade?.id ?? `${world.tradeFlows.length} поставок сверены`));
-  const brokenBop = world.balanceOfPayments.find((point) => point.currentAccountUsdMinor + point.capitalAccountUsdMinor + point.financialAccountUsdMinor + point.reserveChangeUsdMinor + point.errorsAndOmissionsUsdMinor !== point.reconciliationGapUsdMinor || point.reconciliationGapUsdMinor !== 0);
+  const brokenBop = world.balanceOfPayments.find((point) => point.currentAccountUsdMinor + point.capitalAccountUsdMinor + point.financialAccountUsdMinor + point.reserveChangeUsdMinor + point.errorsAndOmissionsUsdMinor !== point.reconciliationGapUsdMinor || point.reconciliationWarning);
   results.push(result("Национальные счета", "bop-reconciliation", "Платёжный баланс сходится", !brokenBop, brokenBop ? `${brokenBop.countryId}:${brokenBop.elapsedMonth}` : `${world.balanceOfPayments.length} периодов сверены`));
   const overCapacityRoute = world.tradeRoutes.find((route) => route.usedCapacityMilliUnits > route.capacityMilliUnits);
   results.push(result("Товары", "route-capacity", "Логистика не превышает пропускную способность", !overCapacityRoute, overCapacityRoute?.id ?? `${world.tradeRoutes.length} маршрутов`));

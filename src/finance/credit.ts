@@ -3,11 +3,11 @@ import {
   accountIds,
   bankAccountBalance,
   bankAccountsForOwner,
-  balanceOf,
   ensureAccount,
   entityBook,
   openBankAccount,
   postTransaction,
+  sumAccountsByOwnerCategoryInstrument,
 } from "../core/ledger.ts";
 import type { Bank, Loan, WorldState } from "../domain/model.ts";
 import { bankLiquidityRatioBps } from "./liquidity.ts";
@@ -17,14 +17,7 @@ export function bankCapitalCents(world: WorldState, bankId: string): number {
 }
 
 export function bankLoanAssetsCents(world: WorldState, bankId: string): number {
-  return Object.values(world.ledger.accounts)
-    .filter(
-      (account) =>
-        account.ownerId === bankId &&
-        account.category === "asset" &&
-        account.instrument === "loan",
-    )
-    .reduce((sum, account) => sum + balanceOf(world, account.id), 0);
+  return sumAccountsByOwnerCategoryInstrument(world, bankId, "asset", "loan");
 }
 
 export function bankCapitalRatioBps(world: WorldState, bankId: string): number {
@@ -51,6 +44,9 @@ export function issueLoan(
   amountCents = Math.floor(amountCents);
   if (amountCents <= 0 || termMonths <= 0) return null;
   const bank = bankFor(world, bankId);
+  const creditSensitivity = world.countryCalibratedParameters[bank.countryId]?.creditDemandSensitivityBps ?? world.calibratedParameters.creditDemandSensitivityBps;
+  const policyRateBps = world.centralBanks.find((item) => item.id === bank.centralBankId)?.policyRateBps ?? world.centralBank.policyRateBps;
+  amountCents = Math.max(1, Math.round(amountCents * Math.max(2_500, 10_000 - Math.round(policyRateBps * creditSensitivity / 5_000)) / 10_000));
   const capital = bankCapitalCents(world, bankId);
   const newRiskAssets = bankLoanAssetsCents(world, bankId) + amountCents;
   const projectedRatio = newRiskAssets > 0 ? Math.floor((capital * 10_000) / newRiskAssets) : 100_000;
@@ -99,7 +95,7 @@ export function issueLoan(
     settlementBankAccountId: settlement.id,
     originalPrincipalCents: amountCents,
     remainingPrincipalCents: amountCents,
-    annualRateBps: Math.round((world.centralBanks.find((item) => item.id === bank.centralBankId)?.policyRateBps ?? world.centralBank.policyRateBps)
+    annualRateBps: Math.round(policyRateBps
       + bank.baseSpreadBps
       + riskPremiumBps
       + Math.max(0, bank.minimumCapitalRatioBps + 250 - projectedRatio) / 4

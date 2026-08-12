@@ -11,6 +11,48 @@ import { emitSimpleEvent } from "./events.ts";
 
 const ownerAccountIndex = new WeakMap<LedgerState, Map<string, string[]>>();
 
+interface LedgerBalanceIndex {
+  sourceAccounts: LedgerState["accounts"];
+  indexedAccountCount: number;
+  totalByCategoryInstrument: Map<string, number>;
+  totalByCurrencyCategoryInstrument: Map<string, number>;
+  totalByOwnerCategoryInstrument: Map<string, number>;
+}
+
+const balanceIndexes = new WeakMap<LedgerState, LedgerBalanceIndex>();
+
+function ledgerBalanceIndex(ledger: LedgerState): LedgerBalanceIndex {
+  let index = balanceIndexes.get(ledger);
+  if (!index || index.sourceAccounts !== ledger.accounts) {
+    index = { sourceAccounts: ledger.accounts, indexedAccountCount: -1, totalByCategoryInstrument: new Map(), totalByCurrencyCategoryInstrument: new Map(), totalByOwnerCategoryInstrument: new Map() };
+    balanceIndexes.set(ledger, index);
+  }
+  if (index.indexedAccountCount >= 0) return index;
+  index.totalByCategoryInstrument.clear();
+  index.totalByCurrencyCategoryInstrument.clear();
+  index.totalByOwnerCategoryInstrument.clear();
+  for (const account of Object.values(ledger.accounts)) {
+    const balance = ledger.balances[account.id] ?? 0;
+    const categoryInstrument = `${account.category}|${account.instrument}`;
+    const currencyCategoryInstrument = `${account.currency}|${categoryInstrument}`;
+    const ownerCategoryInstrument = `${account.ownerId}|${categoryInstrument}`;
+    index.totalByCategoryInstrument.set(categoryInstrument, (index.totalByCategoryInstrument.get(categoryInstrument) ?? 0) + balance);
+    index.totalByCurrencyCategoryInstrument.set(currencyCategoryInstrument, (index.totalByCurrencyCategoryInstrument.get(currencyCategoryInstrument) ?? 0) + balance);
+    index.totalByOwnerCategoryInstrument.set(ownerCategoryInstrument, (index.totalByOwnerCategoryInstrument.get(ownerCategoryInstrument) ?? 0) + balance);
+  }
+  index.indexedAccountCount = 1;
+  return index;
+}
+
+function addBalanceIndexDelta(index: LedgerBalanceIndex, account: LedgerAccount, delta: number): void {
+  const categoryInstrument = `${account.category}|${account.instrument}`;
+  const currencyCategoryInstrument = `${account.currency}|${categoryInstrument}`;
+  const ownerCategoryInstrument = `${account.ownerId}|${categoryInstrument}`;
+  index.totalByCategoryInstrument.set(categoryInstrument, (index.totalByCategoryInstrument.get(categoryInstrument) ?? 0) + delta);
+  index.totalByCurrencyCategoryInstrument.set(currencyCategoryInstrument, (index.totalByCurrencyCategoryInstrument.get(currencyCategoryInstrument) ?? 0) + delta);
+  index.totalByOwnerCategoryInstrument.set(ownerCategoryInstrument, (index.totalByOwnerCategoryInstrument.get(ownerCategoryInstrument) ?? 0) + delta);
+}
+
 interface LedgerTransactionIndex {
   source: LedgerTransaction[];
   indexedLength: number;
@@ -144,7 +186,9 @@ export const accountIds = {
   intercentralPayable: (centralBankId: string, counterpartyId: string) => `${centralBankId}:liability:intercentral:${counterpartyId}`,
   fundUnits: (ownerId: string, fundId: string) => `${ownerId}:asset:fund-units:${fundId}`,
   fundUnitCapital: (fundId: string) => `${fundId}:equity:fund-units`,
-  fxPosition: (ownerId: string, tradeId: string, currencyId: string) => `${ownerId}:equity:fx-position:${tradeId}:${currencyId}`,
+  // FX clearing equity is a running currency position. The trade and its cash
+  // legs remain individual records, without four permanent accounts per deal.
+  fxPosition: (ownerId: string, _tradeId: string, currencyId: string) => `${ownerId}:equity:fx-position:${currencyId}`,
   marginLoanAsset: (primeBrokerId: string, marginAccountId: string) => `${primeBrokerId}:asset:margin-loan:${marginAccountId}`,
   marginLoanLiability: (ownerId: string, marginAccountId: string) => `${ownerId}:liability:margin-loan:${marginAccountId}`,
   repoAsset: (lenderId: string, repoId: string) => `${lenderId}:asset:repo:${repoId}`,
@@ -208,6 +252,7 @@ export function ensureAccount(
   currency?: string,
 ): string {
   if (!ledger.accounts[id]) {
+    const cachedBalanceIndex = balanceIndexes.get(ledger);
     ledger.accounts[id] = {
       id,
       ownerId,
@@ -217,6 +262,7 @@ export function ensureAccount(
       currency: currency ?? "RUB",
     };
     ledger.balances[id] = 0;
+    if (cachedBalanceIndex) cachedBalanceIndex.indexedAccountCount = -1;
     const index = ownerAccountIndex.get(ledger);
     if (index) {
       const ids = index.get(ownerId) ?? [];
@@ -285,10 +331,22 @@ export function postTransaction(
     causeIds,
     entries,
   });
+  const balanceIndex = balanceIndexes.get(world.ledger);
+  const canUpdateBalanceIndex = Boolean(balanceIndex && balanceIndex.sourceAccounts === world.ledger.accounts && balanceIndex.indexedAccountCount >= 0);
+  const indexedDelta = canUpdateBalanceIndex ? new Map<string, { account: LedgerAccount; delta: number }>() : null;
   for (const entry of entries) {
     const account = world.ledger.accounts[entry.accountId];
-    world.ledger.balances[entry.accountId] += signedNaturalDelta(account, entry);
+    const delta = signedNaturalDelta(account, entry);
+    world.ledger.balances[entry.accountId] += delta;
+    if (indexedDelta) {
+      const ownerKey = `${account.ownerId}|${account.category}|${account.instrument}`;
+      const key = `${ownerKey}|${account.currency}`;
+      const current = indexedDelta.get(key);
+      if (current) current.delta += delta;
+      else indexedDelta.set(key, { account, delta });
+    }
   }
+  if (balanceIndex && indexedDelta) for (const { account, delta } of indexedDelta.values()) addBalanceIndexDelta(balanceIndex, account, delta);
   return id;
 }
 
@@ -454,6 +512,7 @@ export function ensureSettlementLiquidity(
   let shortfall = Math.max(0, requiredCents - balanceOf(world, accountIds.bankReserve(bankId)));
   if (shortfall <= 0) return;
   const centralBankId = centralBankIdForBank(world, bankId);
+  const currency = world.banks.find((bank) => bank.id === bankId)?.baseCurrency ?? "RUB";
   for (const lender of world.banks
     .filter((bank) => bank.id !== bankId && bank.centralBankId === centralBankId)
     .sort((left, right) => balanceOf(world, accountIds.bankReserve(right.id)) - balanceOf(world, accountIds.bankReserve(left.id)))) {
@@ -462,8 +521,8 @@ export function ensureSettlementLiquidity(
     const available = Math.max(0, reserve - buffer);
     const amountCents = Math.min(shortfall, available);
     if (amountCents <= 0) continue;
-    ensureAccount(world.ledger, accountIds.interbankAsset(lender.id, bankId), lender.id, `Межбанковский кредит ${bankId}`, "asset");
-    ensureAccount(world.ledger, accountIds.interbankLiability(bankId, lender.id), bankId, `Межбанковское обязательство ${lender.id}`, "liability");
+    ensureAccount(world.ledger, accountIds.interbankAsset(lender.id, bankId), lender.id, `Межбанковский кредит ${bankId}`, "asset", currency);
+    ensureAccount(world.ledger, accountIds.interbankLiability(bankId, lender.id), bankId, `Межбанковское обязательство ${lender.id}`, "liability", currency);
     postTransaction(world, "INTERBANK_LOAN", `Межбанковская ликвидность: ${lender.name} → ${bankId}`, [
       { accountId: accountIds.bankReserve(bankId), side: "debit", amountCents },
       { accountId: accountIds.interbankLiability(bankId, lender.id), side: "credit", amountCents },
@@ -477,8 +536,8 @@ export function ensureSettlementLiquidity(
     if (shortfall <= 0) break;
   }
   if (shortfall > 0) {
-    ensureAccount(world.ledger, accountIds.centralBankFacilityAsset(centralBankId, bankId), centralBankId, `Кредит ликвидности ${bankId}`, "asset");
-    ensureAccount(world.ledger, accountIds.centralBankFacilityLiability(bankId), bankId, "Кредит ликвидности ЦБ", "liability");
+    ensureAccount(world.ledger, accountIds.centralBankFacilityAsset(centralBankId, bankId), centralBankId, `Кредит ликвидности ${bankId}`, "asset", currency);
+    ensureAccount(world.ledger, accountIds.centralBankFacilityLiability(bankId), bankId, "Кредит ликвидности ЦБ", "liability", currency);
     postTransaction(world, "CENTRAL_BANK_FACILITY", `Кредит ликвидности ЦБ для ${bankId}`, [
       { accountId: accountIds.bankReserve(bankId), side: "debit", amountCents: shortfall },
       { accountId: accountIds.centralBankFacilityLiability(bankId), side: "credit", amountCents: shortfall },
@@ -850,6 +909,18 @@ export function sumAccounts(
     if (predicate(account)) total += balanceOf(world, account.id);
   }
   return total;
+}
+
+export function sumAccountsByCategoryInstrument(world: WorldState, category: AccountCategory, instrument: LedgerAccount["instrument"]): number {
+  return ledgerBalanceIndex(world.ledger).totalByCategoryInstrument.get(`${category}|${instrument}`) ?? 0;
+}
+
+export function sumAccountsByCurrencyCategoryInstrument(world: WorldState, currencyId: string, category: AccountCategory, instrument: LedgerAccount["instrument"]): number {
+  return ledgerBalanceIndex(world.ledger).totalByCurrencyCategoryInstrument.get(`${currencyId}|${category}|${instrument}`) ?? 0;
+}
+
+export function sumAccountsByOwnerCategoryInstrument(world: WorldState, ownerId: string, category: AccountCategory, instrument: LedgerAccount["instrument"]): number {
+  return ledgerBalanceIndex(world.ledger).totalByOwnerCategoryInstrument.get(`${ownerId}|${category}|${instrument}`) ?? 0;
 }
 
 export function entityBook(world: WorldState, ownerId: string): {

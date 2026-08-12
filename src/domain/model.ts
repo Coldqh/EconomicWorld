@@ -415,6 +415,92 @@ export interface WorldBaselineReference {
   referenceYear: number;
   countryPackVersion: string;
   calibrationSetId: string;
+  replayObservedExternalShocks: boolean;
+}
+
+export type BaselineCoverageStatus = "OBSERVED" | "ESTIMATED" | "CALIBRATED" | "MISSING";
+
+export interface CountryScaleReconciliation {
+  countryId: string;
+  targetAnnualNominalGdpMinor: number;
+  targetMonthlyNominalGdpMinor: number;
+  explicitCompanyValueAddedMinor: number;
+  sectorCohortValueAddedMinor: number;
+  publicOtherValueAddedMinor: number;
+  logisticsValueAddedMinor: number;
+  productionApproachMinor: number;
+  incomeApproachMinor: number;
+  expenditureApproachMinor: number;
+  householdConsumptionMinor: number;
+  investmentMinor: number;
+  governmentConsumptionMinor: number;
+  inventoryChangeMinor: number;
+  netExportsMinor: number;
+  reconciliationGapMinor: number;
+  targetUnemploymentBps: number;
+  currentUnemploymentBps: number;
+  targetTradeToGdpBps: number;
+  actualTradeToGdpBps: number;
+  targetDebtToGdpBps: number;
+  actualDebtToGdpBps: number;
+  bankAssetsToGdpBps: number;
+  creditToGdpBps: number;
+  initializedAtMonth: number;
+  withinTolerance: boolean;
+  warning: string | null;
+  coverage: Record<string, BaselineCoverageStatus>;
+}
+
+export interface TradeSectorState {
+  id: string;
+  countryId: string;
+  bankId: string;
+  firmCountEquivalent: number;
+  exportCapacityUsdMinor: number;
+  importBudgetUsdMinor: number;
+  reliabilityBps: number;
+  lastExportRevenueUsdMinor: number;
+  lastImportCostUsdMinor: number;
+  tradeFinanceLiabilityUsdMinor: number;
+  tradeCalibrationFactorBps: number;
+}
+
+export interface LogisticsSectorState {
+  id: string;
+  countryId: string;
+  bankId: string;
+  capacityMilliUnits: number;
+  revenueUsdMinor: number;
+  profitUsdMinor: number;
+  employmentEquivalent: number;
+  fuelDemandMilliUnits: number;
+}
+
+export interface BankingSectorCohort {
+  id: string;
+  countryId: string;
+  bankId: string;
+  bankCountEquivalent: number;
+  assetsMinor: number;
+  loansMinor: number;
+  depositsMinor: number;
+  capitalMinor: number;
+  liquidityMinor: number;
+}
+
+export type SovereignHolderType = "DOMESTIC_BANKS" | "DOMESTIC_FUNDS" | "HOUSEHOLDS" | "FOREIGN_INVESTORS" | "CENTRAL_BANK" | "OTHER_INSTITUTIONS";
+
+export interface SovereignHolderCohort {
+  id: string;
+  countryId: string;
+  bankId: string;
+  holderType: SovereignHolderType;
+  targetShareBps: number;
+}
+
+export interface RealWorldInitializationReport extends CountryScaleReconciliation {
+  baselineYear: number;
+  sourceDate: string;
 }
 
 export interface GlobalCommodityDefinition {
@@ -465,6 +551,10 @@ export interface CountryCommodityState {
   importDemandMilliUnits: number;
   exportSupplyMilliUnits: number;
   marginalCostUsdMinor: number;
+  householdDemandMilliUnits: number;
+  industrialDemandMilliUnits: number;
+  investmentDemandMilliUnits: number;
+  resourceDemandMilliUnits: number;
 }
 
 export interface EnergyBalance {
@@ -514,10 +604,28 @@ export interface TradeFlow {
   invoiceValueMinor: number;
   routeId: string;
   transportCostUsdMinor: number;
+  tradeCostUsdMinor: number;
+  landedUnitCostUsdMinor: number;
+  logisticsProviderId: string;
+  logisticsPaymentTransactionId: string | null;
   tariffUsdMinor: number;
   paymentTransactionIds: string[];
   fxTradeId: string | null;
   status: "settled" | "unpaid" | "capacity-constrained";
+}
+
+export interface PhysicalCommodityFlow {
+  countryId: string;
+  commodityId: string;
+  elapsedMonth: number;
+  openingStockMilliUnits: number;
+  productionMilliUnits: number;
+  importsMilliUnits: number;
+  householdConsumptionMilliUnits: number;
+  industrialUseMilliUnits: number;
+  exportsMilliUnits: number;
+  closingStockMilliUnits: number;
+  conservationGapMilliUnits: number;
 }
 
 export interface StrategicReserve {
@@ -557,11 +665,26 @@ export interface BalanceOfPaymentsRecord {
   directInvestmentNetInflowUsdMinor: number;
   portfolioNetInflowUsdMinor: number;
   otherInvestmentNetInflowUsdMinor: number;
+  tradeFinanceNetInflowUsdMinor: number;
   financialAccountUsdMinor: number;
   reserveChangeUsdMinor: number;
   errorsAndOmissionsUsdMinor: number;
   reconciliationGapUsdMinor: number;
+  reconciliationWarning: boolean;
   causeFlowIds: string[];
+}
+
+export interface ExternalClaim {
+  id: string;
+  creditorCountryId: string;
+  debtorCountryId: string;
+  ownerId: string;
+  obligorId: string;
+  currencyId: string;
+  valueUsdMinor: number;
+  sourceFlowId: string;
+  createdAtMonth: number;
+  kind: "TRADE_RECEIVABLE" | "DEPOSIT" | "SECURITY" | "BANK_CLAIM";
 }
 
 export interface InternationalInvestmentPosition {
@@ -812,6 +935,16 @@ export interface Company {
   subsidiaryIds: string[];
   goodwillCents: number;
   globalInputConstraintBps: number;
+  baselineFinancials?: {
+    revenueMinor: number;
+    profitMinor: number;
+    assetsMinor: number;
+    debtMinor: number;
+    cashMinor: number;
+    employees: number;
+    marketCapMinor: number | null;
+    sourceType: BaselineCoverageStatus;
+  } | null;
 }
 
 export interface Bank {
@@ -824,6 +957,14 @@ export interface Bank {
   baseCurrency: string;
   centralBankId: string;
   representationTier: "A" | "B";
+  baselineFinancials?: {
+    assetsMinor: number;
+    loansMinor: number;
+    depositsMinor: number;
+    capitalMinor: number;
+    liquidityMinor: number;
+    sourceType: BaselineCoverageStatus;
+  } | null;
 }
 
 export interface Government {
@@ -1245,6 +1386,45 @@ export interface FirmCohort {
   inventoryMilliUnits: number;
   profitsCents: number;
   productivityBps: number;
+  populationEquivalent: number;
+  firmCountEquivalent: number;
+  outputScaleBps: number;
+  valueAddedMinor: number;
+  intermediateConsumptionMinor: number;
+}
+
+export interface CalibratedParameterSet {
+  consumptionIncomeElasticityBps: number;
+  investmentRateSensitivityBps: number;
+  priceAdjustmentSpeedBps: number;
+  wageAdjustmentSpeedBps: number;
+  creditDemandSensitivityBps: number;
+  employmentAdjustmentSpeedBps: number;
+}
+
+export type PolicyInterventionMode = "RATE_SHOCK" | "RATE_PATH" | "POLICY_RULE_SHIFT";
+
+export interface PolicyIntervention {
+  id: string;
+  countryId: string;
+  targetCentralBankId: string;
+  startMonth: number;
+  durationMonths: number;
+  mode: PolicyInterventionMode;
+  valueBps: number;
+  ratePathBps: number[];
+  baselineRateBps: number;
+}
+
+export interface MacroContributionEvent {
+  id: string;
+  countryId: string;
+  elapsedMonth: number;
+  channel: "POLICY_TO_FUNDING" | "FUNDING_TO_CREDIT" | "CREDIT_TO_INVESTMENT" | "INVESTMENT_TO_DEMAND" | "DEMAND_TO_GDP" | "TRADE_TO_GDP" | "FX_TO_PRICES";
+  fromMetric: string;
+  toMetric: string;
+  contribution: number;
+  evidenceIds: string[];
 }
 
 export interface FidelityState {
@@ -2105,8 +2285,8 @@ export interface MacroMonthlyPoint extends CountryMacroState {
 export type SimulationScenario = "baseline" | "high-demand" | "supply-constraint" | "high-rates" | "bank-liquidity-stress";
 
 export interface WorldState {
-  schemaVersion: 8;
-  saveVersion: 8;
+  schemaVersion: 9;
+  saveVersion: 9;
   seed: string;
   scenario: SimulationScenario;
   baselineReference: WorldBaselineReference;
@@ -2150,6 +2330,16 @@ export interface WorldState {
   durableAssets: DurableAsset[];
   populationCohorts: PopulationCohort[];
   firmCohorts: FirmCohort[];
+  countryScaleReconciliations: CountryScaleReconciliation[];
+  realWorldInitializationReports: RealWorldInitializationReport[];
+  tradeSectors: TradeSectorState[];
+  logisticsSectors: LogisticsSectorState[];
+  bankingSectorCohorts: BankingSectorCohort[];
+  sovereignHolderCohorts: SovereignHolderCohort[];
+  calibratedParameters: CalibratedParameterSet;
+  countryCalibratedParameters: Record<string, Partial<CalibratedParameterSet>>;
+  policyInterventions: PolicyIntervention[];
+  macroContributionEvents: MacroContributionEvent[];
   fidelity: FidelityState;
   ledgerArchives: LedgerArchiveSegment[];
   history: HistoryState;
@@ -2218,11 +2408,13 @@ export interface WorldState {
   strategicReserves: StrategicReserve[];
   inputOutputCoefficients: InputOutputCoefficient[];
   countrySectorInventories: CountrySectorInventory[];
+  physicalCommodityFlows: PhysicalCommodityFlow[];
   balanceOfPayments: BalanceOfPaymentsRecord[];
   internationalInvestmentPositions: InternationalInvestmentPosition[];
   foreignDirectInvestments: ForeignDirectInvestment[];
   internationalPortfolioPositions: InternationalPortfolioPosition[];
   crossBorderLoans: CrossBorderLoanExposure[];
+  externalClaims: ExternalClaim[];
   reservePortfolios: ReservePortfolio[];
   fxRegimes: FxRegimeState[];
   fxPressureHistory: FxPressurePoint[];

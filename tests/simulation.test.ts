@@ -23,9 +23,9 @@ import { collectPropertyTaxes, createSovereignAuction, openMarketPurchase, openM
 import { settleFinancialPayment } from "../src/finance/financial-settlement.ts";
 import { approvePrimeBrokerCapacity, createFxHedgeForFund, runAutonomousDerivativeDecisions } from "../src/finance/autonomous-derivatives.ts";
 import { getCountryEconomicProfile } from "../src/data/country-economic-profiles.ts";
-import { compareCalibrationSeries } from "../src/economy/calibration.ts";
-import { createCommodityFutureHedge, createForeignDirectInvestment, interveneFx, purchaseForeignEquity } from "../src/economy/global-economy.ts";
-import { runEconomicLab } from "../src/economy/economic-lab.ts";
+import { alignReferenceSeriesToWorld, compareCalibrationSeries, searchCalibratedParameters, simulatedMetricSeries } from "../src/economy/calibration.ts";
+import { clearMultilateralCommodityMarkets, createCommodityFutureHedge, createForeignDirectInvestment, interveneFx, purchaseForeignEquity, updateSupplyChains } from "../src/economy/global-economy.ts";
+import { createHistoricalValidationWorld, runEconomicLab } from "../src/economy/economic-lab.ts";
 import { REAL_COUNTRY_PACKS } from "../src/data/real-world/country-packs.ts";
 import { compactLedgerHistory } from "../src/world/systems.ts";
 import { createCities } from "../src/world/catalog.ts";
@@ -45,8 +45,8 @@ function depositMoney(world: WorldState): number {
 
 test("фазы 3 и 4 создают масштабный географический мир", () => {
   const world = createWorld();
-  assert.equal(world.schemaVersion, 8);
-  assert.equal(world.saveVersion, 8);
+  assert.equal(world.schemaVersion, 9);
+  assert.equal(world.saveVersion, 9);
   assert.equal(world.households.length, 100);
   assert.equal(world.people.length, 100);
   assert.equal(world.companies.length, 77);
@@ -219,7 +219,7 @@ test("старое сохранение мигрирует в мультивал
   delete legacy.fxTrades;
   delete legacy.fxDealers;
   const migrated = migrateWorldState(legacy);
-  assert.equal(migrated.schemaVersion, 8);
+  assert.equal(migrated.schemaVersion, 9);
   assert.ok(bankAccountsForOwner(migrated, migrated.player.householdId, "RUB").length > 0);
   assert.ok(migrated.bankAccounts.every((account) => migrated.ledger.accounts[account.ledgerDepositAccountId]));
   assert.equal(migrated.player.personId, "person-player");
@@ -237,7 +237,7 @@ test("сохранение v6 мигрирует в v8 с профилями, и
   const funds = legacy.funds as Array<Record<string, unknown>>;
   for (const fund of funds) { delete fund.strategyProfileId; delete fund.primeBrokerIds; }
   const migrated = migrateWorldState(legacy);
-  assert.equal(migrated.schemaVersion, 8);
+  assert.equal(migrated.schemaVersion, 9);
   assert.equal(migrated.countryEconomicProfiles.length, migrated.countries.length);
   assert.ok(migrated.history.policy.hotLedgerMonths > 0);
   assert.ok(migrated.funds.every((fund) => fund.strategyProfileId && fund.primeBrokerIds.length > 0));
@@ -266,6 +266,20 @@ test("RUB и USD существуют одновременно, а FX сохра
   assert.equal(transferBankAccountBalance(world, rub.id, usd.id, 1_000, "TRANSFER", "Запрещённый 1:1 перевод"), null);
   assert.equal(world.fxTrades.length, 1);
   assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("повторные FX-сделки используют накопительные clearing accounts", () => {
+  const world = createWorld();
+  const ownerId = world.player.householdId;
+  const from = world.bankAccounts.find((account) => account.ownerId === ownerId && account.currencyId === "RUB")!;
+  const foreignBank = world.banks.find((bank) => bank.baseCurrency === "USD")!;
+  const opened = openBankAccount(world, ownerId, foreignBank.id);
+  assert.ok(opened.ok && opened.accountId);
+  const to = world.bankAccounts.find((account) => account.id === opened.accountId)!;
+  assert.ok(executeFxConversion(world, ownerId, from.id, to.id, 1_000).ok);
+  assert.ok(executeFxConversion(world, ownerId, from.id, to.id, 1_000).ok);
+  const positionAccounts = Object.values(world.ledger.accounts).filter((account) => account.id.includes(":equity:fx-position:"));
+  assert.equal(positionAccounts.length, 4);
 });
 
 test("еврозона имеет общую денежную власть, а отчётная валюта использует FX", () => {
@@ -729,6 +743,19 @@ test("страны стартуют с разными профилями гос�
   assert.ok(Math.max(...debtRatios) > 15_000);
 });
 
+test("реальный унаследованный долг обслуживается и рефинансируется когортами", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  runMonths(world, 60);
+  for (const countryId of ["us", "jp"]) {
+    const profile = world.countryEconomicProfiles.find((item) => item.countryId === countryId)!;
+    const annual = world.countryScaleReconciliations.find((item) => item.countryId === countryId)!.targetAnnualNominalGdpMinor;
+    const debt = world.governmentBudgets.find((item) => item.countryId === countryId)!.publicDebtMinor;
+    const ratioBps = Math.round(debt * 10_000 / annual);
+    assert.ok(ratioBps >= profile.governmentDebtToGdpBps * 7_000 / 10_000);
+    assert.equal(world.sovereignBonds.some((bond) => bond.countryId === countryId && bond.status === "defaulted"), false);
+  }
+});
+
 test("правило ЦБ реагирует на инфляцию и сохраняет реальные входы решения", () => {
   const world = createWorld();
   runMonths(world, 1);
@@ -989,4 +1016,145 @@ test("автономный мир проходит 20 лет с архивиро
   assert.ok(world.diagnostics.estimatedSaveBytes < 25_000_000);
   assert.ok(elapsedMs < 60_000, `20 лет рассчитаны за ${elapsedMs} мс`);
   assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("REAL_WORLD согласует ВВП, банки, торговлю и долг всех стран", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  assert.equal(world.realWorldInitializationReports.length, world.countries.length);
+  for (const report of world.realWorldInitializationReports) {
+    assert.ok(Math.abs(report.productionApproachMinor - report.targetMonthlyNominalGdpMinor) <= report.targetMonthlyNominalGdpMinor * 0.1);
+    assert.ok(Math.abs(report.incomeApproachMinor - report.productionApproachMinor) <= report.targetMonthlyNominalGdpMinor * 0.01);
+    assert.ok(Math.abs(report.expenditureApproachMinor - report.productionApproachMinor) <= report.targetMonthlyNominalGdpMinor * 0.01);
+    assert.ok(Math.abs(report.actualDebtToGdpBps - report.targetDebtToGdpBps) <= 100);
+    assert.ok(Math.abs(report.actualTradeToGdpBps - report.targetTradeToGdpBps) <= 100);
+    assert.ok(report.bankAssetsToGdpBps >= 8_000);
+    assert.equal(report.withinTolerance, true);
+  }
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("унаследованный госдолг распределён по срокам и шести группам держателей", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  for (const country of world.countries) {
+    const bonds = world.sovereignBonds.filter((bond) => bond.countryId === country.id);
+    assert.equal(new Set(bonds.map((bond) => bond.maturityBucket)).size, 5);
+    assert.equal(world.sovereignHolderCohorts.filter((holder) => holder.countryId === country.id).length, 6);
+    assert.ok(bonds.every((bond) => world.sovereignBondHoldings.filter((holding) => holding.bondId === bond.id).reduce((sum, holding) => sum + holding.faceValueMinor, 0) === bond.outstandingFaceValueMinor));
+  }
+  const japan = world.realWorldInitializationReports.find((report) => report.countryId === "jp")!;
+  assert.ok(japan.actualDebtToGdpBps > 20_000);
+});
+
+test("многосторонний клиринг не имеет потолка в восемь потоков", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  clearMultilateralCommodityMarkets(world);
+  assert.ok(world.tradeFlows.length > 8);
+  const groups = new Map<string, typeof world.tradeFlows>();
+  for (const flow of world.tradeFlows) groups.set(flow.commodityId, [...(groups.get(flow.commodityId) ?? []), flow]);
+  assert.ok([...groups.values()].some((flows) => new Set(flows.map((flow) => flow.exporterCountryId)).size >= 2 && new Set(flows.map((flow) => flow.importerCountryId)).size >= 3));
+  assert.ok(world.tradeFlows.every((flow) => flow.landedUnitCostUsdMinor === flow.unitPriceUsdMinor + world.tradeRoutes.find((route) => route.id === flow.routeId)!.costUsdMinorPerUnit + Math.round(flow.unitPriceUsdMinor * 35 / 10_000)));
+});
+
+test("REAL_WORLD исполняет калиброванный месячный масштаб торговли", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  clearMultilateralCommodityMarkets(world);
+  for (const countryId of ["us", "jp", "kr", "ru"]) {
+    const sector = world.tradeSectors.find((item) => item.countryId === countryId)!;
+    const flows = world.tradeFlows.filter((flow) => flow.exporterCountryId === countryId || flow.importerCountryId === countryId);
+    const actualUsdMinor = flows.reduce((sum, flow) => sum + Math.round(flow.quantityMilliUnits * flow.unitPriceUsdMinor / 1_000), 0);
+    const targetUsdMinor = sector.exportCapacityUsdMinor + sector.importBudgetUsdMinor;
+    assert.ok(actualUsdMinor >= targetUsdMinor * 7_000 / 10_000, `${countryId}: фактическая торговля ниже 70% baseline`);
+    assert.ok(actualUsdMinor <= targetUsdMinor * 13_000 / 10_000, `${countryId}: фактическая торговля выше 130% baseline`);
+  }
+});
+
+test("международная поставка оплачивает товар, логистику и создаёт внешний актив", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  runMonths(world, 1);
+  assert.ok(world.tradeFlows.length > 8);
+  assert.ok(world.tradeFlows.every((flow) => flow.logisticsPaymentTransactionId && flow.paymentTransactionIds.length >= 2));
+  assert.ok(world.ledger.transactions.some((transaction) => transaction.kind === "LOGISTICS"));
+  assert.equal(world.externalClaims.length, world.tradeFlows.length);
+  assert.ok(world.logisticsSectors.some((sector) => sector.revenueUsdMinor > 0));
+});
+
+test("физический баланс товара сохраняется при торговле и передаче в цепочку", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  runMonths(world, 1);
+  assert.ok(world.physicalCommodityFlows.length > 0);
+  assert.ok(world.physicalCommodityFlows.every((flow) => flow.conservationGapMilliUnits === 0));
+  const source = world.countryCommodityStates.find((state) => state.inventoryMilliUnits > 0)!;
+  const before = source.inventoryMilliUnits;
+  updateSupplyChains(world);
+  assert.ok(source.inventoryMilliUnits <= before);
+});
+
+test("платёжный баланс использует финансовую ногу, а E&O остаётся малым остатком", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  runMonths(world, 12);
+  for (const point of world.balanceOfPayments) {
+    assert.equal(point.reconciliationWarning, false);
+    assert.ok(Math.abs(point.errorsAndOmissionsUsdMinor) <= Math.max(10_000, Math.round((point.goodsExportsUsdMinor + point.goodsImportsUsdMinor) * 0.01)));
+    assert.equal(point.currentAccountUsdMinor + point.capitalAccountUsdMinor + point.financialAccountUsdMinor + point.reserveChangeUsdMinor + point.errorsAndOmissionsUsdMinor, point.reconciliationGapUsdMinor);
+  }
+  assert.ok(world.foreignDirectInvestments.length > 0);
+  assert.ok(world.internationalPortfolioPositions.length > 0);
+  assert.ok(world.crossBorderLoans.length > 0);
+});
+
+test("страновые различия занятости и долга сохраняются после года", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  const before = new Map(world.countryEconomicProfiles.map((profile) => [profile.countryId, profile.unemploymentBps]));
+  runMonths(world, 12);
+  const latest = world.countries.map((country) => [...world.countryMetricsHistory].reverse().find((point) => point.countryId === country.id)!);
+  assert.ok(new Set(latest.map((point) => point.unemploymentBps)).size >= 5);
+  for (const point of latest) assert.ok(Math.abs(point.unemploymentBps - before.get(point.countryId)!) < 300);
+  assert.ok(world.governmentBudgets.find((budget) => budget.countryId === "jp")!.publicDebtMinor > world.governmentBudgets.find((budget) => budget.countryId === "nl")!.publicDebtMinor);
+});
+
+test("реальные компании и банки имеют макрофинансовый масштаб", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  assert.ok(world.companies.filter((company) => company.representationTier === "A").every((company) => company.baselineFinancials && company.baselineFinancials.revenueMinor > 0 && company.baselineFinancials.assetsMinor > company.baselineFinancials.revenueMinor));
+  assert.ok(world.banks.every((bank) => bank.baselineFinancials && bank.baselineFinancials.assetsMinor > bank.baselineFinancials.capitalMinor));
+  assert.ok(world.bankingSectorCohorts.every((cohort) => cohort.assetsMinor > cohort.capitalMinor && cohort.bankCountEquivalent > 0));
+});
+
+test("исторические годы переводятся в календарь мира, а метрики не подменяются", () => {
+  const reference = { id: "calendar", countryId: "us", metric: "inflationBps", months: [0, 12, 24], years: [2019, 2020, 2021], frequency: "annual" as const, values: [100, 200, 300], metadata: { sourceType: "REAL_DATA" as const, baseYear: 2021 } };
+  const aligned = alignReferenceSeriesToWorld(reference, 2019, 1);
+  assert.deepEqual(aligned.months, [11, 23, 35]);
+  const points = [{ elapsedMonth: 11, gdpGrowthBps: 900, inflationBps: 100, unemploymentBps: 500, creditToGdpBps: 8_000 }];
+  assert.equal(simulatedMetricSeries("inflationBps", points).get(11), 100);
+  assert.equal(simulatedMetricSeries("unemploymentBps", points).get(11), 500);
+});
+
+test("исторический старт создаёт baseline выбранного года без неявного replay", () => {
+  const world2019 = createWorld("baseline", { mode: "REAL_WORLD", referenceYear: 2019 });
+  const world2023 = createWorld("baseline", { mode: "REAL_WORLD", referenceYear: 2023 });
+  assert.equal(world2019.clock.startYear, 2019);
+  assert.equal(world2019.baselineReference.replayObservedExternalShocks, false);
+  assert.ok(world2019.countryEconomicProfiles.find((profile) => profile.countryId === "us")!.baselineNominalGdpMinor < world2023.countryEconomicProfiles.find((profile) => profile.countryId === "us")!.baselineNominalGdpMinor);
+  assert.equal(world2019.countryEconomicProfiles.find((profile) => profile.countryId === "us")!.unemploymentBps, 367);
+  const result = runEconomicLab(world2023, { countryId: "us", historicalStartYear: 2019, horizonMonths: 1 });
+  assert.ok(result.baselineWorldId.includes(":2019:"));
+  const validationWorld = createHistoricalValidationWorld(world2023, 2019, 2020);
+  assert.ok(validationWorld.macroHistory.some((point) => point.countryId === "us" && point.elapsedMonth === 12));
+});
+
+test("экономическая лаборатория удерживает шок и показывает фактический causal trace", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  const result = runEconomicLab(world, { countryId: "us", horizonMonths: 12, policyRateDeltaBps: 200, policyDurationMonths: 12, policyMode: "RATE_SHOCK" });
+  assert.ok(result.deltas.some((delta) => delta.delta !== 0));
+  assert.ok(result.causalChain.some((link) => link.from === "policyRateBps" && link.to === "averageLoanRateBps" && link.evidence.some((id) => id.startsWith("policy-experiment-"))));
+  assert.ok(result.causalChain.every((link) => link.evidence.length > 0));
+});
+
+test("coordinate search улучшает training objective и отдельно считает validation", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  const target = { ...world.calibratedParameters, consumptionIncomeElasticityBps: 10_000, priceAdjustmentSpeedBps: 1_600 };
+  const objective = (parameters: typeof target, split: "training" | "validation") => Object.keys(target).reduce((sum, key) => sum + Math.abs(parameters[key as keyof typeof target] - target[key as keyof typeof target]), split === "training" ? 0 : 25);
+  const result = searchCalibratedParameters(world.calibratedParameters, objective, 3);
+  assert.ok(result.trainingErrorBps < result.baselineTrainingErrorBps);
+  assert.ok(result.validationErrorBps >= result.trainingErrorBps);
+  assert.ok(result.iterations > 10);
 });
