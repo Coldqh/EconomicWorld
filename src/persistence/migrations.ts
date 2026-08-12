@@ -45,16 +45,43 @@ function migrateMetric(metric: Partial<MetricPoint>, world: WorldState): MetricP
 
 export function migrateWorldState(raw: unknown): WorldState {
   const legacy = structuredClone(raw) as LegacyWorld;
-  if ((legacy.schemaVersion ?? 1) > 7 || (legacy.saveVersion ?? 1) > 7) {
+  if ((legacy.schemaVersion ?? 1) > 8 || (legacy.saveVersion ?? 1) > 8) {
     throw new Error("Сохранение создано более новой версией приложения");
   }
-  if (legacy.schemaVersion === 7 && legacy.saveVersion === 7) return legacy as WorldState;
+  if (legacy.schemaVersion === 8 && legacy.saveVersion === 8) return legacy as WorldState;
+  if (legacy.schemaVersion === 7 && legacy.saveVersion === 7) {
+    const template = createWorld();
+    const migrated = {
+      ...template,
+      ...legacy,
+      schemaVersion: 8 as const,
+      saveVersion: 8 as const,
+      baselineReference: template.baselineReference,
+      companies: (legacy.companies ?? template.companies).map((company) => ({ ...company, globalInputConstraintBps: company.globalInputConstraintBps ?? 10_000 })),
+      history: {
+        ...template.history,
+        ...(legacy.history ?? {}),
+        policy: { ...template.history.policy, ...(legacy.history?.policy ?? {}) },
+        compactedTradeRecords: legacy.history?.compactedTradeRecords ?? [],
+      },
+      globalCommodities: template.globalCommodities,
+      commodityMarkets: template.commodityMarkets,
+      resourceDeposits: template.resourceDeposits,
+      countryCommodityStates: template.countryCommodityStates,
+      energyBalances: [], tradeRoutes: template.tradeRoutes, ports: template.ports, tradeFlows: [], strategicReserves: template.strategicReserves,
+      inputOutputCoefficients: template.inputOutputCoefficients, countrySectorInventories: template.countrySectorInventories,
+      balanceOfPayments: [], internationalInvestmentPositions: [], foreignDirectInvestments: [], internationalPortfolioPositions: [], crossBorderLoans: [],
+      reservePortfolios: template.reservePortfolios, fxRegimes: template.fxRegimes, fxPressureHistory: [],
+      nextTradeFlowId: 1, nextFdiId: 1, nextInternationalPositionId: 1, nextCrossBorderLoanId: 1,
+    } as WorldState;
+    return migrated;
+  }
   const template = createWorld();
   const world = {
     ...template,
     ...legacy,
-    schemaVersion: 7 as const,
-    saveVersion: 7 as const,
+    schemaVersion: 8 as const,
+    saveVersion: 8 as const,
     goods: template.goods.map((good) => ({ ...good, ...(legacy.goods?.find((item) => item.id === good.id) ?? {}), essential: good.essential })),
     countries: template.countries.map((base) => ({ ...base, ...(legacy.countries?.find((item) => item.id === base.id) ?? {}) })),
     cities: template.cities.map((base) => ({ ...base, ...(legacy.cities?.find((item) => item.id === base.id) ?? {}) })),

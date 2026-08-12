@@ -272,6 +272,17 @@ export interface HistoryRetentionPolicy {
   companyReportMonths: number;
   detailedMetricMonths: number;
   derivativeDetailMonths: number;
+  tradeDetailMonths: number;
+}
+
+export interface CompactedTradeRecord {
+  elapsedMonth: number;
+  exporterCountryId: string;
+  importerCountryId: string;
+  commodityId: string;
+  quantityMilliUnits: number;
+  valueUsdMinor: number;
+  flowCount: number;
 }
 
 export interface HistoryState {
@@ -282,6 +293,7 @@ export interface HistoryState {
   compactedMarketRecords: CompactedMarketRecord[];
   companyAnnualRecords: CompactCompanyAnnualRecord[];
   compactedEventRecords: CompactEventRecord[];
+  compactedTradeRecords: CompactedTradeRecord[];
   globalSeries: CompactNumericSeries;
   countrySeries: Record<string, CompactNumericSeries>;
   lastCompactedMonth: number;
@@ -392,6 +404,255 @@ export interface GoodDefinition {
   consumptionWeightBps: number;
   essential: boolean;
   recipe: Record<string, number>;
+}
+
+export type WorldMode = "REAL_WORLD" | "SYNTHETIC";
+export type GlobalCommodityCategory = "energy" | "metals" | "agriculture" | "industrial" | "final";
+
+export interface WorldBaselineReference {
+  mode: WorldMode;
+  baselineDate: string;
+  referenceYear: number;
+  countryPackVersion: string;
+  calibrationSetId: string;
+}
+
+export interface GlobalCommodityDefinition {
+  id: string;
+  name: string;
+  category: GlobalCommodityCategory;
+  unit: string;
+  linkedGoodId: string | null;
+  benchmarkCurrencyId: string;
+  baseSpotPriceMinor: number;
+  storable: boolean;
+  energyContentBps: number;
+}
+
+export interface CommodityMarketState {
+  commodityId: string;
+  spotPriceUsdMinor: number;
+  previousSpotPriceUsdMinor: number;
+  globalProductionMilliUnits: number;
+  globalConsumptionMilliUnits: number;
+  globalInventoryMilliUnits: number;
+  monthlyVolumeMilliUnits: number;
+  shortageBps: number;
+}
+
+export interface ResourceDeposit {
+  id: string;
+  countryId: string;
+  commodityId: string;
+  provenReservesMilliUnits: number;
+  extractableReservesMilliUnits: number;
+  monthlyCapacityMilliUnits: number;
+  extractionCostUsdMinor: number;
+  infrastructureBps: number;
+  technologyBps: number;
+  depletionBps: number;
+  active: boolean;
+  sourceType: BaselineSourceType;
+}
+
+export interface CountryCommodityState {
+  countryId: string;
+  commodityId: string;
+  productionMilliUnits: number;
+  consumptionMilliUnits: number;
+  inventoryMilliUnits: number;
+  domesticDemandMilliUnits: number;
+  importDemandMilliUnits: number;
+  exportSupplyMilliUnits: number;
+  marginalCostUsdMinor: number;
+}
+
+export interface EnergyBalance {
+  countryId: string;
+  elapsedMonth: number;
+  productionBySourceMilliUnits: Record<string, number>;
+  consumptionBySourceMilliUnits: Record<string, number>;
+  importsMilliUnits: number;
+  exportsMilliUnits: number;
+  strategicReserveMilliUnits: number;
+  unmetDemandMilliUnits: number;
+}
+
+export type FreightMode = "sea" | "rail" | "road" | "air";
+
+export interface TradeRoute {
+  id: string;
+  originCountryId: string;
+  destinationCountryId: string;
+  mode: FreightMode;
+  capacityMilliUnits: number;
+  usedCapacityMilliUnits: number;
+  costUsdMinorPerUnit: number;
+  transitDays: number;
+  active: boolean;
+}
+
+export interface PortNode {
+  id: string;
+  countryId: string;
+  name: string;
+  annualCapacityMilliUnits: number;
+  congestionBps: number;
+}
+
+export interface TradeFlow {
+  id: string;
+  elapsedMonth: number;
+  exporterCountryId: string;
+  importerCountryId: string;
+  exporterId: string;
+  importerId: string;
+  commodityId: string;
+  quantityMilliUnits: number;
+  unitPriceUsdMinor: number;
+  invoiceCurrencyId: string;
+  invoiceValueMinor: number;
+  routeId: string;
+  transportCostUsdMinor: number;
+  tariffUsdMinor: number;
+  paymentTransactionIds: string[];
+  fxTradeId: string | null;
+  status: "settled" | "unpaid" | "capacity-constrained";
+}
+
+export interface StrategicReserve {
+  id: string;
+  countryId: string;
+  commodityId: string;
+  inventoryMilliUnits: number;
+  targetMonthsOfConsumptionBps: number;
+  lastAction: "buy" | "release" | "hold";
+}
+
+export interface InputOutputCoefficient {
+  outputSectorId: string;
+  inputCommodityId: string;
+  requiredMilliUnitsPerOutputUnit: number;
+}
+
+export interface CountrySectorInventory {
+  countryId: string;
+  sectorId: string;
+  inputCommodityId: string;
+  inventoryMilliUnits: number;
+  requiredMilliUnits: number;
+  shortageBps: number;
+}
+
+export interface BalanceOfPaymentsRecord {
+  countryId: string;
+  elapsedMonth: number;
+  goodsExportsUsdMinor: number;
+  goodsImportsUsdMinor: number;
+  servicesBalanceUsdMinor: number;
+  primaryIncomeBalanceUsdMinor: number;
+  secondaryIncomeBalanceUsdMinor: number;
+  currentAccountUsdMinor: number;
+  capitalAccountUsdMinor: number;
+  directInvestmentNetInflowUsdMinor: number;
+  portfolioNetInflowUsdMinor: number;
+  otherInvestmentNetInflowUsdMinor: number;
+  financialAccountUsdMinor: number;
+  reserveChangeUsdMinor: number;
+  errorsAndOmissionsUsdMinor: number;
+  reconciliationGapUsdMinor: number;
+  causeFlowIds: string[];
+}
+
+export interface InternationalInvestmentPosition {
+  countryId: string;
+  elapsedMonth: number;
+  directInvestmentAssetsUsdMinor: number;
+  directInvestmentLiabilitiesUsdMinor: number;
+  portfolioAssetsUsdMinor: number;
+  portfolioLiabilitiesUsdMinor: number;
+  otherInvestmentAssetsUsdMinor: number;
+  otherInvestmentLiabilitiesUsdMinor: number;
+  reserveAssetsUsdMinor: number;
+  netInternationalInvestmentPositionUsdMinor: number;
+  publicExternalDebtUsdMinor: number;
+  privateExternalDebtUsdMinor: number;
+  shortTermExternalDebtUsdMinor: number;
+}
+
+export interface ForeignDirectInvestment {
+  id: string;
+  investorCountryId: string;
+  destinationCountryId: string;
+  parentCompanyId: string;
+  subsidiaryCompanyId: string;
+  currencyId: string;
+  investedAmountMinor: number;
+  votingShareBps: number;
+  openedAtMonth: number;
+  transactionIds: string[];
+  status: "active" | "divested";
+}
+
+export interface InternationalPortfolioPosition {
+  id: string;
+  ownerId: string;
+  ownerCountryId: string;
+  issuerCountryId: string;
+  instrumentType: "equity" | "corporate-bond" | "sovereign-bond";
+  instrumentId: string;
+  quantity: number;
+  acquisitionValueMinor: number;
+  currencyId: string;
+  openedAtMonth: number;
+}
+
+export interface CrossBorderLoanExposure {
+  id: string;
+  lenderId: string;
+  lenderCountryId: string;
+  borrowerId: string;
+  borrowerCountryId: string;
+  currencyId: string;
+  originalPrincipalMinor: number;
+  remainingPrincipalMinor: number;
+  annualRateBps: number;
+  maturityMonth: number;
+  reportingValueUsdMinor: number;
+  borrowerCurrencyBurdenMinor: number;
+  transactionIds: string[];
+  status: "active" | "repaid" | "defaulted";
+}
+
+export interface ReservePortfolio {
+  centralBankId: string;
+  countryId: string;
+  accountIdsByCurrency: Record<string, string>;
+  targetWeightsBps: Record<string, number>;
+  goldUsdMinor: number;
+  sdrUsdMinor: number;
+  totalUsdMinor: number;
+}
+
+export interface FxRegimeState {
+  countryId: string;
+  regime: "FLOATING" | "MANAGED_FLOAT" | "PEG";
+  anchorCurrencyId: string;
+  targetRatePpm: number;
+  bandBps: number;
+  defenseCapacityUsdMinor: number;
+  status: "stable" | "under-pressure" | "failed";
+}
+
+export interface FxPressurePoint {
+  countryId: string;
+  elapsedMonth: number;
+  tradePressureUsdMinor: number;
+  capitalFlowPressureUsdMinor: number;
+  rateDifferentialBps: number;
+  interventionUsdMinor: number;
+  netPressureUsdMinor: number;
+  causeIds: string[];
 }
 
 export interface GoodsMovement {
@@ -550,6 +811,7 @@ export interface Company {
   parentCompanyId: string | null;
   subsidiaryIds: string[];
   goodwillCents: number;
+  globalInputConstraintBps: number;
 }
 
 export interface Bank {
@@ -1458,7 +1720,8 @@ export type UnderlyingReference =
   | { kind: "index"; indexId: string }
   | { kind: "currency-pair"; pairId: string }
   | { kind: "interest-rate"; monetaryAreaId: string }
-  | { kind: "credit"; obligationId: string };
+  | { kind: "credit"; obligationId: string }
+  | { kind: "commodity"; commodityId: string };
 
 export type DerivativeMotive = "FX_HEDGE" | "RATE_HEDGE" | "EQUITY_HEDGE" | "COVERED_INCOME" | "SPECULATION" | "RELATIVE_VALUE" | "FUNDING" | "SYNTHETIC_EXPOSURE" | "CREDIT_HEDGE" | "RISK_TRANSFER";
 
@@ -1842,10 +2105,11 @@ export interface MacroMonthlyPoint extends CountryMacroState {
 export type SimulationScenario = "baseline" | "high-demand" | "supply-constraint" | "high-rates" | "bank-liquidity-stress";
 
 export interface WorldState {
-  schemaVersion: 7;
-  saveVersion: 7;
+  schemaVersion: 8;
+  saveVersion: 8;
   seed: string;
   scenario: SimulationScenario;
+  baselineReference: WorldBaselineReference;
   clock: SimulationClock;
   ledger: LedgerState;
   goods: GoodDefinition[];
@@ -1943,6 +2207,25 @@ export interface WorldState {
   depositInsuranceSchemes: DepositInsuranceScheme[];
   countryMacroStates: CountryMacroState[];
   macroHistory: MacroMonthlyPoint[];
+  globalCommodities: GlobalCommodityDefinition[];
+  commodityMarkets: CommodityMarketState[];
+  resourceDeposits: ResourceDeposit[];
+  countryCommodityStates: CountryCommodityState[];
+  energyBalances: EnergyBalance[];
+  tradeRoutes: TradeRoute[];
+  ports: PortNode[];
+  tradeFlows: TradeFlow[];
+  strategicReserves: StrategicReserve[];
+  inputOutputCoefficients: InputOutputCoefficient[];
+  countrySectorInventories: CountrySectorInventory[];
+  balanceOfPayments: BalanceOfPaymentsRecord[];
+  internationalInvestmentPositions: InternationalInvestmentPosition[];
+  foreignDirectInvestments: ForeignDirectInvestment[];
+  internationalPortfolioPositions: InternationalPortfolioPosition[];
+  crossBorderLoans: CrossBorderLoanExposure[];
+  reservePortfolios: ReservePortfolio[];
+  fxRegimes: FxRegimeState[];
+  fxPressureHistory: FxPressurePoint[];
   nextSecurityId: number;
   nextHoldingId: number;
   nextBondId: number;
@@ -1970,6 +2253,10 @@ export interface WorldState {
   nextSovereignHoldingId: number;
   nextSovereignAuctionId: number;
   nextMonetaryDecisionId: number;
+  nextTradeFlowId: number;
+  nextFdiId: number;
+  nextInternationalPositionId: number;
+  nextCrossBorderLoanId: number;
 }
 
 export interface InvariantResult {

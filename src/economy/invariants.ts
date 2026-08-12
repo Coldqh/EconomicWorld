@@ -171,6 +171,7 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
     if (underlying.kind === "currency-pair") return world.fxPairs.some((pair) => pair.id === underlying.pairId);
     if (underlying.kind === "interest-rate") return world.monetaryAreas.some((area) => area.id === underlying.monetaryAreaId);
     if (underlying.kind === "index") return world.exchanges.some((exchange) => exchange.id === underlying.indexId) || world.countries.some((country) => country.id === underlying.indexId);
+    if (underlying.kind === "commodity") return world.globalCommodities.some((commodity) => commodity.id === underlying.commodityId);
     return world.corporateBonds.some((bond) => bond.id === underlying.obligationId) || world.sovereignBonds.some((bond) => bond.id === underlying.obligationId) || world.loans.some((loan) => loan.id === underlying.obligationId) || world.companies.some((company) => company.id === underlying.obligationId);
   };
   const brokenDerivative = world.derivativeContracts.find((contract) => contract.notionalMinor <= 0 || contract.maturityMonth < contract.startMonth || contract.counterpartyIds[0] === contract.counterpartyIds[1] || !validUnderlying(contract));
@@ -201,5 +202,13 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
 
   const brokenCentralBankSheet = world.centralBankBalanceSheets.find((sheet) => sheet.governmentSecuritiesMinor !== world.sovereignBondHoldings.filter((holding) => holding.holderId === sheet.centralBankId).reduce((sum, holding) => sum + holding.bookValueMinor, 0) || sheet.bankReservesMinor < 0 || !world.centralBanks.some((bank) => bank.id === sheet.centralBankId && bank.currencyId === sheet.currencyId));
   results.push(result("Денежная политика", "central-bank-balance", "Баланс центрального банка сверен", !brokenCentralBankSheet, brokenCentralBankSheet?.centralBankId ?? `${world.centralBankBalanceSheets.length} балансов`));
+  const negativeResource = world.resourceDeposits.find((deposit) => deposit.extractableReservesMilliUnits < 0 || deposit.extractableReservesMilliUnits > deposit.provenReservesMilliUnits);
+  results.push(result("Товары", "resource-conservation", "Добываемые запасы не создаются из ничего", !negativeResource, negativeResource?.id ?? `${world.resourceDeposits.length} месторождений сверены`));
+  const badTrade = world.tradeFlows.find((flow) => flow.quantityMilliUnits <= 0 || flow.exporterCountryId === flow.importerCountryId || flow.status === "settled" && flow.paymentTransactionIds.length === 0);
+  results.push(result("Товары", "trade-goods-money", "Поставка имеет товарную и денежную ноги", !badTrade, badTrade?.id ?? `${world.tradeFlows.length} поставок сверены`));
+  const brokenBop = world.balanceOfPayments.find((point) => point.currentAccountUsdMinor + point.capitalAccountUsdMinor + point.financialAccountUsdMinor + point.reserveChangeUsdMinor + point.errorsAndOmissionsUsdMinor !== point.reconciliationGapUsdMinor || point.reconciliationGapUsdMinor !== 0);
+  results.push(result("Национальные счета", "bop-reconciliation", "Платёжный баланс сходится", !brokenBop, brokenBop ? `${brokenBop.countryId}:${brokenBop.elapsedMonth}` : `${world.balanceOfPayments.length} периодов сверены`));
+  const overCapacityRoute = world.tradeRoutes.find((route) => route.usedCapacityMilliUnits > route.capacityMilliUnits);
+  results.push(result("Товары", "route-capacity", "Логистика не превышает пропускную способность", !overCapacityRoute, overCapacityRoute?.id ?? `${world.tradeRoutes.length} маршрутов`));
   return results;
 }

@@ -16,6 +16,7 @@ import { defaultBorrowerLoans, issueLoan, settleBorrowerLoansFromCash, serviceLo
 import { recordPlayerMonth } from "../player/system.ts";
 import { progressPlayerWorld } from "../player/world-commands.ts";
 import { compactLedgerHistory, migratePopulationCohorts, updateAggregateEconomies, updateWorldDiagnostics } from "../world/systems.ts";
+import { runGlobalEconomyMonth } from "./global-economy.ts";
 import { collectCountryMetrics, collectMetrics } from "./metrics.ts";
 import { calculateFundNav, runInstitutionalFinance } from "../finance/institutional.ts";
 import { processMarginRisk } from "../finance/leverage.ts";
@@ -199,6 +200,7 @@ function produceGoods(world: WorldState): void {
     const laborPotential = company.employees.length * 48_000;
     const capitalFactorBps = clamp(Math.round(Math.sqrt(company.productiveCapital.bookValueCents / Math.max(1, company.productiveCapital.acquisitionCostCents)) * 10_000), 3_000, 12_000);
     let output = Math.min(company.capacityMilliUnits, Math.round(laborPotential * company.productivityBps * company.technologyBps * company.managementBps * capitalFactorBps / 100_000_000_000_000));
+    output = Math.round(output * company.globalInputConstraintBps / 10_000);
     for (const [inputId, coefficient] of Object.entries(good.recipe)) output = Math.min(output, Math.floor((company.inputInventoryMilliUnits[inputId] ?? 0) / coefficient));
     output = Math.max(0, output);
     if (output <= 0) continue;
@@ -478,7 +480,7 @@ function foundCompanyIfNeeded(world: WorldState): void {
   const countryId = world.cities.find((city) => city.id === founder.cityId)!.countryId;
   const securityId = `security-${id}`;
   const boardId = `board-${id}`;
-  const company: Company = { id, name: `Новая ${good.shortName} ${world.nextCompanyId}`, goodId: good.id, ownerHouseholdId: founder.id, bankId: founder.bankId, active: true, employees: [], wageCents: founder.reservationWageCents, priceCents: good.basePriceCents, capacityMilliUnits: 80_000, productivityBps: 9_000, inventoryMilliUnits: 0, inventoryValueCents: 0, inputInventoryMilliUnits: Object.fromEntries(world.goods.map((item) => [item.id, 0])), inputInventoryValueCents: Object.fromEntries(world.goods.map((item) => [item.id, 0])), productiveCapital: { acquisitionCostCents: capital, bookValueCents: capital, accumulatedDepreciationCents: 0, usefulLifeMonths: 180, capacityMilliUnits: 80_000 }, retainedEarningsCents: 0, financialReports: [], lastProductionMilliUnits: 0, lastSalesMilliUnits: 0, lastGrossRevenueCents: 0, lastOperatingExpenseCents: 0, lastCogsCents: 0, lastIntermediateConsumptionCents: 0, lastIntermediateConsumptionBaseCents: 0, lastWagesCents: 0, lastDepreciationCents: 0, lastInterestCents: 0, lastTaxCents: 0, lastCapitalInvestmentCents: 0, lastHouseholdSalesCents: 0, lastGovernmentSalesCents: 0, distressMonths: 0, missedPayrollMonths: 0, foundedAtMonth: world.clock.elapsedMonths, closedAtMonth: null, closureReason: null, cityId: founder.cityId, productId: `product-${good.id}-${id}`, technologyBps: 8_000, managementBps: 7_500, learningByDoingBps: 0, qualityBps: 7_000, brandReputationBps: 4_000, marketShareBps: 0, marginalCostCents: Math.round(good.basePriceCents * 0.72), capacityUtilizationBps: 0, occupationFamilyNeeds: { production: 4, management: 1, sales: 1 }, headquartersCountryId: countryId, headquartersCityId: founder.cityId, industry: good.name, representationTier: "A", sizeClass: "small", corporateStatus: "private", equitySecurityId: securityId, boardId, parentCompanyId: null, subsidiaryIds: [], goodwillCents: 0 };
+  const company: Company = { id, name: `Новая ${good.shortName} ${world.nextCompanyId}`, goodId: good.id, ownerHouseholdId: founder.id, bankId: founder.bankId, active: true, employees: [], wageCents: founder.reservationWageCents, priceCents: good.basePriceCents, capacityMilliUnits: 80_000, productivityBps: 9_000, inventoryMilliUnits: 0, inventoryValueCents: 0, inputInventoryMilliUnits: Object.fromEntries(world.goods.map((item) => [item.id, 0])), inputInventoryValueCents: Object.fromEntries(world.goods.map((item) => [item.id, 0])), productiveCapital: { acquisitionCostCents: capital, bookValueCents: capital, accumulatedDepreciationCents: 0, usefulLifeMonths: 180, capacityMilliUnits: 80_000 }, retainedEarningsCents: 0, financialReports: [], lastProductionMilliUnits: 0, lastSalesMilliUnits: 0, lastGrossRevenueCents: 0, lastOperatingExpenseCents: 0, lastCogsCents: 0, lastIntermediateConsumptionCents: 0, lastIntermediateConsumptionBaseCents: 0, lastWagesCents: 0, lastDepreciationCents: 0, lastInterestCents: 0, lastTaxCents: 0, lastCapitalInvestmentCents: 0, lastHouseholdSalesCents: 0, lastGovernmentSalesCents: 0, distressMonths: 0, missedPayrollMonths: 0, foundedAtMonth: world.clock.elapsedMonths, closedAtMonth: null, closureReason: null, cityId: founder.cityId, productId: `product-${good.id}-${id}`, technologyBps: 8_000, managementBps: 7_500, learningByDoingBps: 0, qualityBps: 7_000, brandReputationBps: 4_000, marketShareBps: 0, marginalCostCents: Math.round(good.basePriceCents * 0.72), capacityUtilizationBps: 0, occupationFamilyNeeds: { production: 4, management: 1, sales: 1 }, headquartersCountryId: countryId, headquartersCityId: founder.cityId, industry: good.name, representationTier: "A", sizeClass: "small", corporateStatus: "private", equitySecurityId: securityId, boardId, parentCompanyId: null, subsidiaryIds: [], goodwillCents: 0, globalInputConstraintBps: 10_000 };
   world.companies.push(company);
   world.countries.find((country) => country.id === countryId)?.companyIds.push(id);
   world.equitySecurities.push({ id: securityId, companyId: id, className: "Обыкновенные акции", currencyId: world.countries.find((country) => country.id === countryId)!.currencyReference, sharesOutstanding: 100_000, votesPerShare: 1, status: "private" });
@@ -515,6 +517,7 @@ export function stepMonth(world: WorldState): void {
   updateAggregateEconomies(world);
   procureInputs(world);
   produceGoods(world);
+  runGlobalEconomyMonth(world);
   clearHouseholdMarket(world);
   governmentPurchases(world);
   depreciateCapital(world);

@@ -24,6 +24,9 @@ import { settleFinancialPayment } from "../src/finance/financial-settlement.ts";
 import { approvePrimeBrokerCapacity, createFxHedgeForFund, runAutonomousDerivativeDecisions } from "../src/finance/autonomous-derivatives.ts";
 import { getCountryEconomicProfile } from "../src/data/country-economic-profiles.ts";
 import { compareCalibrationSeries } from "../src/economy/calibration.ts";
+import { createCommodityFutureHedge, createForeignDirectInvestment, interveneFx, purchaseForeignEquity } from "../src/economy/global-economy.ts";
+import { runEconomicLab } from "../src/economy/economic-lab.ts";
+import { REAL_COUNTRY_PACKS } from "../src/data/real-world/country-packs.ts";
 import { compactLedgerHistory } from "../src/world/systems.ts";
 import { createCities } from "../src/world/catalog.ts";
 import { createPopulationCohorts } from "../src/world/cohorts.ts";
@@ -42,8 +45,8 @@ function depositMoney(world: WorldState): number {
 
 test("фазы 3 и 4 создают масштабный географический мир", () => {
   const world = createWorld();
-  assert.equal(world.schemaVersion, 7);
-  assert.equal(world.saveVersion, 7);
+  assert.equal(world.schemaVersion, 8);
+  assert.equal(world.saveVersion, 8);
   assert.equal(world.households.length, 100);
   assert.equal(world.people.length, 100);
   assert.equal(world.companies.length, 77);
@@ -216,7 +219,7 @@ test("старое сохранение мигрирует в мультивал
   delete legacy.fxTrades;
   delete legacy.fxDealers;
   const migrated = migrateWorldState(legacy);
-  assert.equal(migrated.schemaVersion, 7);
+  assert.equal(migrated.schemaVersion, 8);
   assert.ok(bankAccountsForOwner(migrated, migrated.player.householdId, "RUB").length > 0);
   assert.ok(migrated.bankAccounts.every((account) => migrated.ledger.accounts[account.ledgerDepositAccountId]));
   assert.equal(migrated.player.personId, "person-player");
@@ -224,7 +227,7 @@ test("старое сохранение мигрирует в мультивал
   assert.deepEqual(checkInvariants(migrated).filter((item) => !item.ok), []);
 });
 
-test("сохранение v6 мигрирует в v7 с профилями, историей и стратегиями фондов", () => {
+test("сохранение v6 мигрирует в v8 с профилями, историей и стратегиями фондов", () => {
   const legacy = structuredClone(createWorld()) as unknown as Record<string, unknown>;
   legacy.schemaVersion = 6;
   legacy.saveVersion = 6;
@@ -234,7 +237,7 @@ test("сохранение v6 мигрирует в v7 с профилями, и
   const funds = legacy.funds as Array<Record<string, unknown>>;
   for (const fund of funds) { delete fund.strategyProfileId; delete fund.primeBrokerIds; }
   const migrated = migrateWorldState(legacy);
-  assert.equal(migrated.schemaVersion, 7);
+  assert.equal(migrated.schemaVersion, 8);
   assert.equal(migrated.countryEconomicProfiles.length, migrated.countries.length);
   assert.ok(migrated.history.policy.hotLedgerMonths > 0);
   assert.ok(migrated.funds.every((fund) => fund.strategyProfileId && fund.primeBrokerIds.length > 0));
@@ -908,6 +911,63 @@ test("калибровка считает ошибки и направление
   assert.equal(result.observations, 3);
   assert.ok(result.rootMeanSquaredError > 0);
   assert.equal(result.trendDirectionAccuracyBps, 10_000);
+});
+
+test("глобальная торговля сохраняет товар, деньги, FX и платёжный баланс", () => {
+  const world = createWorld();
+  const reservesBefore = world.resourceDeposits.reduce((sum, deposit) => sum + deposit.extractableReservesMilliUnits, 0);
+  runMonths(world, 2);
+  assert.ok(world.tradeFlows.length > 0);
+  assert.ok(world.tradeFlows.every((flow) => flow.status === "settled" && flow.paymentTransactionIds.length > 0));
+  assert.ok(world.fxTrades.some((trade) => world.tradeFlows.some((flow) => flow.fxTradeId === trade.id)));
+  assert.ok(world.resourceDeposits.reduce((sum, deposit) => sum + deposit.extractableReservesMilliUnits, 0) < reservesBefore);
+  assert.ok(world.balanceOfPayments.every((point) => point.reconciliationGapUsdMinor === 0));
+  assert.deepEqual(checkInvariants(world).filter((item) => !item.ok), []);
+});
+
+test("разрыв импортной цепочки ограничивает производство через коэффициенты затрат", () => {
+  const world = createWorld();
+  world.tradeRoutes.filter((route) => route.destinationCountryId === "jp").forEach((route) => { route.capacityMilliUnits = 1; });
+  world.countryCommodityStates.filter((state) => state.countryId === "jp").forEach((state) => { state.inventoryMilliUnits = 0; });
+  runMonths(world, 2);
+  assert.ok(world.companies.filter((company) => company.headquartersCountryId === "jp").some((company) => company.globalInputConstraintBps < 10_000));
+});
+
+test("FDI и иностранная акция создают позиции и зеркальные финансовые потоки", () => {
+  const world = createWorld();
+  const parent = world.companies.find((company) => company.headquartersCountryId === "us")!;
+  const target = world.companies.find((company) => company.headquartersCountryId === "de")!;
+  const fdi = createForeignDirectInvestment(world, parent.id, "de", 10_000);
+  assert.ok(fdi);
+  assert.equal(target.parentCompanyId, parent.id);
+  const fund = world.funds.find((item) => world.assetManagers.find((manager) => manager.id === item.managerId)?.countryId === "us")!;
+  const foreignSecurity = world.equitySecurities.find((security) => world.companies.find((company) => company.id === security.companyId)?.headquartersCountryId === "de")!;
+  assert.ok(purchaseForeignEquity(world, fund.id, foreignSecurity.id, 1));
+  assert.equal(world.internationalPortfolioPositions.length, 1);
+  assert.equal(world.internationalPortfolioPositions[0].ownerCountryId, "us");
+});
+
+test("товарный фьючерс не создаёт физический товар, а интервенция ограничена резервами", () => {
+  const world = createWorld();
+  const company = world.companies.find((item) => item.headquartersCountryId === "us")!;
+  const inventoryBefore = world.countryCommodityStates.reduce((sum, item) => sum + item.inventoryMilliUnits, 0);
+  assert.ok(createCommodityFutureHedge(world, company.id, "crude-oil", false));
+  assert.equal(world.countryCommodityStates.reduce((sum, item) => sum + item.inventoryMilliUnits, 0), inventoryBefore);
+  const portfolio = world.reservePortfolios.find((item) => item.countryId === "ru")!;
+  assert.equal(interveneFx(world, "ru", "USD", "RUB", Number.MAX_SAFE_INTEGER).ok, false);
+  assert.ok(interveneFx(world, "ru", "USD", "RUB", 10_000).ok);
+  assert.ok(portfolio.totalUsdMinor > 0);
+});
+
+test("реальный мир загружает документированные packs, лаборатория воспроизводима", () => {
+  const world = createWorld("baseline", { mode: "REAL_WORLD" });
+  assert.equal(world.baselineReference.mode, "REAL_WORLD");
+  assert.equal(world.countryEconomicProfiles.find((profile) => profile.countryId === "us")?.population, REAL_COUNTRY_PACKS.find((pack) => pack.countryId === "us")?.population);
+  assert.equal(world.banks.find((bank) => bank.countryId === "us")?.name, "JPMorgan Chase");
+  const first = runEconomicLab(world, { countryId: "ru", horizonMonths: 2, policyRateDeltaBps: 100 });
+  const second = runEconomicLab(world, { countryId: "ru", horizonMonths: 2, policyRateDeltaBps: 100 });
+  assert.equal(first.deterministicFingerprint, second.deterministicFingerprint);
+  assert.deepEqual(first.deltas, second.deltas);
 });
 
 test("автономный мир проходит 20 лет с архивированием истории", { timeout: 90_000 }, () => {
