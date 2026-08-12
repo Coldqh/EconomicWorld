@@ -35,6 +35,7 @@ function defaultSettlement(mode: "cash" | "physical" = "cash", frequencyMonths =
 }
 
 export function underlyingPriceMinor(world: WorldState, underlying: UnderlyingReference): number | null {
+  if (underlying.kind === "commodity") return world.commodityMarkets.find((market) => market.commodityId === underlying.commodityId)?.spotPriceUsdMinor ?? null;
   if (underlying.kind === "equity") return world.listings.find((listing) => listing.securityId === underlying.securityId)?.lastPriceCents ?? null;
   if (underlying.kind === "bond") {
     const corporate = world.corporateBonds.find((bond) => bond.id === underlying.bondId);
@@ -63,7 +64,7 @@ export function createForward(
   maturityMonths: number,
   settlementMode: "cash" | "physical" = "cash",
 ): ForwardContract | null {
-  const currencyId = underlying.kind === "equity"
+  const currencyId = underlying.kind === "commodity" ? "USD" : underlying.kind === "equity"
     ? world.equitySecurities.find((security) => security.id === underlying.securityId)?.currencyId
     : underlying.kind === "currency-pair"
       ? world.fxPairs.find((pair) => pair.id === underlying.pairId)?.quoteCurrencyId

@@ -267,7 +267,7 @@ export class SaveRepository {
     snapshot.events = events;
     snapshot.goodsMovements = goodsMovements;
     if (manifest && (transactions.length !== manifest.transactionCount || events.length !== manifest.eventCount)) throw new Error("Сохранение неполно: нарушена целостность сегментов");
-    if (snapshot.schemaVersion < 7 || snapshot.saveVersion < 7) {
+    if (snapshot.schemaVersion < 8 || snapshot.saveVersion < 8) {
       const backupDatabase = await this.database();
       const backupTransaction = backupDatabase.transaction("migrationBackups", "readwrite");
       backupTransaction.objectStore("migrationBackups").put({ key: `${id}:${new Date().toISOString()}`, saveId: id, createdAtIso: new Date().toISOString(), snapshot: structuredClone(snapshot) });

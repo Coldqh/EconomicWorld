@@ -22,8 +22,11 @@ import { buyToCover, marginAccountState, openMarginAccount, placeMarginBuy, plac
 import { createFuture, derivativeExposure, writeOption } from "../finance/derivatives.ts";
 import { valueEuropeanOption } from "../finance/option-pricing.ts";
 import { APP_BUILD, applyAppUpdate, checkForUpdate, registerAppServiceWorker, serviceWorkerDiagnostics, type UpdateState } from "../pwa/update-manager.ts";
+import { runEconomicLab, type EconomicLabResult } from "../economy/economic-lab.ts";
+import { loadHistoricalSeries } from "../data/real-world/historical-series.ts";
+import { compareCalibrationSeries, type CalibrationResult } from "../economy/calibration.ts";
 
-type View = "life" | "world" | "career" | "education" | "finances" | "economy" | "companies" | "markets" | "portfolio" | "banks" | "ledger" | "control" | "settings";
+type View = "life" | "world" | "career" | "education" | "finances" | "economy" | "global" | "lab" | "companies" | "markets" | "portfolio" | "banks" | "ledger" | "control" | "settings";
 
 const NAV: Array<{ id: View; label: string; short: string }> = [
   { id: "life", label: "Моя жизнь", short: "Жизнь" },
@@ -32,6 +35,8 @@ const NAV: Array<{ id: View; label: string; short: string }> = [
   { id: "education", label: "Институты", short: "Вузы" },
   { id: "finances", label: "Мои финансы", short: "Финансы" },
   { id: "economy", label: "Экономика", short: "Экономика" },
+  { id: "global", label: "Мировая экономика", short: "Мир" },
+  { id: "lab", label: "Экономическая лаборатория", short: "Лаборатория" },
   { id: "companies", label: "Компании", short: "Компании" },
   { id: "markets", label: "Рынки", short: "Рынки" },
   { id: "portfolio", label: "Портфель", short: "Портфель" },
@@ -444,6 +449,36 @@ function countLabels<T>(rows: readonly T[], key: (row: T) => string): Array<read
   return [...counts.entries()].sort((left, right) => right[1] - left[1]);
 }
 
+function GlobalEconomy({ world, openWhy }: { world: WorldState; openWhy: (title: string, text: string) => void }) {
+  const [countryId, setCountryId] = useState(world.cities.find((city) => city.id === world.player.currentCityId)?.countryId ?? "ru");
+  const [tab, setTab] = useState<"trade" | "commodities" | "external" | "fx">("trade");
+  const country = world.countries.find((item) => item.id === countryId)!;
+  const flows = world.tradeFlows.filter((flow) => flow.exporterCountryId === countryId || flow.importerCountryId === countryId).slice(-80).reverse();
+  const bop = [...world.balanceOfPayments].reverse().find((item) => item.countryId === countryId);
+  const niip = [...world.internationalInvestmentPositions].reverse().find((item) => item.countryId === countryId);
+  const pressure = [...world.fxPressureHistory].reverse().find((item) => item.countryId === countryId);
+  const partners = countLabels(flows, (flow) => flow.exporterCountryId === countryId ? flow.importerCountryId : flow.exporterCountryId).slice(0, 8);
+  return <><Section title="Мировая экономика" meta={`${world.tradeFlows.length} активных поставок · ${world.globalCommodities.length} рынков`} />
+    <div className="market-filters macro-filters"><div className="compact-tabs">{[["trade","Торговля"],["commodities","Сырьё"],["external","Внешний сектор"],["fx","Валютное давление"]].map(([id,label]) => <button className={tab === id ? "active" : ""} key={id} onClick={() => setTab(id as typeof tab)}>{label}</button>)}</div><select value={countryId} onChange={(event) => setCountryId(event.target.value)}>{world.countries.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div>
+    {tab === "trade" && <><section className="kpi-grid four"><Kpi label="Экспорт" value={compactMoney(bop?.goodsExportsUsdMinor ?? 0,"USD")} open={openWhy} /><Kpi label="Импорт" value={compactMoney(bop?.goodsImportsUsdMinor ?? 0,"USD")} open={openWhy} /><Kpi label="Маршруты" value={String(world.tradeRoutes.filter((route) => route.originCountryId === countryId || route.destinationCountryId === countryId).length)} open={openWhy} /><Kpi label="Порты" value={String(world.ports.filter((port) => port.countryId === countryId).length)} open={openWhy} /></section><section className="two-column"><article className="panel diagnostic-card"><header className="panel-title"><h2>Партнёры</h2><span>{country.name}</span></header><div className="diagnostic-list">{partners.map(([id,count]) => <div key={id}><span>{world.countries.find((item) => item.id === id)?.name ?? id}</span><strong>{count}</strong></div>)}</div></article><article className="panel diagnostic-card"><header className="panel-title"><h2>Поставки</h2><span>{flows.length}</span></header><div className="diagnostic-list">{flows.slice(0,10).map((flow) => <div key={flow.id}><span>{world.globalCommodities.find((item) => item.id === flow.commodityId)?.name} · {flow.exporterCountryId.toUpperCase()} → {flow.importerCountryId.toUpperCase()}</span><strong>{number.format(flow.quantityMilliUnits/1000)}</strong></div>)}</div></article></section></>}
+    {tab === "commodities" && <section className="commodity-board">{world.commodityMarkets.map((market) => <article className="panel" key={market.commodityId}><span>{world.globalCommodities.find((item) => item.id === market.commodityId)?.category}</span><h2>{world.globalCommodities.find((item) => item.id === market.commodityId)?.name}</h2><strong>{currencyMoney(market.spotPriceUsdMinor,"USD")}</strong><small>{percent(market.shortageBps)} дефицит · {number.format(market.globalInventoryMilliUnits/1000)} запас</small></article>)}</section>}
+    {tab === "external" && <section className="kpi-grid four"><Kpi label="Текущий счёт" value={compactMoney(bop?.currentAccountUsdMinor ?? 0,"USD")} open={openWhy} /><Kpi label="Финансовый счёт" value={compactMoney(bop?.financialAccountUsdMinor ?? 0,"USD")} open={openWhy} /><Kpi label="NIIP" value={compactMoney(niip?.netInternationalInvestmentPositionUsdMinor ?? 0,"USD")} open={openWhy} /><Kpi label="Внешний долг" value={compactMoney((niip?.publicExternalDebtUsdMinor ?? 0)+(niip?.privateExternalDebtUsdMinor ?? 0),"USD")} open={openWhy} /></section>}
+    {tab === "fx" && <section className="two-column"><article className="panel national-accounts"><dl><div><dt>Торговля</dt><dd>{compactMoney(pressure?.tradePressureUsdMinor ?? 0,"USD")}</dd></div><div><dt>Капитал</dt><dd>{compactMoney(pressure?.capitalFlowPressureUsdMinor ?? 0,"USD")}</dd></div><div><dt>Дифференциал ставок</dt><dd>{percent(pressure?.rateDifferentialBps ?? 0)}</dd></div><div><dt>Интервенции</dt><dd>{compactMoney(pressure?.interventionUsdMinor ?? 0,"USD")}</dd></div></dl></article><article className="panel diagnostic-card"><header className="panel-title"><h2>Режим</h2><button onClick={() => openWhy("Валютное давление", `Фактические причины: ${pressure?.causeIds.join(", ") || "нет исполненных потоков"}`)}>Почему?</button></header><dl><div><dt>Режим</dt><dd>{world.fxRegimes.find((item) => item.countryId === countryId)?.regime}</dd></div><div><dt>Резервы</dt><dd>{compactMoney(world.reservePortfolios.find((item) => item.countryId === countryId)?.totalUsdMinor ?? 0,"USD")}</dd></div></dl></article></section>}
+  </>;
+}
+
+function EconomicLab({ world }: { world: WorldState }) {
+  const [countryId, setCountryId] = useState("ru");
+  const [rateDelta, setRateDelta] = useState(100);
+  const [horizon, setHorizon] = useState(12);
+  const [result, setResult] = useState<EconomicLabResult | null>(null);
+  const [validation, setValidation] = useState<CalibrationResult[]>([]);
+  const [running, setRunning] = useState(false);
+  const run = () => { setRunning(true); window.setTimeout(() => { setResult(runEconomicLab(world, { countryId, horizonMonths: horizon, policyRateDeltaBps: rateDelta })); setRunning(false); }, 0); };
+  const validate = async () => { const series = await loadHistoricalSeries(countryId); const values = new Map(world.macroHistory.filter((point) => point.countryId === countryId).map((point) => [point.elapsedMonth, point.gdpGrowthBps])); setValidation(series.map((reference) => compareCalibrationSeries(reference, values))); };
+  return <><Section title="Экономическая лаборатория" meta="Детерминированный контрфактический клон" /><section className="lab-layout"><article className="panel lab-controls"><label>Страна<select value={countryId} onChange={(event) => setCountryId(event.target.value)}>{world.countries.map((country) => <option key={country.id} value={country.id}>{country.name}</option>)}</select></label><label>Изменение ставки, п.п.<input type="number" value={rateDelta/100} step="0.25" onChange={(event) => setRateDelta(Math.round(Number(event.target.value)*100))} /></label><label>Горизонт<select value={horizon} onChange={(event) => setHorizon(Number(event.target.value))}><option value="6">6 месяцев</option><option value="12">1 год</option><option value="24">2 года</option></select></label><button className="primary" disabled={running} onClick={run}>{running ? "Расчёт…" : "Сравнить миры"}</button><button onClick={() => { void validate(); }}>Историческая проверка</button></article><div>{result ? <><section className="kpi-grid two">{result.deltas.map((delta) => <Kpi key={delta.metric} label={delta.metric} value={number.format(delta.delta)} note={`${number.format(delta.baseline)} → ${number.format(delta.counterfactual)}`} open={() => undefined} />)}</section><article className="panel diagnostic-card"><header className="panel-title"><h2>Наблюдаемая цепочка</h2><span>{result.deterministicFingerprint}</span></header><div className="diagnostic-list">{result.causalChain.map((link,index) => <div key={`${link.to}-${index}`}><span>{link.from} → {link.to}</span><strong>{number.format(link.observedContribution)}</strong></div>)}</div></article></> : <article className="panel empty">Задайте изменение и запустите сравнение.</article>}{validation.length > 0 && <article className="panel diagnostic-card"><header className="panel-title"><h2>Историческая проверка</h2><span>{validation.length} рядов</span></header><div className="diagnostic-list">{validation.map((item) => <div key={item.seriesId}><span>{item.seriesId} · корр. {percent(item.correlationBps)}</span><strong>RMSE {number.format(item.rootMeanSquaredError)}</strong></div>)}</div></article>}</div></section></>;
+}
+
 function Control({ world }: { world: WorldState }) {
   const [tab, setTab] = useState<"performance" | "save" | "ledger" | "finance" | "countries">("performance");
   const invariants = checkInvariants(world);
@@ -591,7 +626,7 @@ export function App() {
   useEffect(() => { if (!playing || busy || restoring) return; const timer = window.setTimeout(() => { void advance(speed, false); }, 1_000); return () => window.clearTimeout(timer); }, [playing, busy, restoring, speed, advance]);
   const save = async () => { setBusy(true); try { await repository.save(worldRef.current, "Ручное сохранение", "manual"); setSaves(await repository.list()); setNotice("Мир сохранён"); } finally { setBusy(false); } };
   const load = async () => { const target = saves[0]; if (!target) return; setBusy(true); try { worldRef.current = await repository.load(target.id); commit(); setNotice("Сохранение загружено"); } finally { setBusy(false); } };
-  const reset = () => { if (!window.confirm("Создать новый мир?")) return; worldRef.current = createWorld(); commit(); setPlaying(false); setShowOnboarding(true); setNotice("Новый мир создан"); };
+  const reset = () => { if (!window.confirm("Создать новый мир?")) return; const real = window.confirm("Использовать калиброванный реальный мир?\nОК — реальный baseline 2023; Отмена — синтетический мир."); worldRef.current = createWorld("baseline", { mode: real ? "REAL_WORLD" : "SYNTHETIC" }); commit(); setPlaying(false); setShowOnboarding(true); setNotice(real ? "Реальный мир создан · данные являются модельной калибровкой, а не точной копией реальности" : "Синтетический мир создан"); };
   const profile = (name: string, profileId: string) => { setPlayerProfile(worldRef.current, name, profileId); commit(); try { localStorage.setItem("economic-world-onboarded-v2", "1"); } catch { /* недоступно */ } setShowOnboarding(false); };
   const checkUpdate = async () => { setUpdateState("checking"); setUpdateState(await checkForUpdate()); };
   const updateNow = async (force = false) => { setUpdateState("applying"); try { await applyAppUpdate(saveActiveNow, force); } catch { setUpdateState("error"); } };
@@ -622,6 +657,8 @@ export function App() {
           {view === "education" && <Education world={world} commit={commit} notify={setNotice} openWhy={openWhy} />}
           {view === "finances" && <MyFinances world={world} commit={commit} notify={setNotice} openWhy={openWhy} />}
           {view === "economy" && <Economy world={world} openWhy={openWhy} />}
+          {view === "global" && <GlobalEconomy world={world} openWhy={openWhy} />}
+          {view === "lab" && <EconomicLab world={world} />}
           {view === "companies" && <Companies world={world} commit={commit} notify={setNotice} openWhy={openWhy} />}
           {view === "markets" && <Markets world={world} commit={commit} notify={setNotice} />}
           {view === "portfolio" && <Portfolio world={world} commit={commit} notify={setNotice} />}
