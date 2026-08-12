@@ -41,6 +41,7 @@ import { seedLeverageFinance } from "../finance/leverage.ts";
 import { seedClearingHouses } from "../finance/clearing.ts";
 import { seedDerivativeMarkets } from "../finance/derivatives.ts";
 import { seedMacroeconomics } from "./macroeconomics.ts";
+import { initializeRealWorldReconciliation } from "./real-world-reconciliation.ts";
 import { createFirmCohorts, createPopulationCohorts } from "../world/cohorts.ts";
 import { createCities, createCountries, createHousingCohorts, createProducts, createUniversities } from "../world/catalog.ts";
 import { updateWorldDiagnostics } from "../world/systems.ts";
@@ -166,6 +167,7 @@ function createCompanies(profiles: readonly CountryEconomicProfile[], cities: re
       subsidiaryIds: [],
       goodwillCents: 0,
       globalInputConstraintBps: 10_000,
+      baselineFinancials: null,
     };
   });
 }
@@ -216,6 +218,7 @@ function createInstitutions(scenario: SimulationScenario, profiles: readonly Cou
     baseCurrency: pack.currencyId,
     centralBankId: pack.currencyId === "EUR" ? "monetary-authority-eur" : `central-bank-${pack.countryId}`,
     representationTier: "A" as const,
+    baselineFinancials: null,
   })));
   const governments: Government[] = COUNTRY_ECONOMY_PACKS.map((pack) => {
     const profile = profiles.find((item) => item.countryId === pack.countryId)!;
@@ -226,7 +229,7 @@ function createInstitutions(scenario: SimulationScenario, profiles: readonly Cou
     incomeTaxBps: profile.taxProfile.incomeTaxBps,
     salesTaxBps: profile.taxProfile.consumptionTaxBps,
     corporateTaxBps: profile.taxProfile.corporateTaxBps,
-    monthlyUnemploymentBenefitCents: Math.max(100_000, Math.round(profile.baselineNominalGdpMinor * 10_000 / Math.max(1, profile.population) * 0.28)),
+    monthlyUnemploymentBenefitCents: Math.max(100_000, Math.round(profile.baselineNominalGdpMinor * 10_000 / Math.max(1, profile.population) * 0.28 / (profile.metadata.sourceType === "REAL_DATA" ? 12 : 1))),
   });
   });
   const exchanges: Exchange[] = COUNTRY_ECONOMY_PACKS.map((pack) => ({
@@ -353,7 +356,7 @@ export interface WorldCreationOptions {
 export function createWorld(scenario: SimulationScenario = "baseline", options: WorldCreationOptions = {}): WorldState {
   const mode = options.mode ?? "SYNTHETIC";
   const countryEconomicProfiles = structuredClone(COUNTRY_ECONOMIC_PROFILES);
-  if (mode === "REAL_WORLD") applyCountryPackToProfiles(countryEconomicProfiles);
+  if (mode === "REAL_WORLD") applyCountryPackToProfiles(countryEconomicProfiles, options.referenceYear ?? 2023);
   const monetaryAreaProfiles = structuredClone(MONETARY_AREA_ECONOMIC_PROFILES);
   const { banks, governments, centralBanks, exchanges, brokers } = createInstitutions(scenario, countryEconomicProfiles, monetaryAreaProfiles);
   const cities = createCities(GOODS, countryEconomicProfiles);
@@ -399,8 +402,8 @@ export function createWorld(scenario: SimulationScenario = "baseline", options: 
     }
   }
   const world: WorldState = {
-    schemaVersion: 8, saveVersion: 8, seed: "economic-world-v8", scenario,
-    baselineReference: { mode, baselineDate: options.baselineDate ?? (mode === "REAL_WORLD" ? "2023-12-31" : "2026-01-01"), referenceYear: options.referenceYear ?? (mode === "REAL_WORLD" ? 2023 : 2026), countryPackVersion: mode === "REAL_WORLD" ? "real-world-v1" : "synthetic-v1", calibrationSetId: mode === "REAL_WORLD" ? "wdi-2023-v1" : "synthetic-neutral-v1" },
+    schemaVersion: 9, saveVersion: 9, seed: "economic-world-v9", scenario,
+    baselineReference: { mode, baselineDate: options.baselineDate ?? (mode === "REAL_WORLD" ? "2023-12-31" : "2026-01-01"), referenceYear: options.referenceYear ?? (mode === "REAL_WORLD" ? 2023 : 2026), countryPackVersion: mode === "REAL_WORLD" ? "real-world-v2" : "synthetic-v1", calibrationSetId: mode === "REAL_WORLD" ? "reconciled-2023-v2" : "synthetic-neutral-v1", replayObservedExternalShocks: false },
     clock: { startYear: options.referenceYear ?? (mode === "REAL_WORLD" ? 2023 : 2026), startMonth: mode === "REAL_WORLD" ? 12 : 1, elapsedMonths: 0 }, ledger: createLedger(), goods: structuredClone(GOODS), goodsMovements: [], people, households, companies, banks,
     government: governments.find((item) => item.countryId === "ru")!,
     centralBank: centralBanks.find((item) => item.countryId === "ru")!,
@@ -415,9 +418,12 @@ export function createWorld(scenario: SimulationScenario = "baseline", options: 
     player: { personId: "person-player", householdId: "household-001", profileId: "student", automaticBasicSpending: false, consumptionBudgetBps: 7_500, savingsTargetBps: 2_500, pendingJobOffer: null, jobApplications: [], activeEnrollment: null, completedCourseIds: [], completedLessonIds: [], monthlyHistory: [], timeline: [], commandLog: [], nextCommandId: 1, nextTimelineId: 1, currentCityId: "moscow", residencePropertyId: null, activeTravel: null, universityApplications: [], activeUniversityEnrollment: null, completedProgramIds: [], educationHistory: [], visitedCityIds: ["moscow"], visitedCountryIds: ["ru"], residenceHistory: [{ cityId: "moscow", fromMonth: 0, toMonth: null }], durableAssetIds: [], propertyIds: [], brokerageAccountIds: [], bankAccountIds: [], reportingCurrencyId: "RUB", foodPlanId: "basic" },
     events: [], metricsHistory: [], countryMetricsHistory: [], nextEventId: 1, nextGoodsMovementId: 1, nextLoanId: 1, nextFundingId: 1, nextCompanyId: companies.length + 1,
     countries, countryEconomicProfiles, monetaryAreaProfiles, cities, universities, universityPrograms, housingCohorts, properties: [], products: createProducts(), durableAssets: [], populationCohorts, firmCohorts,
+    countryScaleReconciliations: [], realWorldInitializationReports: [], tradeSectors: [], logisticsSectors: [], bankingSectorCohorts: [], sovereignHolderCohorts: [],
+    calibratedParameters: { consumptionIncomeElasticityBps: 9_000, investmentRateSensitivityBps: 4_500, priceAdjustmentSpeedBps: 1_200, wageAdjustmentSpeedBps: 850, creditDemandSensitivityBps: 5_000, employmentAdjustmentSpeedBps: 700 },
+    countryCalibratedParameters: {}, policyInterventions: [], macroContributionEvents: [],
     fidelity: { tierByEntityId: Object.fromEntries(people.map((person) => [person.id, person.fidelityTier])), relevanceByEntityId: { "person-player": 10_000 }, materializedPersonIds: [], budgets: { maxNamedPersons: 500, maxActivePersons: 200, maxFullCompanies: 120, maxActiveProperties: 300 }, activeCityIds: ["moscow"] },
     ledgerArchives: [],
-    history: { policy: { hotLedgerMonths: 6, detailedArchiveMonths: 60, playerDetailMonths: 120, marketDetailMonths: 24, companyReportMonths: 36, detailedMetricMonths: 24, derivativeDetailMonths: 24, tradeDetailMonths: 24 }, importantLedgerTransactions: [], compactedLedgerRecords: [], compactedDerivativeRecords: [], compactedMarketRecords: [], companyAnnualRecords: [], compactedEventRecords: [], compactedTradeRecords: [], globalSeries: { months: [], columns: {} }, countrySeries: {}, lastCompactedMonth: 0 },
+    history: { policy: { hotLedgerMonths: mode === "REAL_WORLD" ? 1 : 6, detailedArchiveMonths: 24, playerDetailMonths: 120, marketDetailMonths: mode === "REAL_WORLD" ? 12 : 24, companyReportMonths: 36, detailedMetricMonths: 24, derivativeDetailMonths: 24, tradeDetailMonths: mode === "REAL_WORLD" ? 3 : 24 }, importantLedgerTransactions: [], compactedLedgerRecords: [], compactedDerivativeRecords: [], compactedMarketRecords: [], companyAnnualRecords: [], compactedEventRecords: [], compactedTradeRecords: [], globalSeries: { months: [], columns: {} }, countrySeries: {}, lastCompactedMonth: 0 },
     diagnostics: { populationRepresented: 0, businessesRepresented: 0, highFidelityPersons: 0, materializedPersons: 0, explicitFirms: 0, firmCohorts: 0, materializedProperties: 0, housingUnitsRepresented: 0, ledgerHotTransactions: 0, ledgerArchivedTransactions: 0, ledgerCompactedTransactions: 0, estimatedSaveBytes: 0, activeDerivativeContracts: 0, activeMarketOrders: 0, historyRecordCount: 0, memoryPressure: "normal", saveBreakdown: { totalBytes: 0, ledgerBytes: 0, marketsBytes: 0, historyBytes: 0, derivativesBytes: 0, companiesBytes: 0, populationBytes: 0, sovereignBytes: 0, otherBytes: 0 }, deterministicWorkUnits: 0 },
     nextMaterializedPersonId: 1, nextPropertyId: 1, nextDurableAssetId: 1, nextApplicationId: 1,
     equitySecurities: ownership.equitySecurities,
@@ -429,7 +435,7 @@ export function createWorld(scenario: SimulationScenario = "baseline", options: 
     marginAccounts: [], marginCalls: [], collateralPledges: [], securitiesLoans: [], shortPositions: [], repoAgreements: [], primeBrokerExposures: [],
     derivativeContracts: [], optionMarketSeries: [], nettingSets: [], clearingHouses: [], clearingMemberAccounts: [], clearedPositions: [], derivativeMarginCalls: [], derivativeExposureHistory: [],
     sovereignBonds: [], sovereignBondHoldings: [], sovereignAuctions: [], yieldCurveHistory: [], governmentBudgets: [], centralBankBalanceSheets: [], monetaryPolicyDecisions: [], depositInsuranceSchemes: [], countryMacroStates: [], macroHistory: [],
-    globalCommodities: [], commodityMarkets: [], resourceDeposits: [], countryCommodityStates: [], energyBalances: [], tradeRoutes: [], ports: [], tradeFlows: [], strategicReserves: [], inputOutputCoefficients: [], countrySectorInventories: [], balanceOfPayments: [], internationalInvestmentPositions: [], foreignDirectInvestments: [], internationalPortfolioPositions: [], crossBorderLoans: [], reservePortfolios: [], fxRegimes: [], fxPressureHistory: [],
+    globalCommodities: [], commodityMarkets: [], resourceDeposits: [], countryCommodityStates: [], energyBalances: [], tradeRoutes: [], ports: [], tradeFlows: [], strategicReserves: [], inputOutputCoefficients: [], countrySectorInventories: [], physicalCommodityFlows: [], balanceOfPayments: [], internationalInvestmentPositions: [], foreignDirectInvestments: [], internationalPortfolioPositions: [], crossBorderLoans: [], externalClaims: [], reservePortfolios: [], fxRegimes: [], fxPressureHistory: [],
     nextSecurityId: companies.length + 1, nextHoldingId: ownership.equityHoldings.length + 1, nextBondId: 1, nextCorporateActionId: 1,
     nextAcquisitionId: 1, nextBrokerageAccountId: 1, nextOrderId: 1, nextTradeId: 1, nextOrderSequence: 1,
     nextBankAccountId: 1, nextFxOrderId: 1, nextFxTradeId: 1, nextFundUnitHoldingId: 1,
@@ -485,6 +491,7 @@ export function createWorld(scenario: SimulationScenario = "baseline", options: 
   assignInitialEmployment(world);
   seedInstitutionalFinance(world);
   seedLeverageFinance(world);
+  initializeRealWorldReconciliation(world);
   seedMacroeconomics(world);
   seedClearingHouses(world);
   seedDerivativeMarkets(world);

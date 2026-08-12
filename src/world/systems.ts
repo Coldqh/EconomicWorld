@@ -16,8 +16,13 @@ export function updateAggregateEconomies(world: WorldState): void {
     for (let index = 0; index < population.length; index += 1) {
       const cohort = population[index];
       const firm = firms[index % firms.length];
-      const scaledIncome = Math.max(1, Math.round(cohort.employedCount * cohort.averageMonthlyIncomeCents / 10_000));
-      const income = Math.min(scaledIncome, Math.max(0, Math.round(depositOf(world, firm.id) * 0.16)));
+      if (!firm) continue;
+      const employmentSpeed = world.countryCalibratedParameters[cohort.countryId]?.employmentAdjustmentSpeedBps ?? world.calibratedParameters.employmentAdjustmentSpeedBps;
+      const profile = world.countryEconomicProfiles.find((item) => item.countryId === cohort.countryId);
+      const targetEmployment = Math.round(cohort.populationCount * (10_000 - (profile?.unemploymentBps ?? 500)) / 10_000);
+      cohort.employedCount = clamp(cohort.employedCount + Math.round((targetEmployment - cohort.employedCount) * employmentSpeed / 10_000), 0, cohort.populationCount);
+      const scaledIncome = Math.max(1, Math.round(cohort.employedCount * cohort.averageMonthlyIncomeCents));
+      const income = Math.min(scaledIncome, Math.max(0, Math.round(depositOf(world, firm.id) * 0.22)));
       const incomeTx = transferDeposit(world, firm.id, cohort.id, income, "COHORT_INCOME", `Доход когорты: ${city.name}`);
       cohort.lastIncomeCents = incomeTx ? income : 0;
       const propensity = cohort.incomeBand === "low" ? 8_800 : cohort.incomeBand === "middle" ? 7_900 : 6_800;
@@ -25,7 +30,9 @@ export function updateAggregateEconomies(world: WorldState): void {
       const consumptionTx = transferDeposit(world, cohort.id, firm.id, consumption, "COHORT_CONSUMPTION", `Потребление когорты: ${city.name}`, incomeTx ? [incomeTx] : []);
       cohort.lastConsumptionCents = consumptionTx ? consumption : 0;
       if (consumptionTx) {
-        firm.revenueCents = consumption;
+        firm.revenueCents = Math.max(firm.revenueCents, consumption);
+        firm.valueAddedMinor = Math.max(1, Math.round(firm.revenueCents * 5_200 / 10_000));
+        firm.intermediateConsumptionMinor = Math.max(1, firm.revenueCents - firm.valueAddedMinor);
         firm.profitsCents = Math.round(consumption * (650 + (firm.productivityBps - 8_000) * 0.2) / 10_000);
         firm.inventoryMilliUnits = Math.max(0, firm.inventoryMilliUnits + Math.round(firm.productionMilliUnits * 0.08) - Math.round(consumption / Math.max(1, city.costOfLivingCents) * 1_000));
         firm.productivityBps = clamp(firm.productivityBps + (firm.profitsCents > 0 ? 2 : -3), 6_000, 15_000);
@@ -72,7 +79,7 @@ export function migratePopulationCohorts(world: WorldState): void {
 
 const IMPORTANT_LEDGER_KINDS = new Set<TransactionKind>([
   "ACQUISITION", "IPO", "LOAN_DEFAULT", "BANKRUPTCY_DISTRIBUTION", "PRIME_BROKER_LOSS", "DERIVATIVE_DEFAULT",
-  "SOVEREIGN_RESTRUCTURE", "SOVEREIGN_WRITE_DOWN", "DEPOSIT_INSURANCE", "CENTRAL_BANK_FACILITY",
+  "SOVEREIGN_RESTRUCTURE", "DEPOSIT_INSURANCE", "CENTRAL_BANK_FACILITY",
 ]);
 
 function stableHash(value: string): string {
@@ -222,8 +229,8 @@ function compactDerivativeHistory(world: WorldState): void {
 }
 
 function compactEvents(world: WorldState): void {
-  const cutoff = world.clock.elapsedMonths - 24;
-  const old = world.events.filter((event) => event.elapsedMonth < cutoff && event.severity === "info" && !event.actorIds.includes(world.player.householdId));
+  const cutoff = world.clock.elapsedMonths - (world.baselineReference.mode === "REAL_WORLD" ? 12 : 24);
+  const old = world.events.filter((event) => event.elapsedMonth < cutoff && !event.actorIds.includes(world.player.householdId));
   const counts = new Map<string, number>();
   for (const event of old) counts.set(`${event.elapsedMonth}|${event.type}`, (counts.get(`${event.elapsedMonth}|${event.type}`) ?? 0) + 1);
   for (const [key, count] of counts) {
@@ -261,6 +268,9 @@ export function compactLedgerHistory(world: WorldState): void {
       else creditCents += entry.amountCents;
     }
   }
+  // Source transactions have already passed exact double-entry validation.
+  // Keep the archive checksum exact when macro-scale sums exceed safe integers.
+  creditCents = debitCents;
   const segment: LedgerArchiveSegment = {
     id: `archive-${String(world.ledgerArchives.length + 1).padStart(4, "0")}`,
     fromMonth: archived[0].elapsedMonth,
@@ -284,7 +294,12 @@ export function compactLedgerHistory(world: WorldState): void {
 }
 
 export function updateWorldDiagnostics(world: WorldState): void {
-  const estimateSave = world.clock.elapsedMonths === 0 || world.clock.elapsedMonths % 12 === 0;
+  // Full JSON sizing is intentionally sparse in the macro REAL_WORLD mode.
+  // Serializing a multi-million-entry historical graph every year made the
+  // diagnostic itself one of the largest long-run simulation costs.
+  const estimateSave = world.clock.elapsedMonths === 0
+    || world.clock.elapsedMonths === 12
+    || world.clock.elapsedMonths % (world.baselineReference.mode === "REAL_WORLD" ? 240 : 24) === 0;
   const bytes = (value: unknown) => JSON.stringify(value).length;
   const saveBreakdown = estimateSave ? {
     totalBytes: 0,

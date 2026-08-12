@@ -1,4 +1,4 @@
-import { accountIds, balanceOf, transactionsSince } from "../core/ledger.ts";
+import { accountIds, balanceOf, sumAccountsByOwnerCategoryInstrument, transactionsSince } from "../core/ledger.ts";
 import type { WorldState } from "../domain/model.ts";
 
 export function bankReserveCents(world: WorldState, bankId: string): number {
@@ -6,9 +6,7 @@ export function bankReserveCents(world: WorldState, bankId: string): number {
 }
 
 export function bankDepositLiabilitiesCents(world: WorldState, bankId: string): number {
-  return Object.values(world.ledger.accounts)
-    .filter((account) => account.ownerId === bankId && account.category === "liability" && account.instrument === "deposit")
-    .reduce((sum, account) => sum + balanceOf(world, account.id), 0);
+  return sumAccountsByOwnerCategoryInstrument(world, bankId, "liability", "deposit");
 }
 
 export function bankExpectedPaymentsCents(world: WorldState, bankId: string): number {

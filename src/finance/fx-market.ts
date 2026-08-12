@@ -1,5 +1,5 @@
 import { emitSimpleEvent } from "../core/events.ts";
-import { accountIds, bankAccountBalance, bankAccountsForOwner, ensureAccount, postTransaction, transferBankAccountBalance } from "../core/ledger.ts";
+import { accountIds, bankAccountBalance, bankAccountsForOwner, ensureAccount, postTransaction, seedDeposit, transferBankAccountBalance } from "../core/ledger.ts";
 import type { FxPair, WorldState } from "../domain/model.ts";
 import { convertMinor, convertMinorAtRate, fxRatePpm } from "./currencies.ts";
 
@@ -23,6 +23,14 @@ function pairFor(world: WorldState, leftCurrencyId: string, rightCurrencyId: str
 function dealerAccount(world: WorldState, currencyId: string) {
   const dealer = world.fxDealers[0];
   return dealer && dealer.bankAccountIds.map((id) => world.bankAccounts.find((account) => account.id === id)).find((account) => account?.currencyId === currencyId) || null;
+}
+
+function refillDealerInventory(world: WorldState, account: NonNullable<ReturnType<typeof dealerAccount>>, requiredMinor: number): void {
+  const dealer = world.fxDealers[0];
+  if (!dealer || world.baselineReference.mode !== "REAL_WORLD") return;
+  const current = bankAccountBalance(world, account.id);
+  const target = Math.max(requiredMinor * 2, dealer.targetInventoryByCurrency[account.currencyId] ?? 0);
+  if (current < requiredMinor) seedDeposit(world, dealer.id, account.bankId, Math.max(1, target - current));
 }
 
 export function quoteFxConversion(world: WorldState, fromCurrencyId: string, toCurrencyId: string, amountFromMinor: number): FxConversionQuote | null {
@@ -52,6 +60,23 @@ export function executeFxConversion(
   const targetDealer = dealerAccount(world, toAccount.currencyId);
   if (!quote || !sourceDealer || !targetDealer) return { ok: false, message: "Для пары нет исполнимой котировки" };
   if (bankAccountBalance(world, fromAccount.id) < quote.amountFromMinor) return { ok: false, message: `Недостаточно ${fromAccount.currencyId}` };
+  const maximumEntry = Number.MAX_SAFE_INTEGER - 1_000_000;
+  if (quote.amountFromMinor > maximumEntry || quote.amountToMinor > maximumEntry) {
+    let remaining = quote.amountFromMinor;
+    let firstTradeId: string | undefined;
+    let lastQuote: FxConversionQuote | undefined;
+    const maximumSourceTranche = Math.max(1, Math.min(maximumEntry, Math.floor(quote.amountFromMinor * maximumEntry / Math.max(1, quote.amountToMinor))));
+    while (remaining > 0) {
+      const tranche = Math.min(remaining, maximumSourceTranche);
+      const result = executeFxConversion(world, ownerId, fromBankAccountId, toBankAccountId, tranche);
+      if (!result.ok) return result;
+      firstTradeId ??= result.tradeId;
+      lastQuote = result.quote;
+      remaining -= tranche;
+    }
+    return { ok: true, message: "Обмен исполнен траншами", tradeId: firstTradeId, quote: lastQuote };
+  }
+  refillDealerInventory(world, targetDealer, quote.amountToMinor);
   if (bankAccountBalance(world, targetDealer.id) < quote.amountToMinor) return { ok: false, message: "У дилера недостаточно ликвидности" };
 
   const tradeId = `fx-trade-${String(world.nextFxTradeId++).padStart(8, "0")}`;
