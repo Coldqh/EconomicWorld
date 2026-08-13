@@ -1,4 +1,4 @@
-import { beginNationalAccountingMonth } from "../accounting/national-accounts.ts";
+import { closeCountryEconomicPeriods, openCountryEconomicPeriods } from "../accounting/country-periods.ts";
 import { closeMonthlyAccounting, resetCompanyPeriod } from "../accounting/periods.ts";
 import { formatSimulationDate, isQuarterEnd, isYearEnd } from "../core/clock.ts";
 import { emitSimpleEvent, recordGoodsMovement } from "../core/events.ts";
@@ -17,6 +17,10 @@ import { recordPlayerMonth } from "../player/system.ts";
 import { progressPlayerWorld } from "../player/world-commands.ts";
 import { compactLedgerHistory, migratePopulationCohorts, updateAggregateEconomies, updateWorldDiagnostics } from "../world/systems.ts";
 import { runGlobalEconomyMonth } from "./global-economy.ts";
+import { runGeoeconomicMonth } from "../geoeconomics/engine.ts";
+import { runPoliticalEconomyMonth } from "../political-economy/engine.ts";
+import { runDefenseEconomyMonth } from "../defense-economy/engine.ts";
+import { runConflictMonth } from "../conflict/engine.ts";
 import { collectCountryMetrics, collectMetrics } from "./metrics.ts";
 import { calculateFundNav, runInstitutionalFinance } from "../finance/institutional.ts";
 import { processMarginRisk } from "../finance/leverage.ts";
@@ -26,7 +30,8 @@ import { runMarketAgents } from "../markets/exchange.ts";
 import { processDerivativeMonth } from "../finance/derivatives.ts";
 import { runAutonomousDerivativeDecisions } from "../finance/autonomous-derivatives.ts";
 import { settleFinancialPayment } from "../finance/financial-settlement.ts";
-import { runMacroeconomicMonth } from "./macroeconomics.ts";
+import { prepareGovernmentCommitments, runMacroeconomicMonth, serviceSovereignDebt } from "./macroeconomics.ts";
+import { collectLongRunDiagnostics } from "./long-run-stability.ts";
 
 const clamp = (value: number, minimum: number, maximum: number): number => Math.min(maximum, Math.max(minimum, value));
 
@@ -133,7 +138,8 @@ function payWagesAndTaxes(world: WorldState): void {
       company.lastWagesCents += company.wageCents;
       company.lastOperatingExpenseCents += company.wageCents;
       const government = governmentForCountry(world, company.headquartersCountryId);
-      const tax = Math.round((company.wageCents * government.incomeTaxBps) / 10_000);
+      const complianceBps = world.politicalEconomy?.compliance.find((item) => item.countryId === company.headquartersCountryId)?.taxComplianceBps ?? 10_000;
+      const tax = Math.round(company.wageCents * government.incomeTaxBps / 10_000 * complianceBps / 10_000);
       transferDeposit(world, household.id, government.id, tax, "INCOME_TAX", `Налог на доход: ${household.displayName}`, [wageTx]);
     }
   }
@@ -298,7 +304,8 @@ function recognizeMonthlySalesCosts(world: WorldState): void {
       ]);
     }
     const government = governmentForCountry(world, company.headquartersCountryId);
-    const salesTax = Math.min(depositOf(world, company.id), Math.round(company.lastGrossRevenueCents * government.salesTaxBps / 10_000));
+    const complianceBps = world.politicalEconomy?.compliance.find((item) => item.countryId === company.headquartersCountryId)?.taxComplianceBps ?? 10_000;
+    const salesTax = Math.min(depositOf(world, company.id), Math.round(company.lastGrossRevenueCents * government.salesTaxBps / 10_000 * complianceBps / 10_000));
     if (salesTax <= 0) continue;
     const taxTx = transferDeposit(world, company.id, government.id, salesTax, "SALES_TAX", `Налог с продаж за месяц: ${company.name}`);
     if (taxTx) { company.lastTaxCents += salesTax; company.lastOperatingExpenseCents += salesTax; }
@@ -324,8 +331,6 @@ function clearHouseholdMarket(world: WorldState): void {
       if (spent > 0) {
         household.consumptionMilliUnits[good.id] = (household.consumptionMilliUnits[good.id] ?? 0) + quantity;
         household.preferredSellerByGoodId[good.id] = seller.id;
-        world.nationalAccounts.current.householdConsumptionCents += spent;
-        world.nationalAccounts.current.householdConsumptionByGoodCents[good.id] += spent;
         const category = good.id === "food" ? "food" : good.id === "energy" ? "energy" : good.id === "services" ? "services" : "goods";
         household.lastSpendingByCategoryCents[category] += spent;
       }
@@ -346,8 +351,6 @@ function clearHouseholdMarket(world: WorldState): void {
         player.consumptionMilliUnits.food = (player.consumptionMilliUnits.food ?? 0) + quantity;
         player.preferredSellerByGoodId.food = seller.id;
         player.lastSpendingByCategoryCents.food = spent;
-        world.nationalAccounts.current.householdConsumptionCents += spent;
-        world.nationalAccounts.current.householdConsumptionByGoodCents.food += spent;
       }
     }
   }
@@ -356,25 +359,47 @@ function clearHouseholdMarket(world: WorldState): void {
 function governmentPurchases(world: WorldState): void {
   for (const government of world.governments) {
     const fiscal = world.governmentBudgets.find((item) => item.governmentId === government.id);
-    const latest = [...world.countryMetricsHistory].reverse().find((point) => point.countryId === government.countryId);
-    const baseline = latest?.nominalGdpMinor ?? 120_000_000_00;
-    const budget = Math.min(depositOf(world, government.id) * 0.18, Math.max(2_000_00, Math.round(baseline * (fiscal?.governmentConsumptionTargetBps ?? 1_500) / 10_000)));
+    const primary = (fiscal?.mandatoryPrimarySpendingMinor ?? 0) + (fiscal?.discretionaryPrimarySpendingMinor ?? 0);
+    const primaryTargetBps = Math.max(1, (fiscal?.governmentConsumptionTargetBps ?? 1_500) + (fiscal?.publicInvestmentTargetBps ?? 300) + (fiscal?.socialTransferTargetBps ?? 0));
+    const transferTarget = Math.round(primary * (fiscal?.socialTransferTargetBps ?? 0) / primaryTargetBps);
+    const allRecipientCohorts = world.populationCohorts.filter((item) => item.countryId === government.countryId);
+    const recipientCohorts = allRecipientCohorts.length ? [allRecipientCohorts[world.clock.elapsedMonths % allRecipientCohorts.length]] : [];
+    let transfersPaid = 0;
+    for (const [index, cohort] of recipientCohorts.entries()) {
+      const remaining = Math.min(depositOf(world, government.id), transferTarget - transfersPaid);
+      if (remaining <= 0) break;
+      const amount = index === recipientCohorts.length - 1 ? remaining : Math.min(remaining, transferTarget);
+      const tx = amount > 0 ? transferDeposit(world, government.id, cohort.id, amount, "SOCIAL_TRANSFER", `Социальные обязательства · ${government.countryId}`) : null;
+      if (tx) transfersPaid += amount;
+    }
+    const investmentBudget = Math.min(depositOf(world, government.id), Math.round(primary * (fiscal?.publicInvestmentTargetBps ?? 300) / Math.max(1, (fiscal?.governmentConsumptionTargetBps ?? 1_500) + (fiscal?.publicInvestmentTargetBps ?? 300))));
+    let budget = Math.min(depositOf(world, government.id), Math.max(0, primary - investmentBudget - transfersPaid));
+    const allCohortSuppliers = world.firmCohorts.filter((item) => item.countryId === government.countryId);
+    const supplierWindow = Math.min(1, allCohortSuppliers.length);
+    const supplierOffset = allCohortSuppliers.length ? (world.clock.elapsedMonths * supplierWindow) % allCohortSuppliers.length : 0;
+    const cohortSuppliers = Array.from({ length: supplierWindow }, (_, index) => allCohortSuppliers[(supplierOffset + index) % allCohortSuppliers.length]);
+    const cohortBudget = cohortSuppliers.length ? Math.min(budget, Math.round(budget * 7_000 / 10_000)) : 0;
+    let cohortSpent = 0;
+    for (const [index, supplier] of cohortSuppliers.entries()) {
+      const remaining = cohortBudget - cohortSpent;
+      const amount = Math.min(depositOf(world, government.id), remaining, index === cohortSuppliers.length - 1 ? remaining : Math.round(cohortBudget / Math.max(1, cohortSuppliers.length)));
+      if (amount <= 0) continue;
+      const tx = transferDeposit(world, government.id, supplier.id, amount, "PROCUREMENT", `Государственные услуги · ${supplier.industry}`);
+      if (tx) { cohortSpent += amount; supplier.revenueCents = Math.max(supplier.revenueCents, amount); supplier.valueAddedMinor = Math.max(1, Math.round(supplier.revenueCents * 5_200 / 10_000)); supplier.intermediateConsumptionMinor = Math.max(1, supplier.revenueCents - supplier.valueAddedMinor); }
+    }
+    budget = Math.max(0, budget - cohortSpent);
     for (const goodId of ["services", "goods"] as const) {
       const seller = suppliersFor(world, goodId, government.countryId)[0];
       if (!seller) continue;
-      const spent = sellFinalGood(world, government.id, seller, Math.floor(budget / 2), "CONSUMPTION", government.id);
-      world.nationalAccounts.current.governmentConsumptionCents += spent;
-      world.nationalAccounts.current.governmentConsumptionByGoodCents[goodId] += spent;
+      sellFinalGood(world, government.id, seller, Math.floor(budget / 2), "CONSUMPTION", government.id);
     }
-    const investmentBudget = Math.min(depositOf(world, government.id) * 0.06, Math.max(500_00, Math.round(baseline * (fiscal?.publicInvestmentTargetBps ?? 300) / 10_000)));
     const capitalSeller = suppliersFor(world, "goods", government.countryId)[0];
     if (capitalSeller && investmentBudget > 0) {
-      const invested = sellFinalGood(world, government.id, capitalSeller, investmentBudget, "PUBLIC_CAPITAL", government.id);
-      world.nationalAccounts.current.capitalFormationCents += invested;
+      sellFinalGood(world, government.id, capitalSeller, investmentBudget, "PUBLIC_CAPITAL", government.id);
     }
     if (isQuarterEnd(world.clock)) {
       const university = world.universities.find((item) => world.cities.find((city) => city.id === item.cityId)?.countryId === government.countryId);
-      const grant = university ? Math.min(depositOf(world, government.id), Math.max(100_00, Math.round(baseline * (fiscal?.educationFundingBps ?? 350) / 10_000 / 3))) : 0;
+      const grant = university ? Math.min(depositOf(world, government.id), Math.round(primary * (fiscal?.educationFundingBps ?? 350) / Math.max(1, (fiscal?.governmentConsumptionTargetBps ?? 1_500) + (fiscal?.publicInvestmentTargetBps ?? 300)) * 3)) : 0;
       if (university && grant > 0) settleFinancialPayment(world, government.id, university.id, government.currencyId, grant, "EDUCATION", `Финансирование образования · ${government.countryId}`);
     }
   }
@@ -409,11 +434,19 @@ function investInCapital(world: WorldState): void {
     const cashBuffer = buyer.wageCents * Math.max(3, buyer.employees.length) * 2;
     const investmentSensitivity = world.countryCalibratedParameters[buyer.headquartersCountryId]?.investmentRateSensitivityBps ?? world.calibratedParameters.investmentRateSensitivityBps;
     const requiredUtilization = clamp(0.68 + costOfCapitalBps * investmentSensitivity / 180_000_000 + (macro?.lendingStandardsBps ?? 4_000) / 100_000, 0.72, 0.92);
+    const seller = suppliersFor(world, "goods", buyer.headquartersCountryId).find((item) => item.id !== buyer.id);
+    if (!seller) continue;
+    const maintenanceNeed = Math.max(0, Math.round(buyer.productiveCapital.acquisitionCostCents / Math.max(1, buyer.productiveCapital.usefulLifeMonths) * 3));
+    const maintenanceBudget = Math.min(maintenanceNeed, Math.max(0, depositOf(world, buyer.id) - buyer.wageCents * Math.max(2, buyer.employees.length)));
+    const maintained = maintenanceBudget > 0 ? sellFinalGood(world, buyer.id, seller, maintenanceBudget, "CAPITAL", buyer.id) : 0;
+    if (maintained > 0) {
+      buyer.productiveCapital.acquisitionCostCents += maintained;
+      buyer.productiveCapital.bookValueCents += maintained;
+      buyer.lastCapitalInvestmentCents += maintained;
+    }
     if (utilization < requiredUtilization || demandCoverage < 0.58) continue;
     if (depositOf(world, buyer.id) < cashBuffer && (macro?.lendingStandardsBps ?? 10_000) < 7_500) issueLoan(world, buyer.bankId, buyer.id, cashBuffer, 84, Math.round((macro?.lendingStandardsBps ?? 4_000) / 10));
     if (depositOf(world, buyer.id) < cashBuffer) continue;
-    const seller = suppliersFor(world, "goods", buyer.headquartersCountryId).find((item) => item.id !== buyer.id);
-    if (!seller) continue;
     const budget = Math.min(Math.round(depositOf(world, buyer.id) * clamp(900 - costOfCapitalBps / 4, 250, 850) / 10_000), 1_200_000_00);
     const spent = sellFinalGood(world, buyer.id, seller, budget, "CAPITAL", buyer.id);
     if (spent <= 0) continue;
@@ -423,7 +456,6 @@ function investInCapital(world: WorldState): void {
     buyer.productiveCapital.capacityMilliUnits += addedCapacity;
     buyer.capacityMilliUnits += addedCapacity;
     buyer.lastCapitalInvestmentCents += spent;
-    world.nationalAccounts.current.capitalFormationCents += spent;
     emitSimpleEvent(world, "CapitalInvested", "Производственный капитал увеличен", buyer.name, [buyer.id, seller.id], "positive", [], { amountCents: spent, addedCapacityMilliUnits: addedCapacity });
   }
 }
@@ -471,7 +503,8 @@ function collectCorporateTax(world: WorldState): void {
     const annualProfit = company.financialReports.slice(-11).reduce((sum, report) => sum + report.netIncomeCents, 0)
       + company.lastGrossRevenueCents - company.lastCogsCents - company.lastWagesCents - company.lastDepreciationCents - company.lastInterestCents;
     const government = governmentForCountry(world, company.headquartersCountryId);
-    const tax = Math.min(depositOf(world, company.id), Math.max(0, Math.round(annualProfit * government.corporateTaxBps / 10_000)));
+    const complianceBps = world.politicalEconomy?.compliance.find((item) => item.countryId === company.headquartersCountryId)?.taxComplianceBps ?? 10_000;
+    const tax = Math.min(depositOf(world, company.id), Math.max(0, Math.round(annualProfit * government.corporateTaxBps / 10_000 * complianceBps / 10_000)));
     const tx = tax > 0 ? transferDeposit(world, company.id, government.id, tax, "CORPORATE_TAX", `Налог на прибыль: ${company.name}`) : null;
     if (tx) { company.lastTaxCents += tax; company.lastOperatingExpenseCents += tax; }
   }
@@ -510,24 +543,29 @@ function foundCompanyIfNeeded(world: WorldState): void {
   company.productiveCapital.acquisitionCostCents = invested;
   company.productiveCapital.bookValueCents = invested;
   company.lastCapitalInvestmentCents = invested;
-  world.nationalAccounts.current.capitalFormationCents += invested;
   emitSimpleEvent(world, "CompanyFounded", "Зарегистрирована компания", company.name, [founder.id, company.id], "positive", [tx]);
 }
 
 export function stepMonth(world: WorldState): void {
   for (const company of world.companies) resetCompanyPeriod(company);
-  beginNationalAccountingMonth(world);
+  openCountryEconomicPeriods(world);
+  prepareGovernmentCommitments(world);
   serviceLoans(world);
   serviceCorporateBonds(world);
   runLabourMarket(world);
   payWagesAndTaxes(world);
   paySocialTransfers(world);
+  runPoliticalEconomyMonth(world);
   updateAggregateEconomies(world);
   procureInputs(world);
   produceGoods(world);
+  runGeoeconomicMonth(world);
   runGlobalEconomyMonth(world);
   clearHouseholdMarket(world);
   governmentPurchases(world);
+  runDefenseEconomyMonth(world);
+  runConflictMonth(world);
+  serviceSovereignDebt(world);
   depreciateCapital(world);
   investInCapital(world);
   updatePricesAndExpectations(world);
@@ -542,6 +580,7 @@ export function stepMonth(world: WorldState): void {
   foundCompanyIfNeeded(world);
   recognizeMonthlySalesCosts(world);
   runMacroeconomicMonth(world);
+  closeCountryEconomicPeriods(world);
   const metric = collectMetrics(world);
   world.metricsHistory.push(metric);
   world.countryMetricsHistory.push(...collectCountryMetrics(world));
@@ -550,6 +589,7 @@ export function stepMonth(world: WorldState): void {
   closeMonthlyAccounting(world);
   emitSimpleEvent(world, "MonthClosed", "Месяц закрыт", formatSimulationDate(world.clock), [], "info", [], { nominalGdpCents: metric.nominalGdpCents, annualInflationBps: metric.annualInflationBps, unemploymentBps: metric.unemploymentBps });
   world.clock.elapsedMonths += 1;
+  collectLongRunDiagnostics(world);
   migratePopulationCohorts(world);
   compactLedgerHistory(world);
   updateWorldDiagnostics(world);

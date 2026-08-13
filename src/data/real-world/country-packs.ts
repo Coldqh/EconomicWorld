@@ -33,8 +33,21 @@ export interface CountryDataPack {
   labourParticipationBps: number;
   employmentElasticityBps: number;
   tradeOpennessBps: number;
+  effectiveLegacyInterestRateBps: number;
+  exportCommoditySharesBps: Record<string, number>;
+  importCommoditySharesBps: Record<string, number>;
   sources: Record<string, SourceMetadata>;
 }
+
+const TRADE_COMPOSITION: Record<string, { export: Record<string, number>; import: Record<string, number> }> = {
+  ru: { export: { oil: 3300, gas: 1700, coal: 500, steel: 700, wheat: 500, "business-services": 700, machinery: 600, chemicals: 500, vehicles: 300, semiconductors: 200 }, import: { machinery: 2200, vehicles: 1500, chemicals: 1300, semiconductors: 1200, "business-services": 1000, food: 800, steel: 500, oil: 300, gas: 200, wheat: 1000 } },
+  de: { export: { machinery: 2300, vehicles: 2200, chemicals: 1500, "business-services": 1200, semiconductors: 700, steel: 600, food: 500, oil: 300, gas: 200, wheat: 500 }, import: { oil: 1400, gas: 1200, semiconductors: 1300, machinery: 1200, vehicles: 1000, chemicals: 1000, "business-services": 900, food: 800, steel: 600, wheat: 600 } },
+  us: { export: { "business-services": 2200, machinery: 1500, oil: 1300, chemicals: 1100, vehicles: 900, semiconductors: 900, food: 700, gas: 600, wheat: 500, steel: 300 }, import: { machinery: 1800, vehicles: 1600, semiconductors: 1500, chemicals: 1000, oil: 900, "business-services": 900, food: 700, steel: 600, gas: 400, wheat: 600 } },
+  jp: { export: { vehicles: 2600, machinery: 2300, semiconductors: 1200, chemicals: 1000, steel: 800, "business-services": 700, food: 300, oil: 200, gas: 200, wheat: 700 }, import: { oil: 1800, gas: 1700, food: 1100, chemicals: 900, semiconductors: 900, machinery: 800, "business-services": 800, vehicles: 500, steel: 500, wheat: 1000 } },
+  kr: { export: { semiconductors: 2800, vehicles: 1700, machinery: 1500, chemicals: 1100, steel: 900, "business-services": 700, oil: 300, gas: 200, food: 300, wheat: 700 }, import: { oil: 1900, gas: 1500, machinery: 1200, semiconductors: 1100, chemicals: 900, food: 800, steel: 700, "business-services": 700, vehicles: 400, wheat: 900 } },
+};
+const DEFAULT_TRADE = { export: { "business-services": 1800, machinery: 1600, vehicles: 1100, chemicals: 1200, food: 900, semiconductors: 800, oil: 700, gas: 500, steel: 700, wheat: 700 }, import: { machinery: 1600, oil: 1200, vehicles: 1100, chemicals: 1100, "business-services": 1000, semiconductors: 900, food: 900, gas: 700, steel: 700, wheat: 800 } };
+const LEGACY_RATE_BPS: Record<string, number> = { ru: 760, de: 190, fr: 240, gb: 310, us: 290, jp: 80, ca: 270, it: 330, es: 280, nl: 180, kr: 250 };
 
 const WDI_URL = "https://api.worldbank.org/v2/";
 const wdi = (indicator: string, unit: string, currency: string | null = null): SourceMetadata => ({
@@ -83,7 +96,7 @@ export const REAL_COUNTRY_PACKS: CountryDataPack[] = [
   return {
     countryId: id, iso3: String(iso3), population: Number(population), nominalGdpUsd: Number(nominalGdpUsd), inflationBps: Number(inflationBps), unemploymentBps: Number(unemploymentBps),
     exportsUsd: Number(exportsUsd), importsUsd: Number(importsUsd), reservesUsd: Number(reservesUsd), urbanizationBps: Number(urbanizationBps), workingAgeShareBps: Number(workingAgeShareBps),
-    ...structure, tradeOpennessBps: Math.round((Number(exportsUsd) + Number(importsUsd)) * 10_000 / Number(nominalGdpUsd)), sources: sources(),
+    ...structure, tradeOpennessBps: Math.round((Number(exportsUsd) + Number(importsUsd)) * 10_000 / Number(nominalGdpUsd)), effectiveLegacyInterestRateBps: LEGACY_RATE_BPS[id] ?? 300, exportCommoditySharesBps: (TRADE_COMPOSITION[id] ?? DEFAULT_TRADE).export, importCommoditySharesBps: (TRADE_COMPOSITION[id] ?? DEFAULT_TRADE).import, sources: sources(),
   };
 });
 

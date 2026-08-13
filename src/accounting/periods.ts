@@ -122,8 +122,8 @@ export function closeMonthlyAccounting(world: WorldState): void {
     ...world.exchanges.map((item) => item.id),
     ...world.assetManagers.map((item) => item.id),
     ...world.funds.map((item) => item.id),
-    ...world.populationCohorts.map((item) => item.id),
-    ...world.firmCohorts.map((item) => item.id),
+    // Aggregate cohorts close through CountryEconomicPeriod subaccounts. They
+    // do not need a second ledger P&L close for every representative cohort.
     "goods-market",
     "academy-provider",
   ];

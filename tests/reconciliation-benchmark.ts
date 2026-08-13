@@ -30,12 +30,14 @@ interface BenchmarkPoint {
 const world = createWorld("baseline", { mode: "REAL_WORLD" });
 const points: BenchmarkPoint[] = [];
 let completedMonths = 0;
-const benchmarkStarted = performance.now();
+let simulationWallClockMs = 0;
 
-for (const years of [1, 5, 20]) {
+for (const years of [1, 5, 10, 20]) {
   const targetMonths = years * 12;
+  const simulationStarted = performance.now();
   runMonths(world, targetMonths - completedMonths);
-  const wallClockMs = Math.round(performance.now() - benchmarkStarted);
+  simulationWallClockMs += performance.now() - simulationStarted;
+  const wallClockMs = Math.round(simulationWallClockMs);
   completedMonths = targetMonths;
   const failures = checkInvariants(world).filter((item) => !item.ok);
   if (failures.length) throw new Error(JSON.stringify({ years, failures }));

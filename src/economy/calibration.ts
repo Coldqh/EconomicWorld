@@ -38,6 +38,7 @@ export type CalibrationObjective = (parameters: CalibratedParameterSet, split: "
 
 const PARAMETER_BOUNDS: Record<keyof CalibratedParameterSet, readonly [number, number, number]> = {
   consumptionIncomeElasticityBps: [6_000, 12_000, 500], investmentRateSensitivityBps: [1_500, 8_000, 500], priceAdjustmentSpeedBps: [400, 3_000, 200], wageAdjustmentSpeedBps: [300, 2_200, 150], creditDemandSensitivityBps: [2_000, 8_500, 500], employmentAdjustmentSpeedBps: [250, 2_000, 125],
+  firmEntryExitSpeedBps: [200, 1_500, 100], governmentCommitmentAdjustmentBps: [250, 1_500, 100], taxComplianceResponseBps: [200, 1_500, 100], productivityGrowthResponseBps: [100, 1_200, 100],
 };
 
 export function searchCalibratedParameters(initial: CalibratedParameterSet, objective: CalibrationObjective, passes = 2): CalibrationSearchResult {

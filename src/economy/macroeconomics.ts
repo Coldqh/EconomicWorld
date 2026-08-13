@@ -27,6 +27,7 @@ import { bankCapitalCents } from "../finance/credit.ts";
 import { currencyBankAccount, settleFinancialPayment, transferFinancialPrincipal } from "../finance/financial-settlement.ts";
 import { calculateFundNav } from "../finance/institutional.ts";
 import { collectCountryMetrics } from "./metrics.ts";
+import { recordSovereignArrearFlow } from "../accounting/country-periods.ts";
 
 const clamp = (value: number, minimum: number, maximum: number): number => Math.min(maximum, Math.max(minimum, value));
 
@@ -39,7 +40,19 @@ function countryBudget(world: WorldState, countryId: string): GovernmentBudgetSt
 }
 
 function activeSovereignDebt(world: WorldState, governmentId: string): number {
-  return world.sovereignBonds.filter((bond) => bond.governmentId === governmentId && (bond.status === "active" || bond.status === "restructured")).reduce((sum, bond) => sum + bond.outstandingFaceValueMinor, 0);
+  return world.sovereignBonds.filter((bond) => bond.governmentId === governmentId && bond.status !== "matured").reduce((sum, bond) => sum + bond.outstandingFaceValueMinor + bond.arrearsCouponMinor, 0);
+}
+
+function recordSovereignArrears(world: WorldState, bond: SovereignBond, holdings: SovereignBondHolding[], couponMinor: number, principalMinor: number): void {
+  bond.arrearsCouponMinor += couponMinor;
+  bond.arrearsPrincipalMinor = Math.max(bond.arrearsPrincipalMinor, principalMinor);
+  // Unpaid principal remains in outstanding face value; only newly accrued
+  // coupon changes gross debt. Principal arrears are a classification change.
+  recordSovereignArrearFlow(world, bond.countryId, couponMinor);
+  const holderId = `sovereign-arrear-clearing:${bond.countryId}`;
+  const existing = world.sovereignArrears.find((item) => item.bondId === bond.id && item.holderId === holderId && item.status === "outstanding");
+  if (existing) { existing.unpaidCouponMinor += couponMinor; existing.unpaidPrincipalMinor = Math.max(existing.unpaidPrincipalMinor, principalMinor); }
+  else world.sovereignArrears.push({ id: `sovereign-arrear:${bond.id}`, bondId: bond.id, governmentId: bond.governmentId, holderId, currencyId: bond.currencyId, unpaidCouponMinor: couponMinor, unpaidPrincipalMinor: principalMinor, openedAtMonth: world.clock.elapsedMonths, monthsOutstanding: 0, status: "outstanding" });
 }
 
 function ownerCountryId(world: WorldState, ownerId: string): string | null {
@@ -67,6 +80,7 @@ function investorCapacity(world: WorldState, investorId: string, currencyId: str
   const cash = currencyBankAccount(world, investorId, currencyId);
   if (!cash) return 0;
   const balance = bankAccountBalance(world, cash.id);
+  if (investorId.startsWith("sovereign-coupon-clearing:")) return Math.max(0, balance * 0.9);
   const bank = world.banks.find((item) => item.id === investorId);
   if (bank) return Math.max(0, Math.min(balance * 0.55, bankCapitalCents(world, bank.id) * 2.5));
   const fund = world.funds.find((item) => item.id === investorId);
@@ -88,7 +102,7 @@ function auctionYieldBps(world: WorldState, auction: SovereignAuction, demandMin
     policyRate
       + Math.round((macro?.inflationExpectationsBps ?? 0) * 0.35)
       + TERM_PREMIUM_BPS[auction.maturityBucket]
-      + Math.max(0, debtToGdpBps - 6_000) / 18
+      + Math.min(250, Math.max(0, debtToGdpBps - 6_000) / 100)
       + deficitPressure / 12
       + (macro?.sovereignRiskBps ?? 0)
       - clamp(Math.round((demandCoverageBps - 10_000) / 12), -250, 180),
@@ -154,7 +168,7 @@ export function runSovereignAuction(world: WorldState, auctionId: string, demand
   const coverageBps = Math.round(demandMinor * 10_000 / Math.max(1, auction.targetFaceValueMinor));
   auction.bidCount = capacities.length;
   auction.clearingYieldBps = auctionYieldBps(world, auction, demandMinor);
-  const minimumCoverageBps = world.baselineReference.mode === "REAL_WORLD" ? 3_500 : 6_000;
+  const minimumCoverageBps = world.baselineReference.mode === "REAL_WORLD" ? 1 : 6_000;
   if (coverageBps < minimumCoverageBps || capacities.length === 0) {
     auction.status = "failed";
     auction.settledAtMonth = world.clock.elapsedMonths;
@@ -165,7 +179,7 @@ export function runSovereignAuction(world: WorldState, auctionId: string, demand
   }
   const allocatedFaceValueMinor = Math.min(auction.targetFaceValueMinor, demandMinor);
   const reusableBond = world.baselineReference.mode === "REAL_WORLD"
-    ? world.sovereignBonds.find((item) => item.countryId === auction.countryId && item.maturityBucket === auction.maturityBucket && item.status === "active" && item.maturityMonth - world.clock.elapsedMonths >= Math.round(MATURITY_MONTHS[auction.maturityBucket] * 0.75))
+    ? world.sovereignBonds.find((item) => item.countryId === auction.countryId && item.maturityBucket === auction.maturityBucket && (item.status === "active" || item.status === "restructured") && item.maturityMonth - world.clock.elapsedMonths >= Math.round(MATURITY_MONTHS[auction.maturityBucket] * 0.75))
     : undefined;
   const bond: SovereignBond = reusableBond ?? {
     id: `sovereign-bond-${String(world.nextSovereignBondId++).padStart(8, "0")}`,
@@ -182,6 +196,9 @@ export function runSovereignAuction(world: WorldState, auctionId: string, demand
     issuedAtMonth: world.clock.elapsedMonths,
     maturityMonth: world.clock.elapsedMonths + MATURITY_MONTHS[auction.maturityBucket],
     missedPayments: 0,
+    legacy: false,
+    arrearsPrincipalMinor: 0,
+    arrearsCouponMinor: 0,
     status: "active",
   };
   if (!reusableBond) world.sovereignBonds.push(bond);
@@ -301,10 +318,28 @@ export function serviceSovereignDebt(world: WorldState): void {
       : holdings.some((holding) => !paySovereignCoupon(world, bond, holding));
     if (couponFailed) {
       bond.missedPayments += 1;
+      recordSovereignArrears(world, bond, holdings, Math.max(1, Math.round(bond.outstandingFaceValueMinor * bond.couponBps / 10_000 / 12)), 0);
       if (bond.missedPayments >= 1) bond.status = "defaulted";
       continue;
     }
     if (world.clock.elapsedMonths < bond.maturityMonth) continue;
+    if (world.baselineReference.mode === "REAL_WORLD") {
+      const macro = world.countryMacroStates.find((item) => item.countryId === bond.countryId);
+      // A maturity exchange lets existing holders reinvest the principal that
+      // is still locked in the maturing issue. The coupon reprices only here,
+      // so old fixed-rate debt retains its vintage until refinancing.
+      if ((macro?.sovereignRiskBps ?? 0) < 4_500 && holdings.length > 0) {
+        bond.couponBps = bond.yieldBps;
+        bond.issuedAtMonth = world.clock.elapsedMonths;
+        bond.maturityMonth = world.clock.elapsedMonths + MATURITY_MONTHS[bond.maturityBucket];
+        bond.legacy = false;
+        bond.status = "restructured";
+        emitSimpleEvent(world, "SovereignBondIssued", "Государственный долг рефинансирован", bond.id, [bond.governmentId, ...holdings.map((item) => item.holderId)], "info", [], { faceValueMinor: bond.outstandingFaceValueMinor, yieldBps: bond.yieldBps });
+        continue;
+      }
+      const rollover = createSovereignAuction(world, bond.countryId, bond.maturityBucket, bond.outstandingFaceValueMinor);
+      if (rollover) runSovereignAuction(world, rollover.id);
+    }
     let governmentCash = depositOf(world, bond.governmentId);
     if (governmentCash < bond.outstandingFaceValueMinor) {
       const auction = createSovereignAuction(world, bond.countryId, bond.maturityBucket, bond.outstandingFaceValueMinor - governmentCash + Math.round(bond.outstandingFaceValueMinor * 0.1));
@@ -315,6 +350,7 @@ export function serviceSovereignDebt(world: WorldState): void {
     // not repay early holders while leaving the bond's face value unchanged.
     if (governmentCash < holdings.reduce((sum, holding) => sum + holding.faceValueMinor, 0)) {
       bond.missedPayments += 1;
+      recordSovereignArrears(world, bond, holdings, 0, bond.outstandingFaceValueMinor);
       bond.status = "defaulted";
       emitSimpleEvent(world, "SovereignDefault", "Пропущен платёж по государственному долгу", bond.id, [bond.governmentId], "critical", [], { outstandingMinor: bond.outstandingFaceValueMinor });
       continue;
@@ -363,7 +399,25 @@ export function restructureSovereignBond(world: WorldState, bondId: string, prin
   bond.maturityMonth += Math.max(0, Math.floor(extensionMonths));
   bond.status = "restructured";
   bond.missedPayments = 0;
+  const writtenOffArrears = bond.arrearsCouponMinor;
+  const period = world.countryEconomicAccounts.currentByCountry[bond.countryId];
+  if (period) period.financial.writeOffsMinor += writtenOffArrears;
+  bond.arrearsPrincipalMinor = 0;
+  bond.arrearsCouponMinor = 0;
+  for (const arrear of world.sovereignArrears.filter((item) => item.bondId === bond.id && item.status === "outstanding")) arrear.status = "restructured";
   return true;
+}
+
+function resolveSovereignDefaults(world: WorldState): void {
+  for (const arrear of world.sovereignArrears.filter((item) => item.status === "outstanding")) arrear.monthsOutstanding = world.clock.elapsedMonths - arrear.openedAtMonth;
+  for (const bond of world.sovereignBonds.filter((item) => item.status === "defaulted")) {
+    const budget = countryBudget(world, bond.countryId);
+    const cash = depositOf(world, bond.governmentId);
+    const recoveryCapacityBps = budget && budget.totalRevenueMinor > 0 ? clamp(Math.round(cash * 10_000 / budget.totalRevenueMinor), 0, 10_000) : 0;
+    if (bond.missedPayments < 3 && recoveryCapacityBps < 2_000) continue;
+    const haircutBps = clamp(4_500 - Math.round(recoveryCapacityBps / 3), 1_000, 5_500);
+    restructureSovereignBond(world, bond.id, haircutBps, 36 + bond.missedPayments * 6, Math.round(bond.couponBps * 0.25));
+  }
 }
 
 function durationYears(bucket: SovereignMaturityBucket): number {
@@ -477,9 +531,48 @@ export function recalculateGovernmentBudgets(world: WorldState): void {
     budget.budgetBalanceMinor = budget.totalRevenueMinor - budget.totalSpendingMinor;
     budget.publicDebtMinor = activeSovereignDebt(world, budget.governmentId);
     budget.infrastructureCapitalMinor = balanceOf(world, accountIds.infrastructure(budget.governmentId));
-    const active = world.sovereignBonds.filter((bond) => bond.governmentId === budget.governmentId && (bond.status === "active" || bond.status === "restructured"));
-    budget.debtDueNext12MonthsMinor = active.filter((bond) => bond.maturityMonth <= world.clock.elapsedMonths + 12).reduce((sum, bond) => sum + bond.outstandingFaceValueMinor, 0);
-    budget.averageMaturityMonths = budget.publicDebtMinor ? Math.round(active.reduce((sum, bond) => sum + Math.max(0, bond.maturityMonth - world.clock.elapsedMonths) * bond.outstandingFaceValueMinor, 0) / budget.publicDebtMinor) : 0;
+    const performing = world.sovereignBonds.filter((bond) => bond.governmentId === budget.governmentId && (bond.status === "active" || bond.status === "restructured"));
+    budget.debtDueNext12MonthsMinor = performing.filter((bond) => bond.maturityMonth <= world.clock.elapsedMonths + 12).reduce((sum, bond) => sum + bond.outstandingFaceValueMinor, 0);
+    const performingDebt = performing.reduce((sum, bond) => sum + bond.outstandingFaceValueMinor, 0);
+    budget.averageMaturityMonths = performingDebt ? Math.round(performing.reduce((sum, bond) => sum + Math.max(0, bond.maturityMonth - world.clock.elapsedMonths) * bond.outstandingFaceValueMinor, 0) / performingDebt) : 0;
+    budget.effectiveAverageDebtRateBps = performingDebt ? Math.round(performing.reduce((sum, bond) => sum + bond.couponBps * bond.outstandingFaceValueMinor, 0) / performingDebt) : 0;
+    budget.marginalNewIssueYieldBps = performing.length ? Math.round(performing.reduce((sum, bond) => sum + bond.yieldBps * bond.outstandingFaceValueMinor, 0) / Math.max(1, performingDebt)) : 0;
+    const budgetBondIds = new Set(world.sovereignBonds.filter((item) => item.countryId === budget.countryId).map((item) => item.id));
+    budget.debtArrearsMinor = world.sovereignArrears.filter((item) => budgetBondIds.has(item.bondId) && item.status === "outstanding").reduce((sum, item) => sum + item.unpaidCouponMinor + item.unpaidPrincipalMinor, 0);
+  }
+}
+
+export function prepareGovernmentCommitments(world: WorldState): void {
+  for (const budget of world.governmentBudgets) {
+    const profile = world.countryEconomicProfiles.find((item) => item.countryId === budget.countryId);
+    if (!profile) continue;
+    const actual = world.countryEconomicAccounts.closedByCountry[budget.countryId]?.production.valueAddedMinor;
+    const structural = world.countryScaleReconciliations.find((item) => item.countryId === budget.countryId)?.targetMonthlyNominalGdpMinor
+      ?? Math.round(profile.baselineNominalGdpMinor / (world.baselineReference.mode === "REAL_WORLD" ? 12 : 1));
+    const gdp = Math.max(1, actual ?? structural);
+    const mandatoryBps = budget.publicAdministrationTargetBps + budget.healthcareServicesTargetBps + budget.infrastructureMaintenanceTargetBps + budget.socialTransferTargetBps + budget.otherMandatoryTargetBps + budget.educationFundingBps;
+    const primaryTargetBps = Math.max(mandatoryBps + budget.publicInvestmentTargetBps, profile.governmentSpendingShareBps);
+    const stateCapacity = world.politicalEconomy.stateCapacity.find((item) => item.countryId === budget.countryId)?.administrativeCapacityBps ?? 8_000;
+    const mandatoryDeliveryBps = clamp(7_500 + stateCapacity / 4, 7_500, 10_000);
+    budget.mandatoryPrimarySpendingMinor = Math.round(gdp * mandatoryBps / 10_000 * mandatoryDeliveryBps / 10_000);
+    const discretionaryTarget = Math.max(0, Math.round(gdp * (primaryTargetBps - mandatoryBps) / 10_000));
+    const stressAdjustmentBps = clamp(10_000 - budget.fiscalStressBps * 0.55, 2_500, 10_000);
+    budget.discretionaryPrimarySpendingMinor = Math.round(discretionaryTarget * stressAdjustmentBps / 10_000);
+    const monthlyCoupons = world.sovereignBonds.filter((bond) => bond.countryId === budget.countryId && (bond.status === "active" || bond.status === "restructured")).reduce((sum, bond) => sum + Math.max(1, Math.round(bond.outstandingFaceValueMinor * bond.couponBps / 10_000 / 12)), 0);
+    let cash = depositOf(world, budget.governmentId);
+    const bucket: SovereignMaturityBucket = budget.averageMaturityMonths < 60 ? "10y" : "5y";
+    const primaryNeed = budget.mandatoryPrimarySpendingMinor + budget.discretionaryPrimarySpendingMinor;
+    const totalNeed = primaryNeed + Math.min(monthlyCoupons, Math.max(0, primaryNeed));
+    if (cash < totalNeed) {
+      const financingAuction = createSovereignAuction(world, budget.countryId, bucket, totalNeed - cash);
+      if (financingAuction) runSovereignAuction(world, financingAuction.id);
+      cash = depositOf(world, budget.governmentId);
+    }
+    const affordablePrimary = Math.max(0, cash - Math.min(monthlyCoupons, Math.max(0, cash - budget.mandatoryPrimarySpendingMinor)));
+    if (affordablePrimary < budget.mandatoryPrimarySpendingMinor + budget.discretionaryPrimarySpendingMinor) {
+      budget.discretionaryPrimarySpendingMinor = Math.min(budget.discretionaryPrimarySpendingMinor, Math.max(0, affordablePrimary - budget.mandatoryPrimarySpendingMinor));
+      budget.mandatoryPrimarySpendingMinor = Math.min(budget.mandatoryPrimarySpendingMinor, affordablePrimary);
+    }
   }
 }
 
@@ -516,7 +609,10 @@ function updateCountryMacroStates(world: WorldState): void {
     const debtToGdpBps = Math.round(budget.publicDebtMinor * 10_000 / annualizedGdpMinor);
     const deficitToGdpBps = Math.max(0, Math.round(-budget.budgetBalanceMinor * 10_000 / Math.max(1, metric.nominalGdpMinor)));
     const failedAuctions = world.sovereignAuctions.filter((auction) => auction.countryId === metric.countryId && auction.status === "failed" && auction.announcedAtMonth >= world.clock.elapsedMonths - 12).length;
-    state.sovereignRiskBps = clamp(Math.round(Math.max(0, debtToGdpBps - 6_000) / 18 + deficitToGdpBps / 20 + Math.max(0, -metric.gdpGrowthBps) / 12 + failedAuctions * 90), 0, 4_500);
+    const profile = world.countryEconomicProfiles.find((item) => item.countryId === metric.countryId);
+    const debtAnchorBps = Math.max(6_000, Math.round((profile?.governmentDebtToGdpBps ?? 6_000) * 1.15));
+    const maturityBuffer = clamp(budget.averageMaturityMonths * 8, 0, 1_200);
+    state.sovereignRiskBps = clamp(Math.round(Math.max(0, debtToGdpBps - debtAnchorBps) / 18 + deficitToGdpBps / 20 + Math.max(0, -metric.gdpGrowthBps) / 12 + failedAuctions * 90 - maturityBuffer / 10), 0, 4_500);
     budget.fiscalStressBps = clamp(Math.round(state.sovereignRiskBps + budget.debtDueNext12MonthsMinor * 10_000 / Math.max(1, budget.publicDebtMinor) / 4), 0, 10_000);
     const priorCycle = state.businessCycle;
     state.businessCycle = metric.gdpGrowthBps < -50 && metric.unemploymentBps > (previous?.unemploymentBps ?? metric.unemploymentBps)
@@ -843,17 +939,20 @@ export function seedMacroeconomics(world: WorldState): void {
     const government = world.governments.find((item) => item.id === country.governmentId)!;
     const governmentAccount = bankAccountsForOwner(world, government.id, country.currencyReference)[0];
     const profile = world.countryEconomicProfiles.find((item) => item.countryId === country.id)!;
+    const centralBank = world.centralBanks.find((item) => item.id === country.centralBankId)!;
     world.governmentBudgets.push({
       governmentId: government.id, countryId: country.id, currencyId: country.currencyReference, cashBankAccountId: governmentAccount.id,
       propertyTaxBps: profile.taxProfile.propertyTaxBps, governmentConsumptionTargetBps: Math.round(profile.governmentSpendingShareBps * 0.4), publicInvestmentTargetBps: profile.publicInvestmentShareBps, educationFundingBps: profile.educationSpendingShareBps,
       personalTaxRevenueMinor: 0, corporateTaxRevenueMinor: 0, consumptionTaxRevenueMinor: 0, propertyTaxRevenueMinor: 0, totalRevenueMinor: 0,
       governmentConsumptionMinor: 0, publicInvestmentMinor: 0, transfersMinor: 0, educationSpendingMinor: 0, interestSpendingMinor: 0, totalSpendingMinor: 0,
       primaryBalanceMinor: 0, budgetBalanceMinor: 0, publicDebtMinor: 0, debtDueNext12MonthsMinor: 0, averageMaturityMonths: 0, infrastructureCapitalMinor: 0, fiscalStressBps: 0,
+      effectiveTaxCollectionBps: clamp(5_500 + profile.productivityIndexBps / 5 + profile.budgetBalanceToGdpBps * 2, 4_500, 8_800), cashFinancingMinor: 0, debtFinancingMinor: 0,
+      publicAdministrationTargetBps: 350, healthcareServicesTargetBps: Math.round(profile.governmentSpendingShareBps * 0.18), infrastructureMaintenanceTargetBps: Math.max(120, Math.round(profile.publicInvestmentShareBps * 0.3)), socialTransferTargetBps: Math.round(profile.governmentSpendingShareBps * 0.16), otherMandatoryTargetBps: 180,
+      mandatoryPrimarySpendingMinor: 0, discretionaryPrimarySpendingMinor: 0, effectiveAverageDebtRateBps: 0, marginalNewIssueYieldBps: centralBank.policyRateBps + 180, debtArrearsMinor: 0,
     });
-    const centralBank = world.centralBanks.find((item) => item.id === country.centralBankId)!;
     if (!world.centralBankBalanceSheets.some((sheet) => sheet.centralBankId === centralBank.id)) world.centralBankBalanceSheets.push({ centralBankId: centralBank.id, currencyId: centralBank.currencyId, governmentSecuritiesMinor: 0, bankLendingMinor: 0, otherAssetsMinor: 0, bankReservesMinor: 0, currencyInCirculationMinor: 0, governmentDepositsMinor: 0, equityMinor: 0, qePurchasesMinor: 0, qtSalesMinor: 0 });
     const potentialOutputMinor = world.baselineReference.mode === "REAL_WORLD" ? Math.round(profile.baselineNominalGdpMinor / 12) : profile.baselineNominalGdpMinor;
-    world.countryMacroStates.push({ countryId: country.id, currencyId: country.currencyReference, potentialOutputMinor, outputGapBps: 0, businessCycle: "expansion", inflationExpectationsBps: profile.inflationBps, centralBankCredibilityBps: 8_000, creditGrowthBps: 0, creditToGdpBps: profile.privateCreditToGdpBps, defaultRateBps: 0, lendingStandardsBps: 4_000, leverageBps: profile.householdDebtToGdpBps, depositRateBps: Math.round(centralBank.policyRateBps * 0.6), averageLoanRateBps: centralBank.policyRateBps + 450, sovereignRiskBps: Math.max(30, Math.round(profile.governmentDebtToGdpBps / 80)), tenYearYieldBps: centralBank.policyRateBps + 180, demandPressureBps: 0, wagePressureBps: 0, inputPressureBps: 0, housingServicesPressureBps: 0 });
+    world.countryMacroStates.push({ countryId: country.id, currencyId: country.currencyReference, potentialOutputMinor, outputGapBps: 0, businessCycle: "expansion", inflationExpectationsBps: profile.inflationBps, centralBankCredibilityBps: 8_000, creditGrowthBps: 0, creditToGdpBps: profile.privateCreditToGdpBps, defaultRateBps: 0, lendingStandardsBps: 4_000, leverageBps: profile.householdDebtToGdpBps, depositRateBps: Math.round(centralBank.policyRateBps * 0.6), averageLoanRateBps: centralBank.policyRateBps + 450, sovereignRiskBps: Math.max(20, Math.round(profile.governmentDebtToGdpBps / 300)), tenYearYieldBps: centralBank.policyRateBps + 180, demandPressureBps: 0, wagePressureBps: 0, inputPressureBps: 0, housingServicesPressureBps: 0 });
     const insuranceId = `deposit-insurance-${country.id}`;
     const insuranceBank = world.banks.filter((bank) => bank.countryId === country.id)[1] ?? world.banks.find((bank) => bank.countryId === country.id)!;
     seedDeposit(world, insuranceId, insuranceBank.id, 80_000_000_00);
@@ -875,38 +974,16 @@ export function seedMacroeconomics(world: WorldState): void {
 }
 
 function automaticGovernmentBorrowing(world: WorldState): void {
+  if (world.baselineReference.mode === "REAL_WORLD") return;
   for (const budget of world.governmentBudgets) {
     const cash = depositOf(world, budget.governmentId);
     const countryDebt = world.sovereignBonds.filter((bond) => bond.countryId === budget.countryId && (bond.status === "active" || bond.status === "restructured"));
     const monthlyCoupons = countryDebt.reduce((sum, bond) => sum + Math.max(1, Math.round(bond.outstandingFaceValueMinor * bond.couponBps / 10_000 / 12)), 0);
-    const profile = world.countryEconomicProfiles.find((item) => item.countryId === budget.countryId);
-    const structuralAnnualGdp = world.countryScaleReconciliations.find((item) => item.countryId === budget.countryId)?.targetAnnualNominalGdpMinor ?? 0;
-    const structuralMonthlySpending = world.baselineReference.mode === "REAL_WORLD" && profile
-      ? Math.round(structuralAnnualGdp / 12 * profile.governmentSpendingShareBps / 10_000)
-      : 0;
-    const expectedMonthlySpending = Math.max(10_000_00, structuralMonthlySpending, budget.totalSpendingMinor || Math.round((budget.totalRevenueMinor || 20_000_00) * 1.05), monthlyCoupons);
+    const expectedPrimarySpending = Math.max(10_000_00, budget.totalSpendingMinor - budget.interestSpendingMinor, Math.round((budget.totalRevenueMinor || 20_000_00) * 0.9));
+    const expectedMonthlySpending = expectedPrimarySpending + monthlyCoupons;
     const refinancing = budget.debtDueNext12MonthsMinor;
-    const latest = [...world.countryMetricsHistory].reverse().find((point) => point.countryId === budget.countryId);
-    const effectiveAnnualGdp = structuralAnnualGdp || (latest?.nominalGdpMinor ?? 0) * 12;
-    const targetDebt = profile ? Math.round(effectiveAnnualGdp * profile.governmentDebtToGdpBps / 10_000) : 0;
-    const debtGap = Math.max(0, targetDebt - budget.publicDebtMinor);
-    if (cash >= expectedMonthlySpending * 3 + monthlyCoupons && refinancing <= cash && debtGap <= targetDebt * 100 / 10_000) continue;
-    const urgent = cash < expectedMonthlySpending + monthlyCoupons || refinancing > cash;
-    if (world.baselineReference.mode === "REAL_WORLD" && urgent && refinancing > cash) {
-      const localCentralBank = world.centralBanks.find((bank) => bank.countryId === budget.countryId);
-      const sourceBond = countryDebt.filter((bond) => bond.maturityMonth <= world.clock.elapsedMonths + 12).sort((left, right) => left.maturityMonth - right.maturityMonth)[0];
-      const centralBankLiquidity = localCentralBank ? currencyBankAccount(world, localCentralBank.id, budget.currencyId) : null;
-      if (localCentralBank && sourceBond && centralBankLiquidity) {
-        const liquidity = Math.max(0, bankAccountBalance(world, centralBankLiquidity.id) - expectedMonthlySpending);
-        const support = Math.min(Math.max(0, refinancing - cash), liquidity);
-        if (support > 0) {
-          const auction = createSovereignAuction(world, budget.countryId, sourceBond.maturityBucket, support);
-          if (auction) runSovereignAuction(world, auction.id, 20_000);
-        }
-      }
-    }
-    if (world.baselineReference.mode === "REAL_WORLD" && !urgent && world.clock.elapsedMonths % 3 !== 0) continue;
-    const need = Math.max(expectedMonthlySpending * 4 + monthlyCoupons - cash, Math.round(refinancing * 0.3), Math.round(debtGap * 0.08));
+    if (cash >= expectedMonthlySpending * 2 && refinancing <= cash) continue;
+    const need = Math.max(expectedMonthlySpending * 2 - cash, refinancing - cash);
     if (need <= 0) continue;
     const bucket: SovereignMaturityBucket = budget.averageMaturityMonths < 48 ? "10y" : "5y";
     const auction = createSovereignAuction(world, budget.countryId, bucket, need);
@@ -916,7 +993,7 @@ function automaticGovernmentBorrowing(world: WorldState): void {
 
 export function runMacroeconomicMonth(world: WorldState): void {
   collectPropertyTaxes(world);
-  serviceSovereignDebt(world);
+  resolveSovereignDefaults(world);
   recalculateGovernmentBudgets(world);
   automaticGovernmentBorrowing(world);
   recalculateGovernmentBudgets(world);
@@ -924,4 +1001,6 @@ export function runMacroeconomicMonth(world: WorldState): void {
   runMonetaryPolicy(world);
   updateSovereignValuations(world);
   updateCentralBankBalanceSheets(world);
+  if (world.sovereignAuctions.length > world.countries.length * 18) world.sovereignAuctions.splice(0, world.sovereignAuctions.length - world.countries.length * 18);
+  world.sovereignArrears = world.sovereignArrears.filter((item) => item.status === "outstanding" || item.openedAtMonth >= world.clock.elapsedMonths - 24);
 }

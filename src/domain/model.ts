@@ -173,6 +173,13 @@ export type TransactionKind =
   | "SOVEREIGN_RESTRUCTURE"
   | "SOVEREIGN_WRITE_DOWN"
   | "PUBLIC_INVESTMENT"
+  | "TARIFF"
+  | "SUBSIDY"
+  | "FOREIGN_AID"
+  | "SOVEREIGN_LOAN"
+  | "PROCUREMENT"
+  | "CORRUPTION_LEAKAGE"
+  | "LOBBYING"
   | "OPEN_MARKET_PURCHASE"
   | "OPEN_MARKET_SALE"
   | "QE"
@@ -744,7 +751,43 @@ export interface CrossBorderLoanExposure {
   reportingValueUsdMinor: number;
   borrowerCurrencyBurdenMinor: number;
   transactionIds: string[];
-  status: "active" | "repaid" | "defaulted";
+  openedAtMonth: number;
+  lastServicedMonth: number;
+  principalRepaidMinor: number;
+  interestPaidMinor: number;
+  accruedInterestMinor: number;
+  arrearsMinor: number;
+  missedPayments: number;
+  rolloverCount: number;
+  borrowerType: "bank" | "firm" | "trade-sector" | "government";
+  status: "active" | "arrears" | "repaid" | "defaulted" | "restructured";
+}
+
+export interface SovereignArrear {
+  id: string;
+  bondId: string;
+  governmentId: string;
+  holderId: string;
+  currencyId: string;
+  unpaidCouponMinor: number;
+  unpaidPrincipalMinor: number;
+  openedAtMonth: number;
+  monthsOutstanding: number;
+  status: "outstanding" | "restructured" | "paid" | "written-down";
+}
+
+export interface SovereignDebtBridge {
+  countryId: string;
+  elapsedMonth: number;
+  openingDebtMinor: number;
+  primaryDeficitMinor: number;
+  interestContributionMinor: number;
+  newIssuanceMinor: number;
+  principalRepaymentMinor: number;
+  restructuringHaircutMinor: number;
+  arrearsChangeMinor: number;
+  otherAdjustmentMinor: number;
+  closingDebtMinor: number;
 }
 
 export interface ReservePortfolio {
@@ -1080,21 +1123,426 @@ export interface CountryMetricPoint {
   activeCompanies: number;
   productionMilliUnits: number;
   consumptionMinor: number;
+  structuralNominalGdpMinor: number;
+  gdpDeflatorBps: number;
 }
 
-export interface CurrentAccountingPeriod {
-  openingInventoryValueCents: number;
-  householdConsumptionCents: number;
-  governmentConsumptionCents: number;
-  capitalFormationCents: number;
-  householdConsumptionByGoodCents: Record<string, number>;
-  governmentConsumptionByGoodCents: Record<string, number>;
+export interface LongRunCountryPoint {
+  countryId: string;
+  elapsedMonth: number;
+  structuralNominalGdpMinor: number;
+  actualNominalGdpMinor: number;
+  actualRealGdpMinor: number;
+  gdpDeflatorBps: number;
+  nominalGdpGrowthBps: number;
+  realGdpGrowthBps: number;
+  population: number;
+  householdIncomeMinor: number;
+  householdConsumptionMinor: number;
+  householdSavingsMinor: number;
+  householdTaxesMinor: number;
+  firmRevenueMinor: number;
+  firmWagesMinor: number;
+  firmProfitMinor: number;
+  corporateTaxesMinor: number;
+  investmentMinor: number;
+  governmentRevenueMinor: number;
+  governmentPrimarySpendingMinor: number;
+  governmentInterestMinor: number;
+  debtMinor: number;
+  effectiveDebtRateBps: number;
+  marginalDebtRateBps: number;
+  averageMaturityMonths: number;
+  wagesToGdpBps: number;
+  profitsToGdpBps: number;
+  consumptionToGdpBps: number;
+  investmentToGdpBps: number;
+  revenueToGdpBps: number;
+  primarySpendingToGdpBps: number;
+  interestToGdpBps: number;
+  debtToGdpBps: number;
+  creditToGdpBps: number;
+  bankCapitalMinor: number;
+  unemploymentBps: number;
+  inflationBps: number;
+  activeCompanies: number;
+  representedFirms: number;
 }
 
-export interface NationalAccountsState {
-  baseYear: number;
-  cpiWeightsBps: Record<string, number>;
-  current: CurrentAccountingPeriod;
+export interface LongRunWarning {
+  id: string;
+  countryId: string;
+  elapsedMonth: number;
+  severity: "warning" | "failure";
+  code: string;
+  reason: string;
+  evidence: Record<string, number>;
+}
+
+export interface LongRunDiagnosticsState {
+  points: LongRunCountryPoint[];
+  warnings: LongRunWarning[];
+  lastRecordedMonth: number;
+}
+
+export type DefenseIndustryCategory = "ground" | "aerospace" | "naval" | "electronics" | "munitions" | "logistics" | "communications";
+export type DefenseCapabilityDomain = "land" | "air" | "naval" | "airDefense" | "logistics" | "cyberCommunications";
+export interface DefenseIndustrySector {
+  id: string; countryId: string; category: DefenseIndustryCategory; supplierCohortId: string;
+  capacityMinor: number; utilizedCapacityBps: number; technologyBps: number; inputAvailabilityBps: number; importDependencyBps: number; expansionMonthsRemaining: number;
+}
+export interface DefenseCountryState {
+  countryId: string; targetSpendingToGdpBps: number;
+  personnelSpendingMinor: number; procurementSpendingMinor: number; operationsMaintenanceMinor: number; researchSpendingMinor: number; infrastructureSpendingMinor: number;
+  activePersonnel: number; reservePersonnel: number; supportPersonnel: number; reserveActivationCapacity: number; industrialConversionCapacityBps: number;
+  equipmentStockMinor: number; munitionsStockMinor: number; fuelStockMinor: number; sparePartsStockMinor: number; medicalLogisticsStockMinor: number;
+  readinessBps: number; equipmentConditionBps: number; trainingBps: number; logisticsReadinessBps: number; importDependencyBps: number;
+  capabilitiesBps: Record<DefenseCapabilityDomain, number>; lastCauseCodes: string[];
+}
+export interface DefenseAidTransfer { id: string; donorCountryId: string; recipientCountryId: string; elapsedMonth: number; equipmentMinor: number; suppliesMinor: number; fundingMinor: number; transactionId: string | null; }
+export interface SecurityAlliance { id: string; memberCountryIds: string[]; defenseCooperationBps: number; accessBps: number; mutualSupportCommitmentBps: number; }
+export interface DefenseEconomyState { countries: DefenseCountryState[]; industries: DefenseIndustrySector[]; aidTransfers: DefenseAidTransfer[]; alliances: SecurityAlliance[]; nextAidId: number; }
+
+export type ConflictStatus = "proposed" | "active" | "ceasefire" | "settled";
+export interface ArmedConflict {
+  id: string; participantCountryIds: string[]; initiatorCountryId: string; defenderCountryId: string; startMonth: number; endMonth: number | null;
+  objective: "defend" | "coerce" | "secure-access" | "limited-political"; scope: string; intensityBps: number; status: ConflictStatus;
+  mobilizationByCountry: Record<string, number>; industrialConversionBpsByCountry: Record<string, number>; militaryLossesByCountry: Record<string, number>;
+  equipmentLossMinorByCountry: Record<string, number>; capitalDamageMinorByCountry: Record<string, number>; tradeDisruptionBpsByCountry: Record<string, number>;
+  fiscalCostMinorByCountry: Record<string, number>; civilianConsumptionLossMinorByCountry: Record<string, number>; continuationPressureBpsByCountry: Record<string, number>; causeCodes: string[];
+}
+export interface ConflictState { conflicts: ArmedConflict[]; nextConflictId: number; }
+
+export interface CountryEconomicPeriod {
+  countryId: string;
+  currencyId: string;
+  elapsedMonth: number;
+  status: "open" | "closed";
+  production: { grossOutputMinor: number; intermediateConsumptionMinor: number; valueAddedMinor: number; explicitValueAddedMinor: number; cohortValueAddedMinor: number; publicOtherValueAddedMinor: number };
+  expenditure: { householdConsumptionMinor: number; privateInvestmentMinor: number; governmentConsumptionMinor: number; governmentInvestmentMinor: number; exportsMinor: number; importsMinor: number; inventoryChangeMinor: number; gdpMinor: number };
+  income: { employeeCompensationMinor: number; operatingSurplusMinor: number; mixedIncomeMinor: number; taxesOnProductionNetMinor: number; propertyIncomeMinor: number; gdpMinor: number };
+  fiscal: { openingCashMinor: number; personalTaxMinor: number; corporateTaxMinor: number; consumptionTaxMinor: number; tariffsMinor: number; propertyOtherTaxMinor: number; otherRevenueMinor: number; soeDividendsMinor: number; consumptionMinor: number; investmentMinor: number; transfersMinor: number; subsidiesMinor: number; interestMinor: number; bondIssuanceMinor: number; loanFinancingMinor: number; otherFinancingMinor: number; principalRepaymentMinor: number; closingCashMinor: number; primaryBalanceMinor: number; overallBalanceMinor: number; cashGapMinor: number; cashGapBps: number };
+  external: { reportingCurrencyId: "USD"; goodsExportsMinor: number; goodsImportsMinor: number; servicesExportsMinor: number; servicesImportsMinor: number; primaryIncomeReceivedMinor: number; primaryIncomePaidMinor: number; transfersReceivedMinor: number; transfersPaidMinor: number; fdiAssetsMinor: number; fdiLiabilitiesMinor: number; portfolioAssetsMinor: number; portfolioLiabilitiesMinor: number; crossBorderLoanAssetsMinor: number; crossBorderLoanLiabilitiesMinor: number; bankFlowsMinor: number; reserveChangeMinor: number; currentAccountMinor: number; financialAccountMinor: number; reconciliationGapMinor: number };
+  financial: { openingGrossDebtMinor: number; newIssuanceMinor: number; newArrearsMinor: number; principalRepaymentMinor: number; haircutsMinor: number; writeOffsMinor: number; closingGrossDebtMinor: number; debtBridgeGapMinor: number; debtBridgeGapBps: number };
+  labour: { explicitEmployment: number; cohortEmployment: number; labourForce: number; employeeCompensationPaidMinor: number; employeeCompensationReceivedMinor: number; wageGapMinor: number };
+  reconciliation: { productionGdpMinor: number; expenditureGdpMinor: number; incomeGdpMinor: number; productionExpenditureGapMinor: number; productionIncomeGapMinor: number; productionExpenditureGapBps: number; productionIncomeGapBps: number };
+}
+
+export interface HouseholdCohortMonthlyAccount {
+  cohortId: string; countryId: string; elapsedMonth: number; status: "open" | "closed";
+  openingFinancialPositionMinor: number; labourIncomeMinor: number; capitalIncomeMinor: number; transfersReceivedMinor: number; personalTaxesMinor: number; otherTaxesMinor: number; disposableIncomeMinor: number; consumptionMinor: number; savingsMinor: number; debtBorrowingMinor: number; debtRepaymentMinor: number; financialInvestmentMinor: number; budgetGapMinor: number; budgetGapBps: number;
+}
+
+export interface FirmCohortMonthlyAccount {
+  cohortId: string; countryId: string; elapsedMonth: number; status: "open" | "closed";
+  revenueMinor: number; intermediateInputExpenseMinor: number; wagesMinor: number; interestMinor: number; taxesMinor: number; otherOperatingExpenseMinor: number; profitMinor: number; investmentMinor: number; borrowingMinor: number; debtRepaymentMinor: number; dividendsMinor: number; pnlGapMinor: number; pnlGapBps: number;
+}
+
+export interface SectorRepresentation {
+  countryId: string; sectorId: string; baselineTargetMinor: number; explicitRepresentationMinor: number; explicitCarveOutMinor: number; residualTargetMinor: number; representedTotalMinor: number; representedShareBps: number;
+}
+
+export interface CountryEconomicAccountsState {
+  currentByCountry: Record<string, CountryEconomicPeriod>;
+  closedByCountry: Record<string, CountryEconomicPeriod>;
+  history: CountryEconomicPeriod[];
+  hotHistoryMonths: number;
+  householdAccounts: HouseholdCohortMonthlyAccount[];
+  firmAccounts: FirmCohortMonthlyAccount[];
+  representations: SectorRepresentation[];
+}
+
+export type GeoeconomicPolicyKind =
+  | "tariff"
+  | "trade-agreement"
+  | "export-control"
+  | "sanction"
+  | "financial-restriction"
+  | "asset-freeze"
+  | "foreign-aid"
+  | "sovereign-lending"
+  | "investment-screening"
+  | "industrial-policy"
+  | "capital-control";
+
+export interface StrategicInterest {
+  countryId: string;
+  energySecurityBps: number;
+  exportAccessBps: number;
+  technologyAccessBps: number;
+  financialStabilityBps: number;
+  fiscalSpaceBps: number;
+  updatedAtMonth: number;
+}
+
+export interface DirectionalDependency {
+  sourceCountryId: string;
+  targetCountryId: string;
+  tradeDependencyBps: number;
+  importDependencyBps: number;
+  financeDependencyBps: number;
+  strategicDependencyBps: number;
+  updatedAtMonth: number;
+}
+
+export interface GeoeconomicPolicy {
+  id: string;
+  actorCountryId: string;
+  targetCountryIds: string[];
+  kind: GeoeconomicPolicyKind;
+  commodityIds: string[];
+  rateBps: number;
+  accessPenaltyBps: number;
+  startsAtMonth: number;
+  endsAtMonth: number | null;
+  status: "active" | "expired" | "revoked";
+  retaliationOfId: string | null;
+  transactionIds: string[];
+}
+
+export interface TradeAgreement {
+  id: string;
+  name: string;
+  memberCountryIds: string[];
+  tariffReductionBps: number;
+  investmentAccessBonusBps: number;
+  startsAtMonth: number;
+  endsAtMonth: number | null;
+  status: "active" | "suspended" | "expired";
+}
+
+export interface EconomicBloc {
+  id: string;
+  name: string;
+  memberCountryIds: string[];
+  coordinationBps: number;
+}
+
+export interface StateOwnedEnterpriseMandate {
+  companyId: string;
+  countryId: string;
+  stateOwnershipBps: number;
+  mandate: "energy-security" | "infrastructure" | "finance" | "technology";
+  softBudgetConstraintBps: number;
+}
+
+export interface IndustrialPolicyProgram {
+  id: string;
+  countryId: string;
+  beneficiaryCompanyId: string;
+  commodityId: string;
+  monthlyBudgetMinor: number;
+  startsAtMonth: number;
+  endsAtMonth: number | null;
+  status: "active" | "paused" | "completed";
+  transactionIds: string[];
+}
+
+export interface SovereignLendingFacility {
+  id: string;
+  lenderCountryId: string;
+  borrowerCountryId: string;
+  currencyId: string;
+  limitMinor: number;
+  drawnMinor: number;
+  annualRateBps: number;
+  maturityMonths: number;
+  status: "open" | "suspended" | "closed";
+  transactionIds: string[];
+}
+
+export interface GeoeconomicDecisionTrace {
+  id: string;
+  actorCountryId: string;
+  elapsedMonth: number;
+  decision: string;
+  targetCountryIds: string[];
+  inputs: Record<string, number | string | boolean>;
+  reasons: string[];
+  evidenceIds: string[];
+  outcome: "adopted" | "rejected" | "retaliated" | "expired";
+}
+
+export interface GeoeconomicsState {
+  strategicInterests: StrategicInterest[];
+  directionalDependencies: DirectionalDependency[];
+  policies: GeoeconomicPolicy[];
+  tradeAgreements: TradeAgreement[];
+  blocs: EconomicBloc[];
+  soeMandates: StateOwnedEnterpriseMandate[];
+  industrialPolicyPrograms: IndustrialPolicyProgram[];
+  sovereignLendingFacilities: SovereignLendingFacility[];
+  decisionTraces: GeoeconomicDecisionTrace[];
+  nextPolicyId: number;
+  nextDecisionTraceId: number;
+  nextProgramId: number;
+  nextFacilityId: number;
+}
+
+export type InstitutionType = "executive" | "legislature" | "judiciary" | "regulator" | "tax-authority" | "procurement-authority";
+
+export interface InstitutionalActor {
+  id: string;
+  countryId: string;
+  type: InstitutionType;
+  capacityBps: number;
+  independenceBps: number;
+  integrityBps: number;
+  accountabilityBps: number;
+}
+
+export interface StateCapacityProfile {
+  countryId: string;
+  administrativeCapacityBps: number;
+  fiscalCapacityBps: number;
+  enforcementCapacityBps: number;
+  procurementCapacityBps: number;
+  policyCredibilityBps: number;
+  politicalRiskBps: number;
+  updatedAtMonth: number;
+}
+
+export interface InterestGroup {
+  id: string;
+  countryId: string;
+  type: "labour" | "business" | "finance" | "regional" | "state-enterprise";
+  memberEntityIds: string[];
+  resourcesMinor: number;
+  influenceBps: number;
+  preferredPolicy: string;
+  lobbyingTransactionIds: string[];
+}
+
+export interface PolicyProposal {
+  id: string;
+  countryId: string;
+  sponsorInstitutionId: string;
+  topic: "tax-compliance" | "procurement" | "banking" | "industrial-policy" | "labour-formalization";
+  proposedAtMonth: number;
+  supportBps: number;
+  captureRiskBps: number;
+  status: "proposed" | "adopted" | "rejected" | "expired";
+  coalitionId: string | null;
+}
+
+export interface PoliticalCoalition {
+  id: string;
+  countryId: string;
+  proposalId: string;
+  supporterIds: string[];
+  opponentIds: string[];
+  supportBps: number;
+  formedAtMonth: number;
+}
+
+export interface ProcurementContract {
+  id: string;
+  countryId: string;
+  authorityId: string;
+  supplierId: string;
+  corruptionNetworkId: string | null;
+  grossAmountMinor: number;
+  deliveredValueMinor: number;
+  leakageMinor: number;
+  elapsedMonth: number;
+  transactionIds: string[];
+  status: "awarded" | "paid" | "cancelled";
+}
+
+export interface CorruptionNetwork {
+  id: string;
+  countryId: string;
+  memberEntityIds: string[];
+  captureBps: number;
+  hiddenBalanceMinor: number;
+  detectedLossMinor: number;
+  transactionIds: string[];
+}
+
+export interface ShadowEconomyAccount {
+  countryId: string;
+  elapsedMonth: number;
+  trueOutputMinor: number;
+  officialOutputMinor: number;
+  hiddenOutputMinor: number;
+  trueEmployment: number;
+  officialEmployment: number;
+  informalEmployment: number;
+  assessedTaxMinor: number;
+  collectedTaxMinor: number;
+  taxGapMinor: number;
+}
+
+export interface ComplianceProfile {
+  countryId: string;
+  taxComplianceBps: number;
+  labourComplianceBps: number;
+  financialComplianceBps: number;
+  beneficialOwnershipTransparencyBps: number;
+  updatedAtMonth: number;
+}
+
+export interface ConnectedLendingRelationship {
+  id: string;
+  countryId: string;
+  bankId: string;
+  borrowerCompanyId: string;
+  connectionBps: number;
+  preferentialSpreadBps: number;
+  loanIds: string[];
+  status: "active" | "exposed" | "closed";
+}
+
+export interface SoeGovernanceRecord {
+  companyId: string;
+  countryId: string;
+  boardIndependenceBps: number;
+  disclosureBps: number;
+  politicalAppointmentsBps: number;
+  softBudgetConstraintBps: number;
+  subsidyTransactionIds: string[];
+}
+
+export interface ZombieFirmRecord {
+  companyId: string;
+  countryId: string;
+  lossMonths: number;
+  debtServiceCoverageBps: number;
+  supportDependencyBps: number;
+  recognizedAtMonth: number;
+  status: "watch" | "zombie" | "restructured" | "resolved";
+}
+
+export interface PoliticalEconomyDecisionTrace {
+  id: string;
+  countryId: string;
+  elapsedMonth: number;
+  decision: string;
+  actorIds: string[];
+  inputs: Record<string, number | string | boolean>;
+  reasons: string[];
+  transactionIds: string[];
+  outcome: string;
+}
+
+export interface PoliticalEconomyState {
+  institutions: InstitutionalActor[];
+  stateCapacity: StateCapacityProfile[];
+  interestGroups: InterestGroup[];
+  policyProposals: PolicyProposal[];
+  coalitions: PoliticalCoalition[];
+  procurementContracts: ProcurementContract[];
+  corruptionNetworks: CorruptionNetwork[];
+  shadowEconomy: ShadowEconomyAccount[];
+  compliance: ComplianceProfile[];
+  connectedLending: ConnectedLendingRelationship[];
+  soeGovernance: SoeGovernanceRecord[];
+  zombieFirms: ZombieFirmRecord[];
+  decisionTraces: PoliticalEconomyDecisionTrace[];
+  nextProposalId: number;
+  nextCoalitionId: number;
+  nextProcurementId: number;
+  nextDecisionTraceId: number;
 }
 
 export interface Occupation {
@@ -1400,6 +1848,10 @@ export interface CalibratedParameterSet {
   wageAdjustmentSpeedBps: number;
   creditDemandSensitivityBps: number;
   employmentAdjustmentSpeedBps: number;
+  firmEntryExitSpeedBps: number;
+  governmentCommitmentAdjustmentBps: number;
+  taxComplianceResponseBps: number;
+  productivityGrowthResponseBps: number;
 }
 
 export type PolicyInterventionMode = "RATE_SHOCK" | "RATE_PATH" | "POLICY_RULE_SHIFT";
@@ -2139,6 +2591,9 @@ export interface SovereignBond {
   issuedAtMonth: number;
   maturityMonth: number;
   missedPayments: number;
+  legacy: boolean;
+  arrearsPrincipalMinor: number;
+  arrearsCouponMinor: number;
   status: "active" | "matured" | "defaulted" | "restructured";
 }
 
@@ -2199,6 +2654,19 @@ export interface GovernmentBudgetState {
   averageMaturityMonths: number;
   infrastructureCapitalMinor: number;
   fiscalStressBps: number;
+  effectiveTaxCollectionBps: number;
+  cashFinancingMinor: number;
+  debtFinancingMinor: number;
+  publicAdministrationTargetBps: number;
+  healthcareServicesTargetBps: number;
+  infrastructureMaintenanceTargetBps: number;
+  socialTransferTargetBps: number;
+  otherMandatoryTargetBps: number;
+  mandatoryPrimarySpendingMinor: number;
+  discretionaryPrimarySpendingMinor: number;
+  effectiveAverageDebtRateBps: number;
+  marginalNewIssueYieldBps: number;
+  debtArrearsMinor: number;
 }
 
 export interface CentralBankBalanceSheetState {
@@ -2285,8 +2753,8 @@ export interface MacroMonthlyPoint extends CountryMacroState {
 export type SimulationScenario = "baseline" | "high-demand" | "supply-constraint" | "high-rates" | "bank-liquidity-stress";
 
 export interface WorldState {
-  schemaVersion: 9;
-  saveVersion: 9;
+  schemaVersion: 14;
+  saveVersion: 14;
   seed: string;
   scenario: SimulationScenario;
   baselineReference: WorldBaselineReference;
@@ -2307,7 +2775,12 @@ export interface WorldState {
   bankAccounts: BankAccount[];
   loans: Loan[];
   bankFunding: BankFunding[];
-  nationalAccounts: NationalAccountsState;
+  countryEconomicAccounts: CountryEconomicAccountsState;
+  geoeconomics: GeoeconomicsState;
+  politicalEconomy: PoliticalEconomyState;
+  longRunDiagnostics: LongRunDiagnosticsState;
+  defenseEconomy: DefenseEconomyState;
+  conflicts: ConflictState;
   occupations: Occupation[];
   player: PlayerState;
   events: DomainEvent[];
@@ -2388,6 +2861,8 @@ export interface WorldState {
   derivativeMarginCalls: DerivativeMarginCall[];
   derivativeExposureHistory: DerivativeExposureSnapshot[];
   sovereignBonds: SovereignBond[];
+  sovereignArrears: SovereignArrear[];
+  sovereignDebtBridges: SovereignDebtBridge[];
   sovereignBondHoldings: SovereignBondHolding[];
   sovereignAuctions: SovereignAuction[];
   yieldCurveHistory: YieldCurveSnapshot[];

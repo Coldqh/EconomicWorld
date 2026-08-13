@@ -14,7 +14,6 @@ import type {
 import { convertMinor } from "../finance/currencies.ts";
 
 const MATURITY_MONTHS: Record<SovereignMaturityBucket, number> = { short: 12, "2y": 24, "5y": 60, "10y": 120, long: 240 };
-const MATURITY_WEIGHTS_BPS = [1_400, 1_800, 2_600, 2_500, 1_700] as const;
 const HOLDER_WEIGHTS: Array<[SovereignHolderType, number]> = [
   ["DOMESTIC_BANKS", 2_700], ["DOMESTIC_FUNDS", 2_000], ["HOUSEHOLDS", 1_200], ["FOREIGN_INVESTORS", 2_000], ["CENTRAL_BANK", 700], ["OTHER_INSTITUTIONS", 1_400],
 ];
@@ -137,7 +136,7 @@ function bootstrapSovereignDebt(world: WorldState): void {
     const profile = world.countryEconomicProfiles.find((item) => item.countryId === country.id)!;
     const annualGdp = targetMonthlyGdpMinor(world, country.id) * 12;
     const targetDebt = Math.round(annualGdp * profile.governmentDebtToGdpBps / 10_000);
-    const policy = world.centralBanks.find((item) => item.id === country.centralBankId)?.policyRateBps ?? 0;
+    const pack = REAL_COUNTRY_PACKS.find((item) => item.countryId === country.id)!;
     const primaryBank = world.banks.find((item) => item.countryId === country.id)!;
     const holders = HOLDER_WEIGHTS.map(([holderType, targetShareBps]): SovereignHolderCohort => ({ id: `sovereign-holder-${country.id}-${holderType.toLowerCase()}`, countryId: country.id, bankId: primaryBank.id, holderType, targetShareBps }));
     world.sovereignHolderCohorts.push(...holders);
@@ -145,11 +144,16 @@ function bootstrapSovereignDebt(world: WorldState): void {
     // must be macro-scale as well. It finances rollover without pretending a
     // handful of explicit funds can absorb the national debt stock.
     for (const holder of holders) seedDeposit(world, holder.id, holder.bankId, Math.max(1, Math.round(targetDebt * holder.targetShareBps / 10_000 / 4)));
+    const average = Math.max(12, profile.averageDebtMaturityMonths);
+    const rawWeights = ([12, 24, 60, 120, 240] as const).map((months) => Math.exp(-Math.abs(Math.log(months / average))) * (months <= average * 2.5 ? 1 : 0.55));
+    const weightTotal = rawWeights.reduce((sum, weight) => sum + weight, 0);
+    const maturityWeights = rawWeights.map((weight) => Math.round(weight * 10_000 / weightTotal));
+    maturityWeights[maturityWeights.length - 1] += 10_000 - maturityWeights.reduce((sum, weight) => sum + weight, 0);
     for (const [bucketIndex, bucket] of (["short", "2y", "5y", "10y", "long"] as SovereignMaturityBucket[]).entries()) {
-      const faceValue = Math.round(targetDebt * MATURITY_WEIGHTS_BPS[bucketIndex] / 10_000);
-      const yieldBps = clamp(policy + [35, 70, 125, 180, 240][bucketIndex] + Math.round(profile.governmentDebtToGdpBps / 80), 0, 6_000);
+      const faceValue = Math.round(targetDebt * maturityWeights[bucketIndex] / 10_000);
+      const yieldBps = clamp(pack.effectiveLegacyInterestRateBps + [-50, -25, 0, 25, 55][bucketIndex], 0, 3_000);
       const bondId = `sovereign-bond-${String(world.nextSovereignBondId++).padStart(8, "0")}`;
-      world.sovereignBonds.push({ id: bondId, governmentId: country.governmentId, countryId: country.id, currencyId: country.currencyReference, maturityBucket: bucket, faceValueMinor: faceValue, outstandingFaceValueMinor: faceValue, couponBps: yieldBps, issuePriceMinor: faceValue, marketPriceMinor: faceValue, yieldBps, issuedAtMonth: world.clock.elapsedMonths, maturityMonth: world.clock.elapsedMonths + MATURITY_MONTHS[bucket], missedPayments: 0, status: "active" });
+      world.sovereignBonds.push({ id: bondId, governmentId: country.governmentId, countryId: country.id, currencyId: country.currencyReference, maturityBucket: bucket, faceValueMinor: faceValue, outstandingFaceValueMinor: faceValue, couponBps: yieldBps, issuePriceMinor: faceValue, marketPriceMinor: faceValue, yieldBps, issuedAtMonth: world.clock.elapsedMonths, maturityMonth: world.clock.elapsedMonths + MATURITY_MONTHS[bucket], missedPayments: 0, legacy: true, arrearsPrincipalMinor: 0, arrearsCouponMinor: 0, status: "active" });
       const liabilityId = accountIds.sovereignBondLiability(country.governmentId, bondId);
       ensureAccount(world.ledger, liabilityId, country.governmentId, `Унаследованный государственный долг ${bondId}`, "liability", country.currencyReference);
       ensureAccount(world.ledger, accountIds.openingEquity(country.governmentId), country.governmentId, "Исторический собственный капитал", "equity", country.currencyReference);

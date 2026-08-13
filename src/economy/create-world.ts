@@ -6,7 +6,8 @@ import {
   seedDeposit,
   seedNonCashAsset,
 } from "../core/ledger.ts";
-import { emptyAccountingPeriod } from "../accounting/national-accounts.ts";
+import { initializeCountryEconomicAccounts } from "../accounting/country-periods.ts";
+import { buildRepresentationLayer } from "../accounting/representation.ts";
 import type {
   Bank,
   Broker,
@@ -45,6 +46,10 @@ import { initializeRealWorldReconciliation } from "./real-world-reconciliation.t
 import { createFirmCohorts, createPopulationCohorts } from "../world/cohorts.ts";
 import { createCities, createCountries, createHousingCohorts, createProducts, createUniversities } from "../world/catalog.ts";
 import { updateWorldDiagnostics } from "../world/systems.ts";
+import { createGeoeconomicsState, seedGeoeconomics } from "../geoeconomics/state.ts";
+import { createPoliticalEconomyState, seedPoliticalEconomy } from "../political-economy/state.ts";
+import { createDefenseEconomyState, seedDefenseEconomy } from "../defense-economy/state.ts";
+import { createConflictState } from "../conflict/state.ts";
 
 export const GOODS: GoodDefinition[] = [
   { id: "food", name: "Продовольствие", shortName: "Еда", unit: "корзина", basePriceCents: 78_000, consumptionWeightBps: 3_100, essential: true, recipe: { energy: 0.08 } },
@@ -402,7 +407,7 @@ export function createWorld(scenario: SimulationScenario = "baseline", options: 
     }
   }
   const world: WorldState = {
-    schemaVersion: 9, saveVersion: 9, seed: "economic-world-v9", scenario,
+    schemaVersion: 14, saveVersion: 14, seed: "economic-world-v14", scenario,
     baselineReference: { mode, baselineDate: options.baselineDate ?? (mode === "REAL_WORLD" ? "2023-12-31" : "2026-01-01"), referenceYear: options.referenceYear ?? (mode === "REAL_WORLD" ? 2023 : 2026), countryPackVersion: mode === "REAL_WORLD" ? "real-world-v2" : "synthetic-v1", calibrationSetId: mode === "REAL_WORLD" ? "reconciled-2023-v2" : "synthetic-neutral-v1", replayObservedExternalShocks: false },
     clock: { startYear: options.referenceYear ?? (mode === "REAL_WORLD" ? 2023 : 2026), startMonth: mode === "REAL_WORLD" ? 12 : 1, elapsedMonths: 0 }, ledger: createLedger(), goods: structuredClone(GOODS), goodsMovements: [], people, households, companies, banks,
     government: governments.find((item) => item.countryId === "ru")!,
@@ -413,13 +418,18 @@ export function createWorld(scenario: SimulationScenario = "baseline", options: 
     monetaryAreas: structuredClone(MONETARY_AREAS),
     bankAccounts: [],
     loans: [], bankFunding: [],
-    nationalAccounts: { baseYear: 2026, cpiWeightsBps: Object.fromEntries(GOODS.map((good) => [good.id, good.consumptionWeightBps])), current: emptyAccountingPeriod({ goods: GOODS }) },
+    countryEconomicAccounts: { currentByCountry: {}, closedByCountry: {}, history: [], hotHistoryMonths: 24, householdAccounts: [], firmAccounts: [], representations: [] },
+    geoeconomics: createGeoeconomicsState(),
+    politicalEconomy: createPoliticalEconomyState(),
+    longRunDiagnostics: { points: [], warnings: [], lastRecordedMonth: -1 },
+    defenseEconomy: createDefenseEconomyState(),
+    conflicts: createConflictState(),
     occupations: structuredClone(OCCUPATIONS),
     player: { personId: "person-player", householdId: "household-001", profileId: "student", automaticBasicSpending: false, consumptionBudgetBps: 7_500, savingsTargetBps: 2_500, pendingJobOffer: null, jobApplications: [], activeEnrollment: null, completedCourseIds: [], completedLessonIds: [], monthlyHistory: [], timeline: [], commandLog: [], nextCommandId: 1, nextTimelineId: 1, currentCityId: "moscow", residencePropertyId: null, activeTravel: null, universityApplications: [], activeUniversityEnrollment: null, completedProgramIds: [], educationHistory: [], visitedCityIds: ["moscow"], visitedCountryIds: ["ru"], residenceHistory: [{ cityId: "moscow", fromMonth: 0, toMonth: null }], durableAssetIds: [], propertyIds: [], brokerageAccountIds: [], bankAccountIds: [], reportingCurrencyId: "RUB", foodPlanId: "basic" },
     events: [], metricsHistory: [], countryMetricsHistory: [], nextEventId: 1, nextGoodsMovementId: 1, nextLoanId: 1, nextFundingId: 1, nextCompanyId: companies.length + 1,
     countries, countryEconomicProfiles, monetaryAreaProfiles, cities, universities, universityPrograms, housingCohorts, properties: [], products: createProducts(), durableAssets: [], populationCohorts, firmCohorts,
     countryScaleReconciliations: [], realWorldInitializationReports: [], tradeSectors: [], logisticsSectors: [], bankingSectorCohorts: [], sovereignHolderCohorts: [],
-    calibratedParameters: { consumptionIncomeElasticityBps: 9_000, investmentRateSensitivityBps: 4_500, priceAdjustmentSpeedBps: 1_200, wageAdjustmentSpeedBps: 850, creditDemandSensitivityBps: 5_000, employmentAdjustmentSpeedBps: 700 },
+    calibratedParameters: { consumptionIncomeElasticityBps: 9_000, investmentRateSensitivityBps: 4_500, priceAdjustmentSpeedBps: 1_200, wageAdjustmentSpeedBps: 850, creditDemandSensitivityBps: 5_000, employmentAdjustmentSpeedBps: 700, firmEntryExitSpeedBps: 650, governmentCommitmentAdjustmentBps: 750, taxComplianceResponseBps: 600, productivityGrowthResponseBps: 500 },
     countryCalibratedParameters: {}, policyInterventions: [], macroContributionEvents: [],
     fidelity: { tierByEntityId: Object.fromEntries(people.map((person) => [person.id, person.fidelityTier])), relevanceByEntityId: { "person-player": 10_000 }, materializedPersonIds: [], budgets: { maxNamedPersons: 500, maxActivePersons: 200, maxFullCompanies: 120, maxActiveProperties: 300 }, activeCityIds: ["moscow"] },
     ledgerArchives: [],
@@ -434,7 +444,7 @@ export function createWorld(scenario: SimulationScenario = "baseline", options: 
     assetManagers: [], funds: [], fundUnitHoldings: [], investmentBankMandates: [],
     marginAccounts: [], marginCalls: [], collateralPledges: [], securitiesLoans: [], shortPositions: [], repoAgreements: [], primeBrokerExposures: [],
     derivativeContracts: [], optionMarketSeries: [], nettingSets: [], clearingHouses: [], clearingMemberAccounts: [], clearedPositions: [], derivativeMarginCalls: [], derivativeExposureHistory: [],
-    sovereignBonds: [], sovereignBondHoldings: [], sovereignAuctions: [], yieldCurveHistory: [], governmentBudgets: [], centralBankBalanceSheets: [], monetaryPolicyDecisions: [], depositInsuranceSchemes: [], countryMacroStates: [], macroHistory: [],
+    sovereignBonds: [], sovereignArrears: [], sovereignDebtBridges: [], sovereignBondHoldings: [], sovereignAuctions: [], yieldCurveHistory: [], governmentBudgets: [], centralBankBalanceSheets: [], monetaryPolicyDecisions: [], depositInsuranceSchemes: [], countryMacroStates: [], macroHistory: [],
     globalCommodities: [], commodityMarkets: [], resourceDeposits: [], countryCommodityStates: [], energyBalances: [], tradeRoutes: [], ports: [], tradeFlows: [], strategicReserves: [], inputOutputCoefficients: [], countrySectorInventories: [], physicalCommodityFlows: [], balanceOfPayments: [], internationalInvestmentPositions: [], foreignDirectInvestments: [], internationalPortfolioPositions: [], crossBorderLoans: [], externalClaims: [], reservePortfolios: [], fxRegimes: [], fxPressureHistory: [],
     nextSecurityId: companies.length + 1, nextHoldingId: ownership.equityHoldings.length + 1, nextBondId: 1, nextCorporateActionId: 1,
     nextAcquisitionId: 1, nextBrokerageAccountId: 1, nextOrderId: 1, nextTradeId: 1, nextOrderSequence: 1,
@@ -496,7 +506,12 @@ export function createWorld(scenario: SimulationScenario = "baseline", options: 
   seedClearingHouses(world);
   seedDerivativeMarkets(world);
   seedGlobalEconomy(world);
+  seedGeoeconomics(world);
+  seedPoliticalEconomy(world);
+  seedDefenseEconomy(world);
   updateWorldDiagnostics(world);
   emitSimpleEvent(world, "WorldCreated", "Экономика запущена", `${world.diagnostics.populationRepresented.toLocaleString("ru-RU")} жителей · ${world.cities.length} городов · ${world.universities.length} вузов`, [world.government.id, world.centralBank.id], "positive");
+  initializeCountryEconomicAccounts(world);
+  buildRepresentationLayer(world);
   return world;
 }
