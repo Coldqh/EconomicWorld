@@ -7,6 +7,7 @@ import {
   entityBook,
   openBankAccount,
   postTransaction,
+  settleDepositPayment,
   sumAccountsByOwnerCategoryInstrument,
 } from "../core/ledger.ts";
 import type { Bank, Loan, WorldState } from "../domain/model.ts";
@@ -51,19 +52,21 @@ export function issueLoan(
   const newRiskAssets = bankLoanAssetsCents(world, bankId) + amountCents;
   const projectedRatio = newRiskAssets > 0 ? Math.floor((capital * 10_000) / newRiskAssets) : 100_000;
   const company = world.companies.find((item) => item.id === borrowerId);
+  const firmCohort = world.firmCohorts.find((item) => item.id === borrowerId);
   const recentReports = company?.financialReports.slice(-3) ?? [];
   const averageCashFlow = recentReports.length
     ? recentReports.reduce((sum, report) => sum + report.operatingCashFlowCents, 0) / recentReports.length
-    : company?.lastGrossRevenueCents ?? amountCents;
+    : company?.lastGrossRevenueCents ?? firmCohort?.revenueCents ?? amountCents;
   const existingDebt = world.loans
     .filter((loan) => loan.borrowerId === borrowerId && loan.status === "active")
     .reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
   const liquidityRatio = bankLiquidityRatioBps(world, bankId);
+  const isAggregateFirm = Boolean(firmCohort);
   const reasons = {
     capitalConstraint: projectedRatio < bank.minimumCapitalRatioBps,
     liquidityConstraint: liquidityRatio < bank.minimumLiquidityRatioBps,
     borrowerRisk: riskPremiumBps > 900,
-    cashFlowConstraint: averageCashFlow < 0 || existingDebt > Math.max(amountCents * 3, averageCashFlow * 24),
+    cashFlowConstraint: averageCashFlow < 0 || existingDebt > Math.max(amountCents * (isAggregateFirm ? 12 : 3), averageCashFlow * (isAggregateFirm ? 60 : 24)),
   };
   if (Object.values(reasons).some(Boolean)) {
     emitSimpleEvent(world, "LoanRejected", "Банк отказал в кредите", `Заявка ${borrowerId} не прошла ограничения капитала, ликвидности или денежного потока.`, [bankId, borrowerId], "attention", causeIds, { ...reasons, projectedCapitalRatioBps: projectedRatio, liquidityRatioBps: liquidityRatio, averageCashFlowCents: Math.round(averageCashFlow) });
@@ -133,9 +136,14 @@ export function issueLoan(
 }
 
 export function serviceLoans(world: WorldState): void {
+  const ownerByBank = new Map(world.banks.map((bank) => {
+    const owners = world.populationCohorts.filter((cohort) => cohort.countryId === bank.countryId && cohort.bankId === bank.id);
+    return [bank.id, owners.length ? owners[(world.clock.elapsedMonths + bank.id.length) % owners.length] : undefined] as const;
+  }));
   for (const loan of world.loans) {
     if (loan.status !== "active" || loan.remainingPrincipalCents <= 0) continue;
-    const principalCents = Math.min(
+    const aggregateWorkingCapital = world.firmCohorts.some((cohort) => cohort.id === loan.borrowerId);
+    let principalCents = aggregateWorkingCapital && loan.remainingMonths > 1 ? 0 : Math.min(
       loan.remainingPrincipalCents,
       Math.max(1, Math.ceil(loan.remainingPrincipalCents / Math.max(1, loan.remainingMonths))),
     );
@@ -145,6 +153,13 @@ export function serviceLoans(world: WorldState): void {
     );
     const settlement = world.bankAccounts.find((account) => account.id === loan.settlementBankAccountId && account.status === "active");
     const available = settlement ? bankAccountBalance(world, settlement.id) : 0;
+    if (aggregateWorkingCapital && loan.remainingMonths <= 1 && available >= interestCents && available < principalCents + interestCents) {
+      loan.remainingMonths = 12;
+      const lender = bankFor(world, loan.lenderBankId);
+      const policyRate = world.centralBanks.find((item) => item.id === lender.centralBankId)?.policyRateBps ?? 0;
+      loan.annualRateBps = policyRate + lender.baseSpreadBps + 350;
+      principalCents = 0;
+    }
     if (available < principalCents + interestCents) {
       loan.missedPayments += 1;
       if (loan.missedPayments === 1 || loan.missedPayments === 3) {
@@ -189,12 +204,14 @@ export function serviceLoans(world: WorldState): void {
         amountCents: interestCents,
       },
     ]);
+    // Проценты не должны навсегда изымать депозиты из реального оборота:
+    // часть банковской прибыли распределяется владельцам капитала.
     const borrowerCompany = world.companies.find((company) => company.id === loan.borrowerId);
     if (borrowerCompany) {
       borrowerCompany.lastInterestCents += interestCents;
       borrowerCompany.lastOperatingExpenseCents += interestCents;
     }
-    postTransaction(world, "LOAN_PRINCIPAL", `Погашение principal ${loan.id}`, [
+    if (principalCents > 0) postTransaction(world, "LOAN_PRINCIPAL", `Погашение principal ${loan.id}`, [
       { accountId: borrowerLoan, side: "debit", amountCents: principalCents },
       { accountId: settlement.ledgerDepositAccountId, side: "credit", amountCents: principalCents },
       { accountId: bankDepositLiability, side: "debit", amountCents: principalCents },
@@ -214,6 +231,19 @@ export function serviceLoans(world: WorldState): void {
         "positive",
       );
     }
+  }
+  if (world.clock.elapsedMonths % 3 !== 0) return;
+  for (const bank of world.banks) {
+    const owner = ownerByBank.get(bank.id);
+    const bankAccount = bankAccountsForOwner(world, bank.id, bank.baseCurrency)[0];
+    if (!owner || !bankAccount) continue;
+    const distribution = Math.floor(bankAccountBalance(world, bankAccount.id) / 40);
+    if (distribution <= 0) continue;
+    const expense = accountIds.operatingExpense(bank.id);
+    const income = accountIds.dividendIncome(owner.id);
+    ensureAccount(world.ledger, expense, bank.id, "Распределение банковской прибыли", "expense", bank.baseCurrency);
+    ensureAccount(world.ledger, income, owner.id, "Доход от банковского капитала", "income", bank.baseCurrency);
+    settleDepositPayment(world, bank.id, owner.id, distribution, "DIVIDEND", `Распределение прибыли ${bank.id}`, expense, income);
   }
 }
 

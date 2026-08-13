@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatSimulationDate } from "../core/clock.ts";
 import { accountIds, balanceOf, bankAccountBalance, bankAccountsForOwner, depositOf, entityBook, openBankAccount, setPrimaryBankAccount } from "../core/ledger.ts";
 import { createWorld } from "../economy/create-world.ts";
@@ -22,11 +22,14 @@ import { buyToCover, marginAccountState, openMarginAccount, placeMarginBuy, plac
 import { createFuture, derivativeExposure, writeOption } from "../finance/derivatives.ts";
 import { valueEuropeanOption } from "../finance/option-pricing.ts";
 import { APP_BUILD, applyAppUpdate, checkForUpdate, registerAppServiceWorker, serviceWorkerDiagnostics, type UpdateState } from "../pwa/update-manager.ts";
-import { createHistoricalValidationWorld, runEconomicLab, type EconomicLabResult } from "../economy/economic-lab.ts";
-import { loadHistoricalSeries } from "../data/real-world/historical-series.ts";
-import { alignReferenceSeriesToWorld, compareCalibrationSeries, simulatedMetricSeries, type CalibrationResult } from "../economy/calibration.ts";
 
-type View = "life" | "world" | "career" | "education" | "finances" | "economy" | "global" | "lab" | "companies" | "markets" | "portfolio" | "banks" | "ledger" | "control" | "settings";
+type View = "life" | "world" | "career" | "education" | "finances" | "economy" | "global" | "geoeconomics" | "political-economy" | "defense" | "lab" | "companies" | "markets" | "portfolio" | "banks" | "ledger" | "control" | "settings";
+
+const GeoeconomicsPanel = lazy(() => import("./phase-panels/GeoeconomicsPanel.tsx"));
+const PoliticalEconomyPanel = lazy(() => import("./phase-panels/PoliticalEconomyPanel.tsx"));
+const EconomicLabPanel = lazy(() => import("./phase-panels/EconomicLabPanel.tsx"));
+const DiagnosticsPanel = lazy(() => import("./phase-panels/DiagnosticsPanel.tsx"));
+const DefenseConflictPanel = lazy(() => import("./phase-panels/DefenseConflictPanel.tsx"));
 
 const NAV: Array<{ id: View; label: string; short: string }> = [
   { id: "life", label: "Моя жизнь", short: "Жизнь" },
@@ -36,6 +39,9 @@ const NAV: Array<{ id: View; label: string; short: string }> = [
   { id: "finances", label: "Мои финансы", short: "Финансы" },
   { id: "economy", label: "Экономика", short: "Экономика" },
   { id: "global", label: "Мировая экономика", short: "Мир" },
+  { id: "geoeconomics", label: "Геоэкономика", short: "Гео" },
+  { id: "political-economy", label: "Институты и власть", short: "Институты" },
+  { id: "defense", label: "Оборона и конфликты", short: "Оборона" },
   { id: "lab", label: "Экономическая лаборатория", short: "Лаборатория" },
   { id: "companies", label: "Компании", short: "Компании" },
   { id: "markets", label: "Рынки", short: "Рынки" },
@@ -59,7 +65,7 @@ const TX_LABELS: Record<TransactionKind, string> = {
   EQUITY_ISSUE: "Выпуск акций", EQUITY_SECONDARY: "Сделка с акциями", DIVIDEND: "Дивиденд", BOND_ISSUE: "Выпуск облигаций", BOND_COUPON: "Купон", BOND_REPAYMENT: "Погашение облигации", ACQUISITION: "Поглощение", IPO: "IPO", BROKER_DEPOSIT: "Брокерский счёт", MARKET_TRADE: "Биржевая сделка", BROKER_FEE: "Комиссия брокера", EXCHANGE_FEE: "Комиссия биржи", BANKRUPTCY_DISTRIBUTION: "Распределение при банкротстве", SECURITY_REVALUATION: "Переоценка ценной бумаги",
   FX_TRADE: "Валютная сделка", FUND_SUBSCRIPTION: "Подписка на фонд", FUND_REDEMPTION: "Погашение паёв", MANAGEMENT_FEE: "Комиссия за управление", PERFORMANCE_FEE: "Комиссия за результат", PENSION_CONTRIBUTION: "Пенсионный взнос", ETF_CREATION: "Создание паёв ETF", ETF_REDEMPTION: "Погашение паёв ETF", UNDERWRITING_FEE: "Комиссия андеррайтера", MARGIN_FINANCE: "Маржинальное финансирование", MARGIN_REPAYMENT: "Погашение маржи", SECURITIES_BORROW: "Заём бумаг", BORROW_FEE: "Комиссия за заём", DIVIDEND_COMPENSATION: "Компенсация дивиденда", REPO_OPEN: "Открытие репо", REPO_REPAYMENT: "Погашение репо", COLLATERAL_PLEDGE: "Залог", PRIME_BROKER_LOSS: "Убыток прайм-брокера",
   PROPERTY_TAX: "Налог на имущество", DERIVATIVE_PREMIUM: "Премия по деривативу", DERIVATIVE_SETTLEMENT: "Расчёт по деривативу", FUTURES_INITIAL_MARGIN: "Начальная маржа", FUTURES_VARIATION_MARGIN: "Вариационная маржа", SWAP_SETTLEMENT: "Расчёт по свопу", TRS_SETTLEMENT: "Расчёт по свопу совокупного дохода", CDS_PREMIUM: "Премия по кредитной защите", CDS_SETTLEMENT: "Выплата кредитной защиты", FX_FORWARD_SETTLEMENT: "Расчёт по валютному форварду", DERIVATIVE_DEFAULT: "Дефолт по деривативу",
-  SOVEREIGN_ISSUE: "Выпуск госдолга", SOVEREIGN_COUPON: "Купон по госдолгу", SOVEREIGN_REPAYMENT: "Погашение госдолга", SOVEREIGN_RESTRUCTURE: "Реструктуризация госдолга", SOVEREIGN_WRITE_DOWN: "Списание госдолга", PUBLIC_INVESTMENT: "Государственные инвестиции", OPEN_MARKET_PURCHASE: "Покупка на открытом рынке", OPEN_MARKET_SALE: "Продажа на открытом рынке", QE: "Количественное смягчение", QT: "Количественное ужесточение", DEPOSIT_INSURANCE: "Страхование вкладов",
+  SOVEREIGN_ISSUE: "Выпуск госдолга", SOVEREIGN_COUPON: "Купон по госдолгу", SOVEREIGN_REPAYMENT: "Погашение госдолга", SOVEREIGN_RESTRUCTURE: "Реструктуризация госдолга", SOVEREIGN_WRITE_DOWN: "Списание госдолга", PUBLIC_INVESTMENT: "Государственные инвестиции", TARIFF: "Таможенный тариф", SUBSIDY: "Субсидия", FOREIGN_AID: "Внешняя помощь", SOVEREIGN_LOAN: "Суверенный кредит", PROCUREMENT: "Госзакупка", CORRUPTION_LEAKAGE: "Утечка средств", LOBBYING: "Лоббирование", OPEN_MARKET_PURCHASE: "Покупка на открытом рынке", OPEN_MARKET_SALE: "Продажа на открытом рынке", QE: "Количественное смягчение", QT: "Количественное ужесточение", DEPOSIT_INSURANCE: "Страхование вкладов",
 };
 
 const number = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 });
@@ -467,6 +473,8 @@ function GlobalEconomy({ world, openWhy }: { world: WorldState; openWhy: (title:
   </>;
 }
 
+/* Legacy inline screens retained temporarily as source reference. The active
+ * implementations are code-split in phase-panels and are not bundled here.
 function EconomicLab({ world }: { world: WorldState }) {
   const [countryId, setCountryId] = useState("ru");
   const [rateDelta, setRateDelta] = useState(100);
@@ -525,6 +533,7 @@ function Control({ world }: { world: WorldState }) {
   </>;
 }
 
+*/
 const UPDATE_LABELS: Record<UpdateState, string> = {
   unsupported: "Не поддерживается",
   current: "Актуальная версия",
@@ -673,13 +682,16 @@ export function App() {
           {view === "finances" && <MyFinances world={world} commit={commit} notify={setNotice} openWhy={openWhy} />}
           {view === "economy" && <Economy world={world} openWhy={openWhy} />}
           {view === "global" && <GlobalEconomy world={world} openWhy={openWhy} />}
-          {view === "lab" && <EconomicLab world={world} />}
+          {view === "geoeconomics" && <Suspense fallback={<p className="empty">Загрузка…</p>}><GeoeconomicsPanel world={world} /></Suspense>}
+          {view === "political-economy" && <Suspense fallback={<p className="empty">Загрузка…</p>}><PoliticalEconomyPanel world={world} /></Suspense>}
+          {view === "defense" && <Suspense fallback={<p className="empty">Загрузка…</p>}><DefenseConflictPanel world={world} /></Suspense>}
+          {view === "lab" && <Suspense fallback={<p className="empty">Загрузка…</p>}><EconomicLabPanel world={world} /></Suspense>}
           {view === "companies" && <Companies world={world} commit={commit} notify={setNotice} openWhy={openWhy} />}
           {view === "markets" && <Markets world={world} commit={commit} notify={setNotice} />}
           {view === "portfolio" && <Portfolio world={world} commit={commit} notify={setNotice} />}
           {view === "banks" && <Banks world={world} openWhy={openWhy} />}
           {view === "ledger" && <Ledger world={world} openWhy={openWhy} />}
-          {view === "control" && <Control world={world} />}
+          {view === "control" && <Suspense fallback={<p className="empty">Загрузка…</p>}><DiagnosticsPanel world={world} /></Suspense>}
           {view === "settings" && <Settings repository={repository} updateState={updateState} autosaveState={autosaveState} checkUpdate={() => { void checkUpdate(); }} updateNow={() => { void updateNow(false); }} forceUpdate={() => { void updateNow(true); }} />}
         </main>
       </div>

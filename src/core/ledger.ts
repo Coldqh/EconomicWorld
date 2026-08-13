@@ -7,51 +7,39 @@ import type {
   TransactionKind,
   WorldState,
 } from "../domain/model.ts";
+import { recordCountryTransaction } from "../accounting/country-periods.ts";
 import { emitSimpleEvent } from "./events.ts";
 
 const ownerAccountIndex = new WeakMap<LedgerState, Map<string, string[]>>();
 
-interface LedgerBalanceIndex {
-  sourceAccounts: LedgerState["accounts"];
-  indexedAccountCount: number;
-  totalByCategoryInstrument: Map<string, number>;
-  totalByCurrencyCategoryInstrument: Map<string, number>;
-  totalByOwnerCategoryInstrument: Map<string, number>;
+interface BankAccountLookupIndex {
+  source: WorldState["bankAccounts"];
+  indexedLength: number;
+  byId: Map<string, WorldState["bankAccounts"][number]>;
+  byOwner: Map<string, WorldState["bankAccounts"]>;
 }
 
-const balanceIndexes = new WeakMap<LedgerState, LedgerBalanceIndex>();
+const bankAccountIndexes = new WeakMap<WorldState, BankAccountLookupIndex>();
 
-function ledgerBalanceIndex(ledger: LedgerState): LedgerBalanceIndex {
-  let index = balanceIndexes.get(ledger);
-  if (!index || index.sourceAccounts !== ledger.accounts) {
-    index = { sourceAccounts: ledger.accounts, indexedAccountCount: -1, totalByCategoryInstrument: new Map(), totalByCurrencyCategoryInstrument: new Map(), totalByOwnerCategoryInstrument: new Map() };
-    balanceIndexes.set(ledger, index);
+function bankAccountLookupIndex(world: WorldState): BankAccountLookupIndex {
+  let index = bankAccountIndexes.get(world);
+  if (!index || index.source !== world.bankAccounts || index.indexedLength > world.bankAccounts.length) {
+    index = { source: world.bankAccounts, indexedLength: 0, byId: new Map(), byOwner: new Map() };
+    bankAccountIndexes.set(world, index);
   }
-  if (index.indexedAccountCount >= 0) return index;
-  index.totalByCategoryInstrument.clear();
-  index.totalByCurrencyCategoryInstrument.clear();
-  index.totalByOwnerCategoryInstrument.clear();
-  for (const account of Object.values(ledger.accounts)) {
-    const balance = ledger.balances[account.id] ?? 0;
-    const categoryInstrument = `${account.category}|${account.instrument}`;
-    const currencyCategoryInstrument = `${account.currency}|${categoryInstrument}`;
-    const ownerCategoryInstrument = `${account.ownerId}|${categoryInstrument}`;
-    index.totalByCategoryInstrument.set(categoryInstrument, (index.totalByCategoryInstrument.get(categoryInstrument) ?? 0) + balance);
-    index.totalByCurrencyCategoryInstrument.set(currencyCategoryInstrument, (index.totalByCurrencyCategoryInstrument.get(currencyCategoryInstrument) ?? 0) + balance);
-    index.totalByOwnerCategoryInstrument.set(ownerCategoryInstrument, (index.totalByOwnerCategoryInstrument.get(ownerCategoryInstrument) ?? 0) + balance);
+  for (let position = index.indexedLength; position < world.bankAccounts.length; position += 1) {
+    const account = world.bankAccounts[position];
+    index.byId.set(account.id, account);
+    const ownerAccounts = index.byOwner.get(account.ownerId) ?? [];
+    ownerAccounts.push(account);
+    index.byOwner.set(account.ownerId, ownerAccounts);
   }
-  index.indexedAccountCount = 1;
+  index.indexedLength = world.bankAccounts.length;
   return index;
 }
 
-function addBalanceIndexDelta(index: LedgerBalanceIndex, account: LedgerAccount, delta: number): void {
-  const categoryInstrument = `${account.category}|${account.instrument}`;
-  const currencyCategoryInstrument = `${account.currency}|${categoryInstrument}`;
-  const ownerCategoryInstrument = `${account.ownerId}|${categoryInstrument}`;
-  index.totalByCategoryInstrument.set(categoryInstrument, (index.totalByCategoryInstrument.get(categoryInstrument) ?? 0) + delta);
-  index.totalByCurrencyCategoryInstrument.set(currencyCategoryInstrument, (index.totalByCurrencyCategoryInstrument.get(currencyCategoryInstrument) ?? 0) + delta);
-  index.totalByOwnerCategoryInstrument.set(ownerCategoryInstrument, (index.totalByOwnerCategoryInstrument.get(ownerCategoryInstrument) ?? 0) + delta);
-}
+// Aggregate ledger queries are comparatively rare. Computing them on demand is
+// cheaper than maintaining three string-key indexes for every transaction leg.
 
 interface LedgerTransactionIndex {
   source: LedgerTransaction[];
@@ -252,7 +240,6 @@ export function ensureAccount(
   currency?: string,
 ): string {
   if (!ledger.accounts[id]) {
-    const cachedBalanceIndex = balanceIndexes.get(ledger);
     ledger.accounts[id] = {
       id,
       ownerId,
@@ -262,7 +249,8 @@ export function ensureAccount(
       currency: currency ?? "RUB",
     };
     ledger.balances[id] = 0;
-    if (cachedBalanceIndex) cachedBalanceIndex.indexedAccountCount = -1;
+    // A new account starts at zero, so an initialized aggregate balance index
+    // remains correct and receives its first non-zero delta in postTransaction.
     const index = ownerAccountIndex.get(ledger);
     if (index) {
       const ids = index.get(ownerId) ?? [];
@@ -323,30 +311,21 @@ export function postTransaction(
   }
 
   const id = `tx-${String(world.ledger.nextTransactionId++).padStart(8, "0")}`;
-  world.ledger.transactions.push({
+  const transaction = {
     id,
     elapsedMonth: world.clock.elapsedMonths,
     kind,
     memo,
     causeIds,
     entries,
-  });
-  const balanceIndex = balanceIndexes.get(world.ledger);
-  const canUpdateBalanceIndex = Boolean(balanceIndex && balanceIndex.sourceAccounts === world.ledger.accounts && balanceIndex.indexedAccountCount >= 0);
-  const indexedDelta = canUpdateBalanceIndex ? new Map<string, { account: LedgerAccount; delta: number }>() : null;
+  };
+  world.ledger.transactions.push(transaction);
   for (const entry of entries) {
     const account = world.ledger.accounts[entry.accountId];
     const delta = signedNaturalDelta(account, entry);
     world.ledger.balances[entry.accountId] += delta;
-    if (indexedDelta) {
-      const ownerKey = `${account.ownerId}|${account.category}|${account.instrument}`;
-      const key = `${ownerKey}|${account.currency}`;
-      const current = indexedDelta.get(key);
-      if (current) current.delta += delta;
-      else indexedDelta.set(key, { account, delta });
-    }
   }
-  if (balanceIndex && indexedDelta) for (const { account, delta } of indexedDelta.values()) addBalanceIndexDelta(balanceIndex, account, delta);
+  recordCountryTransaction(world, transaction);
   return id;
 }
 
@@ -355,17 +334,17 @@ export function balanceOf(world: WorldState, accountId: string): number {
 }
 
 export function depositOf(world: WorldState, ownerId: string): number {
-  const primary = world.bankAccounts?.find((account) => account.ownerId === ownerId && account.isPrimary && account.status === "active");
+  const primary = bankAccountLookupIndex(world).byOwner.get(ownerId)?.find((account) => account.isPrimary && account.status === "active");
   return balanceOf(world, primary?.ledgerDepositAccountId ?? accountIds.deposit(ownerId));
 }
 
 export function bankAccountBalance(world: WorldState, bankAccountId: string): number {
-  const account = world.bankAccounts.find((item) => item.id === bankAccountId && item.status === "active");
-  return account ? balanceOf(world, account.ledgerDepositAccountId) : 0;
+  const account = bankAccountLookupIndex(world).byId.get(bankAccountId);
+  return account?.status === "active" ? balanceOf(world, account.ledgerDepositAccountId) : 0;
 }
 
 export function bankAccountsForOwner(world: WorldState, ownerId: string, currencyId?: string) {
-  return world.bankAccounts.filter((account) => account.ownerId === ownerId && account.status === "active" && (!currencyId || account.currencyId === currencyId));
+  return (bankAccountLookupIndex(world).byOwner.get(ownerId) ?? []).filter((account) => account.status === "active" && (!currencyId || account.currencyId === currencyId));
 }
 
 export function primaryBankAccount(world: WorldState, ownerId: string) {
@@ -761,6 +740,8 @@ export function transferDeposit(
     | "DURABLE_PURCHASE"
     | "USED_ASSET"
     | "LOGISTICS"
+    | "PROCUREMENT"
+    | "CAPITAL_INVESTMENT"
   >,
   memo: string,
   causeIds: string[] = [],
@@ -912,15 +893,18 @@ export function sumAccounts(
 }
 
 export function sumAccountsByCategoryInstrument(world: WorldState, category: AccountCategory, instrument: LedgerAccount["instrument"]): number {
-  return ledgerBalanceIndex(world.ledger).totalByCategoryInstrument.get(`${category}|${instrument}`) ?? 0;
+  return sumAccounts(world, (account) => account.category === category && account.instrument === instrument);
 }
 
 export function sumAccountsByCurrencyCategoryInstrument(world: WorldState, currencyId: string, category: AccountCategory, instrument: LedgerAccount["instrument"]): number {
-  return ledgerBalanceIndex(world.ledger).totalByCurrencyCategoryInstrument.get(`${currencyId}|${category}|${instrument}`) ?? 0;
+  return sumAccounts(world, (account) => account.currency === currencyId && account.category === category && account.instrument === instrument);
 }
 
 export function sumAccountsByOwnerCategoryInstrument(world: WorldState, ownerId: string, category: AccountCategory, instrument: LedgerAccount["instrument"]): number {
-  return ledgerBalanceIndex(world.ledger).totalByOwnerCategoryInstrument.get(`${ownerId}|${category}|${instrument}`) ?? 0;
+  return indexedAccountIds(world.ledger, ownerId).reduce((sum, accountId) => {
+    const account = world.ledger.accounts[accountId];
+    return account?.category === category && account.instrument === instrument ? sum + balanceOf(world, accountId) : sum;
+  }, 0);
 }
 
 export function entityBook(world: WorldState, ownerId: string): {

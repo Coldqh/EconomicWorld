@@ -13,9 +13,9 @@ export function collectMetrics(world: WorldState): MetricPoint {
   const priceByGoodCents = Object.fromEntries(world.goods.map((good) => [good.id, averagePriceForGood(world, good.id)]));
   const productionByGoodMilliUnits = Object.fromEntries(world.goods.map((good) => [good.id, world.companies.filter((company) => company.goodId === good.id).reduce((sum, company) => sum + company.lastProductionMilliUnits, 0)]));
   const salesByGoodMilliUnits = Object.fromEntries(world.goods.map((good) => [good.id, world.companies.filter((company) => company.goodId === good.id).reduce((sum, company) => sum + company.lastSalesMilliUnits, 0)]));
-  const actualConsumption = world.nationalAccounts.current.householdConsumptionByGoodCents;
+  const actualConsumption = Object.fromEntries(world.goods.map((good) => [good.id, 0]));
   const totalConsumption = Object.values(actualConsumption).reduce((sum, value) => sum + value, 0);
-  const weights = Object.fromEntries(world.goods.map((good) => [good.id, totalConsumption > 0 ? Math.round((actualConsumption[good.id] * 10_000) / totalConsumption) : world.nationalAccounts.cpiWeightsBps[good.id]]));
+  const weights = Object.fromEntries(world.goods.map((good) => [good.id, totalConsumption > 0 ? Math.round((actualConsumption[good.id] * 10_000) / totalConsumption) : good.consumptionWeightBps]));
   const cpiContributionBpsByGood = Object.fromEntries(world.goods.map((good) => {
     const relativeBps = Math.round((priceByGoodCents[good.id] * 10_000) / good.basePriceCents);
     return [good.id, Math.round((relativeBps * weights[good.id]) / 10_000)];
@@ -60,9 +60,9 @@ export function collectMetrics(world: WorldState): MetricPoint {
     realGdpCents: national.realGdpCents,
     realGdpGrowthBps,
     gdpDeflatorBps: national.deflatorBps,
-    householdConsumptionCents: world.nationalAccounts.current.householdConsumptionCents,
-    capitalFormationCents: world.nationalAccounts.current.capitalFormationCents,
-    governmentConsumptionCents: world.nationalAccounts.current.governmentConsumptionCents,
+    householdConsumptionCents: Object.values(world.countryEconomicAccounts.closedByCountry).reduce((sum, item) => sum + item.expenditure.householdConsumptionMinor, 0),
+    capitalFormationCents: Object.values(world.countryEconomicAccounts.closedByCountry).reduce((sum, item) => sum + item.expenditure.privateInvestmentMinor + item.expenditure.governmentInvestmentMinor, 0),
+    governmentConsumptionCents: Object.values(world.countryEconomicAccounts.closedByCountry).reduce((sum, item) => sum + item.expenditure.governmentConsumptionMinor, 0),
     inventoryChangeCents: national.inventoryChangeCents,
     cpiBps,
     monthlyInflationBps,
@@ -101,15 +101,21 @@ export function collectCountryMetrics(world: WorldState): CountryMetricPoint[] {
     const companies = world.companies.filter((company) => company.headquartersCountryId === country.id);
     const households = world.households.filter((household) => world.cities.find((city) => city.id === household.cityId)?.countryId === country.id);
     const cohorts = world.populationCohorts.filter((cohort) => cohort.countryId === country.id);
-    const reconciliation = world.countryScaleReconciliations.find((item) => item.countryId === country.id);
-    const explicitCurrent = companies.reduce((sum, company) => sum + Math.max(0, company.lastGrossRevenueCents - company.lastIntermediateConsumptionCents), 0);
-    const cohortValueAdded = world.firmCohorts.filter((item) => item.countryId === country.id).reduce((sum, item) => sum + item.valueAddedMinor, 0);
-    const nominalGdpMinor = reconciliation ? Math.max(1, reconciliation.explicitCompanyValueAddedMinor + cohortValueAdded + reconciliation.publicOtherValueAddedMinor + reconciliation.logisticsValueAddedMinor + Math.round(explicitCurrent * 0.05)) : explicitCurrent;
+    const period = world.countryEconomicAccounts.closedByCountry[country.id];
+    // The calibrated target is permitted only before the first simulated month
+    // exists. From month one onward the closed period is authoritative.
+    const initialTarget = world.clock.elapsedMonths === 0
+      ? world.countryScaleReconciliations.find((item) => item.countryId === country.id)?.targetMonthlyNominalGdpMinor ?? 0
+      : 0;
+    const nominalGdpMinor = Math.max(1, period?.production.valueAddedMinor ?? initialTarget);
     const pricePoints = world.cities.filter((city) => city.countryId === country.id).flatMap((city) => Object.entries(city.localPriceByGoodCents));
     const cpiBps = pricePoints.length ? Math.round(pricePoints.reduce((sum, [goodId, price]) => sum + price * 10_000 / Math.max(1, world.goods.find((good) => good.id === goodId)?.basePriceCents ?? price), 0) / pricePoints.length) : 10_000;
     const previous = [...world.countryMetricsHistory].reverse().find((point) => point.countryId === country.id);
     const twelveMonthsAgo = [...world.countryMetricsHistory].reverse().find((point) => point.countryId === country.id && point.elapsedMonth <= world.clock.elapsedMonths - 12);
     const realGdpMinor = Math.round(nominalGdpMinor * 10_000 / Math.max(1, cpiBps));
+    const structuralNominalGdpMinor = world.countryScaleReconciliations.find((item) => item.countryId === country.id)?.targetMonthlyNominalGdpMinor
+      ?? world.countryEconomicProfiles.find((item) => item.countryId === country.id)?.baselineNominalGdpMinor
+      ?? nominalGdpMinor;
     const gdpGrowthBps = previous?.realGdpMinor ? Math.round((realGdpMinor - previous.realGdpMinor) * 10_000 / previous.realGdpMinor) : 0;
     const inflationBps = twelveMonthsAgo?.cpiBps ? Math.round((cpiBps - twelveMonthsAgo.cpiBps) * 10_000 / twelveMonthsAgo.cpiBps) : 0;
     const employedNamed = households.filter((household) => household.employerId).length;
@@ -134,7 +140,9 @@ export function collectCountryMetrics(world: WorldState): CountryMetricPoint[] {
       creditMinor,
       activeCompanies: companies.filter((company) => company.active).length,
       productionMilliUnits: companies.reduce((sum, company) => sum + company.lastProductionMilliUnits, 0),
-      consumptionMinor: reconciliation?.householdConsumptionMinor ?? households.reduce((sum, household) => sum + Object.values(household.lastSpendingByCategoryCents).reduce((subtotal, value) => subtotal + value, 0), 0),
+      consumptionMinor: period?.expenditure.householdConsumptionMinor ?? 0,
+      structuralNominalGdpMinor,
+      gdpDeflatorBps: cpiBps,
     };
   });
 }

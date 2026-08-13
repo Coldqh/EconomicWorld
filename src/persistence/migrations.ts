@@ -4,6 +4,10 @@ import { createWorld } from "../economy/create-world.ts";
 import { seedMacroeconomics } from "../economy/macroeconomics.ts";
 import { seedClearingHouses } from "../finance/clearing.ts";
 import { seedDerivativeMarkets } from "../finance/derivatives.ts";
+import { createGeoeconomicsState } from "../geoeconomics/state.ts";
+import { createPoliticalEconomyState } from "../political-economy/state.ts";
+import { createDefenseEconomyState, seedDefenseEconomy } from "../defense-economy/state.ts";
+import { createConflictState } from "../conflict/state.ts";
 
 type LegacyWorld = Omit<Partial<WorldState>, "schemaVersion" | "saveVersion"> & { schemaVersion?: number; saveVersion?: number };
 
@@ -45,16 +49,64 @@ function migrateMetric(metric: Partial<MetricPoint>, world: WorldState): MetricP
 
 export function migrateWorldState(raw: unknown): WorldState {
   const legacy = structuredClone(raw) as LegacyWorld;
-  if ((legacy.schemaVersion ?? 1) > 9 || (legacy.saveVersion ?? 1) > 9) {
+  if ((legacy.schemaVersion ?? 1) > 14 || (legacy.saveVersion ?? 1) > 14) {
     throw new Error("Сохранение создано более новой версией приложения");
   }
-  if (legacy.schemaVersion === 9 && legacy.saveVersion === 9) return legacy as WorldState;
-  if (legacy.schemaVersion === 8 && legacy.saveVersion === 8) {
-    const template = createWorld();
+  const template = createWorld();
+  const upgradeLongRun = (source: LegacyWorld): WorldState => {
+    const upgraded = {
+    ...template,
+    ...source,
+    schemaVersion: 14,
+    saveVersion: 14,
+    calibratedParameters: { ...template.calibratedParameters, ...(source.calibratedParameters ?? {}) },
+    countryCalibratedParameters: source.countryCalibratedParameters ?? {},
+    governmentBudgets: (source.governmentBudgets ?? []).map((budget) => ({
+      ...template.governmentBudgets.find((item) => item.countryId === budget.countryId),
+      ...budget,
+    })),
+    longRunDiagnostics: source.longRunDiagnostics ?? { points: [], warnings: [], lastRecordedMonth: -1 },
+    defenseEconomy: source.defenseEconomy ?? createDefenseEconomyState(),
+    conflicts: source.conflicts ?? createConflictState(),
+    geoeconomics: source.geoeconomics ?? createGeoeconomicsState(),
+    politicalEconomy: source.politicalEconomy ?? createPoliticalEconomyState(),
+    countryEconomicAccounts: { currentByCountry: {}, closedByCountry: {}, history: [], hotHistoryMonths: 24, householdAccounts: [], firmAccounts: [], representations: [] },
+    } as WorldState;
+    seedDefenseEconomy(upgraded);
+    return upgraded;
+  };
+  if (legacy.schemaVersion === 14 && legacy.saveVersion === 14) return upgradeLongRun(legacy);
+  if (legacy.schemaVersion === 13 && legacy.saveVersion === 13) return upgradeLongRun(legacy);
+  if (legacy.schemaVersion === 12 && legacy.saveVersion === 12) return upgradeLongRun(legacy);
+  if (legacy.schemaVersion === 11 && legacy.saveVersion === 11) {
+    // Accounting periods are derived caches. Early schema-11 development
+    // saves may contain the pre-bridge shape, so rebuild them from live state.
+    return upgradeLongRun(legacy);
+  }
+  if (legacy.schemaVersion === 10 && legacy.saveVersion === 10) {
+    return upgradeLongRun(legacy);
+  }
+  if (legacy.schemaVersion === 9 && legacy.saveVersion === 9) {
     return {
       ...legacy,
-      schemaVersion: 9 as const,
-      saveVersion: 9 as const,
+      schemaVersion: 14 as const,
+      saveVersion: 14 as const,
+      countryEconomicAccounts: { currentByCountry: {}, closedByCountry: {}, history: [], hotHistoryMonths: 24, householdAccounts: [], firmAccounts: [], representations: [] },
+      geoeconomics: createGeoeconomicsState(),
+      politicalEconomy: createPoliticalEconomyState(),
+      longRunDiagnostics: { points: [], warnings: [], lastRecordedMonth: -1 },
+      sovereignArrears: [],
+      sovereignDebtBridges: [],
+      sovereignBonds: (legacy.sovereignBonds ?? []).map((bond) => ({ ...bond, legacy: bond.issuedAtMonth === 0, arrearsPrincipalMinor: 0, arrearsCouponMinor: 0 })),
+      governmentBudgets: (legacy.governmentBudgets ?? []).map((budget) => ({ ...budget, effectiveTaxCollectionBps: 10_000, cashFinancingMinor: 0, debtFinancingMinor: 0 })),
+      crossBorderLoans: (legacy.crossBorderLoans ?? []).map((loan) => ({ ...loan, openedAtMonth: Math.max(0, loan.maturityMonth - 36), lastServicedMonth: Math.min(legacy.clock?.elapsedMonths ?? 0, loan.maturityMonth), principalRepaidMinor: Math.max(0, loan.originalPrincipalMinor - loan.remainingPrincipalMinor), interestPaidMinor: 0, accruedInterestMinor: 0, arrearsMinor: 0, missedPayments: 0, rolloverCount: 0, borrowerType: template.banks.some((item) => item.id === loan.borrowerId) ? "bank" as const : template.governments.some((item) => item.id === loan.borrowerId) ? "government" as const : template.tradeSectors.some((item) => item.id === loan.borrowerId) ? "trade-sector" as const : "firm" as const })),
+    } as WorldState;
+  }
+  if (legacy.schemaVersion === 8 && legacy.saveVersion === 8) {
+    return {
+      ...legacy,
+      schemaVersion: 14 as const,
+      saveVersion: 14 as const,
       baselineReference: { ...template.baselineReference, ...(legacy.baselineReference ?? {}), replayObservedExternalShocks: false },
       companies: (legacy.companies ?? template.companies).map((company) => ({ ...company, baselineFinancials: null })),
       banks: (legacy.banks ?? template.banks).map((bank) => ({ ...bank, baselineFinancials: null })),
@@ -64,12 +116,11 @@ export function migrateWorldState(raw: unknown): WorldState {
     } as WorldState;
   }
   if (legacy.schemaVersion === 7 && legacy.saveVersion === 7) {
-    const template = createWorld();
     const migrated = {
       ...template,
       ...legacy,
-      schemaVersion: 9 as const,
-      saveVersion: 9 as const,
+      schemaVersion: 14 as const,
+      saveVersion: 14 as const,
       baselineReference: template.baselineReference,
       companies: (legacy.companies ?? template.companies).map((company) => ({ ...company, globalInputConstraintBps: company.globalInputConstraintBps ?? 10_000 })),
       history: {
@@ -90,12 +141,11 @@ export function migrateWorldState(raw: unknown): WorldState {
     } as WorldState;
     return migrated;
   }
-  const template = createWorld();
   const world = {
     ...template,
     ...legacy,
-    schemaVersion: 9 as const,
-    saveVersion: 9 as const,
+    schemaVersion: 14 as const,
+    saveVersion: 14 as const,
     goods: template.goods.map((good) => ({ ...good, ...(legacy.goods?.find((item) => item.id === good.id) ?? {}), essential: good.essential })),
     countries: template.countries.map((base) => ({ ...base, ...(legacy.countries?.find((item) => item.id === base.id) ?? {}) })),
     cities: template.cities.map((base) => ({ ...base, ...(legacy.cities?.find((item) => item.id === base.id) ?? {}) })),
@@ -118,7 +168,6 @@ export function migrateWorldState(raw: unknown): WorldState {
     centralBanks: template.centralBanks.map((base) => ({ ...base, ...(legacy.centralBanks?.find((item) => item.id === base.id) ?? {}) })),
     brokers: template.brokers.map((base) => ({ ...base, ...(legacy.brokers?.find((item) => item.id === base.id) ?? {}), supportedCurrencyIds: base.supportedCurrencyIds, marginAvailable: base.marginAvailable })),
     bankFunding: legacy.bankFunding ?? [],
-    nationalAccounts: legacy.nationalAccounts ?? template.nationalAccounts,
     occupations: legacy.occupations ?? template.occupations,
     player: { ...template.player, ...(legacy.player ?? {}) },
     nextFundingId: legacy.nextFundingId ?? 1,

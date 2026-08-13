@@ -1,0 +1,23 @@
+.phase-screen { display: grid; gap: 16px; }
+.phase-screen > header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.phase-screen > header h1 { margin: 0; font-size: clamp(1.65rem, 4vw, 2.4rem); }
+.phase-screen > header span { color: var(--muted); font-size: .95rem; }
+.phase-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.phase-kpis article { min-height: 92px; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); display: flex; flex-direction: column; justify-content: space-between; }
+.phase-kpis span, .phase-list small, .phase-traces small { color: var(--muted); }
+.phase-kpis strong { font-size: 1.7rem; }
+.phase-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.phase-list, .phase-traces { display: grid; gap: 8px; }
+.phase-list > div { display: grid; grid-template-columns: 1fr auto; gap: 3px 12px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.phase-list small { grid-column: 1 / -1; font-size: .9rem; line-height: 1.35; }
+.phase-traces > div { display: grid; grid-template-columns: 46px minmax(120px, .7fr) 1fr; gap: 10px; align-items: baseline; padding: 11px 0; border-bottom: 1px solid var(--line); }
+@media (max-width: 760px) {
+  .phase-screen { gap: 12px; }
+  .phase-screen > header { align-items: flex-start; flex-direction: column; }
+  .phase-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .phase-kpis article { min-height: 86px; padding: 14px; }
+  .phase-kpis span, .phase-list, .phase-traces { font-size: 1rem; }
+  .phase-columns { grid-template-columns: 1fr; }
+  .phase-traces > div { grid-template-columns: 42px 1fr; }
+  .phase-traces small { grid-column: 1 / -1; font-size: .92rem; }
+}

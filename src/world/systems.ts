@@ -1,41 +1,126 @@
 import { emitSimpleEvent } from "../core/events.ts";
 import { depositOf, transferDeposit } from "../core/ledger.ts";
 import type { CompactNumericSeries, LedgerArchiveSegment, LedgerTransaction, TransactionKind, WorldState } from "../domain/model.ts";
+import { issueLoan } from "../finance/credit.ts";
 
 const clamp = (value: number, minimum: number, maximum: number): number => Math.min(maximum, Math.max(minimum, value));
 
 export function updateAggregateEconomies(world: WorldState): void {
-  // Массовые когорты работают на квартальном такте; персональный контур остаётся месячным.
-  if (world.clock.elapsedMonths % 3 !== 0) return;
+  // Доходы, потребление и налоги должны жить в том же месячном периоде,
+  // что государственные расходы и обслуживание долга.
+  const populationByCity = new Map<string, typeof world.populationCohorts>();
+  const firmsByCity = new Map<string, typeof world.firmCohorts>();
+  for (const cohort of world.populationCohorts) {
+    const group = populationByCity.get(cohort.cityId) ?? [];
+    group.push(cohort);
+    populationByCity.set(cohort.cityId, group);
+  }
+  for (const cohort of world.firmCohorts) {
+    const group = firmsByCity.get(cohort.cityId) ?? [];
+    group.push(cohort);
+    firmsByCity.set(cohort.cityId, group);
+  }
+  const profileByCountry = new Map(world.countryEconomicProfiles.map((item) => [item.countryId, item]));
+  const capacityByCountry = new Map(world.politicalEconomy.stateCapacity.map((item) => [item.countryId, item]));
+  const governmentByCountry = new Map(world.governments.map((item) => [item.countryId, item]));
+  const budgetByCountry = new Map(world.governmentBudgets.map((item) => [item.countryId, item]));
+  const macroByCountry = new Map(world.countryMacroStates.map((item) => [item.countryId, item]));
   for (const city of world.cities) {
-    const population = world.populationCohorts.filter((cohort) => cohort.cityId === city.id);
-    const firms = world.firmCohorts.filter((cohort) => cohort.cityId === city.id);
+    const population = populationByCity.get(city.id) ?? [];
+    const firms = firmsByCity.get(city.id) ?? [];
+    const cityValueAdded = firms.reduce((sum, firm) => sum + firm.valueAddedMinor, 0);
+    const profile = profileByCountry.get(city.countryId);
+    const stateCapacity = capacityByCountry.get(city.countryId);
+    const humanCapitalBps = Math.round(population.reduce((sum, cohort) => sum + (cohort.education === "master" ? 11_000 : cohort.education === "bachelor" ? 10_400 : 9_700) * cohort.populationCount, 0) / Math.max(1, population.reduce((sum, cohort) => sum + cohort.populationCount, 0)));
+    const capitalDeepeningBps = Math.round(firms.reduce((sum, firm) => sum + firm.capitalCents, 0) * 10_000 / Math.max(1, firms.reduce((sum, firm) => sum + firm.revenueCents * 18, 0)));
+    const productivityImpulse = clamp(Math.round(((humanCapitalBps - 10_000) * 0.08 + (capitalDeepeningBps - 10_000) * 0.04 + ((stateCapacity?.policyCredibilityBps ?? 7_000) - 7_000) * 0.03) * world.calibratedParameters.productivityGrowthResponseBps / 10_000), -4, 12);
+    for (const firm of firms) firm.productivityBps = clamp(firm.productivityBps + productivityImpulse, 6_000, 18_000);
+    const wageShareBps = clamp(5_500 + Math.round(((profile?.workingAgeShareBps ?? 6_500) - 6_500) * 0.1), 5_000, 6_200);
+    const monthlyWagePool = Math.round(cityValueAdded * wageShareBps / 10_000);
+    const wageWeights = population.reduce((sum, cohort) => sum + cohort.employedCount * cohort.averageMonthlyIncomeCents, 0);
+    const wagePayer = firms.reduce<(typeof firms)[number] | undefined>((best, candidate) => !best || depositOf(world, candidate.id) > depositOf(world, best.id) ? candidate : best, undefined);
     let localIncome = 0;
     let employed = 0;
     let residents = 0;
     for (let index = 0; index < population.length; index += 1) {
       const cohort = population[index];
-      const firm = firms[index % firms.length];
-      if (!firm) continue;
+      const firm = wagePayer;
+      if (!firm || !firms.length) continue;
       const employmentSpeed = world.countryCalibratedParameters[cohort.countryId]?.employmentAdjustmentSpeedBps ?? world.calibratedParameters.employmentAdjustmentSpeedBps;
-      const profile = world.countryEconomicProfiles.find((item) => item.countryId === cohort.countryId);
       const targetEmployment = Math.round(cohort.populationCount * (10_000 - (profile?.unemploymentBps ?? 500)) / 10_000);
       cohort.employedCount = clamp(cohort.employedCount + Math.round((targetEmployment - cohort.employedCount) * employmentSpeed / 10_000), 0, cohort.populationCount);
-      const scaledIncome = Math.max(1, Math.round(cohort.employedCount * cohort.averageMonthlyIncomeCents));
-      const income = Math.min(scaledIncome, Math.max(0, Math.round(depositOf(world, firm.id) * 0.22)));
+      const scaledIncome = Math.max(1, Math.round(monthlyWagePool * cohort.employedCount * cohort.averageMonthlyIncomeCents / Math.max(1, wageWeights)));
+      if (depositOf(world, firm.id) < scaledIncome) {
+        const liquidityGap = Math.max(1, scaledIncome - depositOf(world, firm.id));
+        const activeWorkingCapital = world.loans.filter((loan) => loan.borrowerId === firm.id && loan.status === "active");
+        const lastWorkingCapital = activeWorkingCapital.reduce((latest, loan) => Math.max(latest, loan.issuedAtMonth), -1);
+        if (!activeWorkingCapital.length || world.clock.elapsedMonths - lastWorkingCapital >= 24) issueLoan(world, firm.bankId, firm.id, liquidityGap * 12, 60, 350, [firm.id]);
+      }
+      const income = Math.min(scaledIncome, Math.max(0, depositOf(world, firm.id)));
       const incomeTx = transferDeposit(world, firm.id, cohort.id, income, "COHORT_INCOME", `Доход когорты: ${city.name}`);
       cohort.lastIncomeCents = incomeTx ? income : 0;
-      const propensity = cohort.incomeBand === "low" ? 8_800 : cohort.incomeBand === "middle" ? 7_900 : 6_800;
-      const consumption = Math.min(depositOf(world, cohort.id), Math.round(cohort.lastIncomeCents * propensity / 10_000));
-      const consumptionTx = transferDeposit(world, cohort.id, firm.id, consumption, "COHORT_CONSUMPTION", `Потребление когорты: ${city.name}`, incomeTx ? [incomeTx] : []);
+      const government = governmentByCountry.get(cohort.countryId);
+      const budget = budgetByCountry.get(cohort.countryId);
+      const collectionBps = budget?.effectiveTaxCollectionBps ?? 10_000;
+      const fiscalCohortsEnabled = world.baselineReference.mode === "REAL_WORLD";
+      const incomeTax = fiscalCohortsEnabled && government && profile ? Math.min(depositOf(world, cohort.id), Math.round(income * profile.taxProfile.incomeTaxBps / 10_000 * collectionBps / 10_000)) : 0;
+      const incomeTaxTx = government && incomeTax > 0 ? transferDeposit(world, cohort.id, government.id, incomeTax, "INCOME_TAX", `Агрегированный налог на доход · ${city.name}`, incomeTx ? [incomeTx] : []) : null;
+      const basePropensity = cohort.incomeBand === "low" ? 8_800 : cohort.incomeBand === "middle" ? 7_900 : 6_800;
+      const wealthMonths = depositOf(world, cohort.id) / Math.max(1, cohort.lastIncomeCents || cohort.averageMonthlyIncomeCents);
+      const wealthAdjustmentBps = clamp(Math.round((wealthMonths - 6) * 140), -700, 4_500);
+      const macro = macroByCountry.get(cohort.countryId);
+      const rateAdjustmentBps = clamp(-Math.max(0, (macro?.depositRateBps ?? 0) - (macro?.inflationExpectationsBps ?? 0)) * 0.25, -500, 200);
+      const debtAdjustmentBps = clamp(-cohort.aggregateDebtCents * 800 / Math.max(1, cohort.aggregateWealthCents), -800, 0);
+      const propensity = clamp(basePropensity + wealthAdjustmentBps + rateAdjustmentBps + debtAdjustmentBps, 5_800, 12_500);
+      cohort.savingsRateBps = clamp(10_000 - propensity, -2_500, 4_200);
+      const liquidWealth = depositOf(world, cohort.id);
+      const normalMonthlyIncome = Math.max(cohort.lastIncomeCents, cohort.averageMonthlyIncomeCents);
+      const excessLiquidWealth = Math.max(0, liquidWealth - normalMonthlyIncome * 6);
+      const wealthDraw = Math.round(excessLiquidWealth / 24);
+      const consumption = Math.min(liquidWealth, Math.round((cohort.lastIncomeCents - incomeTax) * propensity / 10_000) + wealthDraw);
+      const consumptionSupplier = firms[(index + world.clock.elapsedMonths) % firms.length] ?? firm;
+      const previousRevenue = consumptionSupplier.revenueCents;
+      const consumptionTx = transferDeposit(world, cohort.id, consumptionSupplier.id, consumption, "COHORT_CONSUMPTION", `Потребление когорты: ${city.name}`, incomeTx ? [incomeTx] : []);
       cohort.lastConsumptionCents = consumptionTx ? consumption : 0;
+      const consumptionTax = fiscalCohortsEnabled && government && profile ? Math.min(depositOf(world, firm.id), Math.round(consumption * profile.taxProfile.consumptionTaxBps / (10_000 + profile.taxProfile.consumptionTaxBps) * collectionBps / 10_000)) : 0;
+      if (government && consumptionTax > 0) transferDeposit(world, firm.id, government.id, consumptionTax, "SALES_TAX", `Агрегированный налог на потребление · ${city.name}`, [consumptionTx, incomeTaxTx].filter(Boolean) as string[]);
       if (consumptionTx) {
-        firm.revenueCents = Math.max(firm.revenueCents, consumption);
-        firm.valueAddedMinor = Math.max(1, Math.round(firm.revenueCents * 5_200 / 10_000));
-        firm.intermediateConsumptionMinor = Math.max(1, firm.revenueCents - firm.valueAddedMinor);
-        firm.profitsCents = Math.round(consumption * (650 + (firm.productivityBps - 8_000) * 0.2) / 10_000);
-        firm.inventoryMilliUnits = Math.max(0, firm.inventoryMilliUnits + Math.round(firm.productionMilliUnits * 0.08) - Math.round(consumption / Math.max(1, city.costOfLivingCents) * 1_000));
-        firm.productivityBps = clamp(firm.productivityBps + (firm.profitsCents > 0 ? 2 : -3), 6_000, 15_000);
+        consumptionSupplier.revenueCents = Math.max(consumptionSupplier.revenueCents, consumption);
+        consumptionSupplier.valueAddedMinor = Math.max(1, Math.round(consumptionSupplier.revenueCents * 5_200 / 10_000));
+        consumptionSupplier.intermediateConsumptionMinor = Math.max(1, consumptionSupplier.revenueCents - consumptionSupplier.valueAddedMinor);
+        consumptionSupplier.profitsCents = Math.round(consumption * (650 + (consumptionSupplier.productivityBps - 8_000) * 0.2) / 10_000);
+        if (fiscalCohortsEnabled && government && profile && consumptionSupplier.profitsCents > 0) {
+          const profitTax = Math.min(depositOf(world, consumptionSupplier.id), Math.round(consumptionSupplier.profitsCents * profile.taxProfile.corporateTaxBps / 10_000 * collectionBps / 10_000));
+          if (profitTax > 0) transferDeposit(world, consumptionSupplier.id, government.id, profitTax, "CORPORATE_TAX", `Агрегированный налог на прибыль · ${city.name}`, consumptionTx ? [consumptionTx] : []);
+        }
+        consumptionSupplier.inventoryMilliUnits = Math.max(0, consumptionSupplier.inventoryMilliUnits + Math.round(consumptionSupplier.productionMilliUnits * 0.08) - Math.round(consumption / Math.max(1, city.costOfLivingCents) * 1_000));
+        const depreciation = Math.round(consumptionSupplier.capitalCents / 360);
+        // One rotating cohort per city purchases capital each month. This keeps
+        // the aggregate flow real without multiplying identical micro-payments.
+        const maintenance = index === 0 ? Math.min(depositOf(world, consumptionSupplier.id), Math.max(0, depreciation)) : 0;
+        const capitalSupplier = firms[(index + world.clock.elapsedMonths + 1) % firms.length];
+        const investmentTx = capitalSupplier && capitalSupplier.id !== consumptionSupplier.id && maintenance > 0
+          ? transferDeposit(world, consumptionSupplier.id, capitalSupplier.id, maintenance, "CAPITAL_INVESTMENT", `Обновление капитала: ${city.name}`, consumptionTx ? [consumptionTx] : [])
+          : null;
+        const realizedMaintenance = investmentTx ? maintenance : 0;
+        consumptionSupplier.capitalCents = Math.max(1, consumptionSupplier.capitalCents - depreciation + realizedMaintenance);
+        if (investmentTx && capitalSupplier) {
+          const suppliedValueAdded = Math.round(maintenance * 5_200 / 10_000);
+          capitalSupplier.revenueCents = Math.max(capitalSupplier.revenueCents, maintenance);
+          capitalSupplier.valueAddedMinor = Math.max(capitalSupplier.valueAddedMinor, suppliedValueAdded);
+          capitalSupplier.intermediateConsumptionMinor = Math.max(capitalSupplier.intermediateConsumptionMinor, maintenance - suppliedValueAdded);
+        }
+        const unmetDemand = Math.max(0, consumption - previousRevenue);
+        const entrySpeed = world.calibratedParameters.firmEntryExitSpeedBps;
+        if (consumptionSupplier.profitsCents > 0 && unmetDemand > 0) {
+          const demandPressure = clamp(unmetDemand / Math.max(1, previousRevenue), 0, 0.02);
+          consumptionSupplier.firmCount = Math.max(1, consumptionSupplier.firmCount + Math.round(consumptionSupplier.firmCount * entrySpeed / 10_000 / 12 * demandPressure));
+          consumptionSupplier.firmCountEquivalent = Math.max(consumptionSupplier.firmCountEquivalent, consumptionSupplier.firmCount);
+        } else if (consumptionSupplier.profitsCents < 0) {
+          const exit = Math.round(consumptionSupplier.firmCount * entrySpeed / 10_000 / 24);
+          consumptionSupplier.firmCount = Math.max(1, consumptionSupplier.firmCount - exit);
+          consumptionSupplier.firmCountEquivalent = Math.max(1, consumptionSupplier.firmCount);
+        }
       }
       localIncome += cohort.averageMonthlyIncomeCents * cohort.populationCount;
       residents += cohort.populationCount;
@@ -283,7 +368,7 @@ export function compactLedgerHistory(world: WorldState): void {
   world.ledgerArchives.push(segment);
   world.ledger.transactions = world.ledger.transactions.filter((transaction) => transaction.elapsedMonth >= cutoff);
   }
-  world.goodsMovements = world.goodsMovements.filter((movement) => movement.elapsedMonth >= world.clock.elapsedMonths - 24);
+  world.goodsMovements = world.goodsMovements.filter((movement) => movement.elapsedMonth >= world.clock.elapsedMonths - 12);
   compactAnalyticalHistory(world);
   collapseOldLedgerRecords(world);
   compactCompanyHistory(world);
@@ -299,7 +384,7 @@ export function updateWorldDiagnostics(world: WorldState): void {
   // diagnostic itself one of the largest long-run simulation costs.
   const estimateSave = world.clock.elapsedMonths === 0
     || world.clock.elapsedMonths === 12
-    || world.clock.elapsedMonths % (world.baselineReference.mode === "REAL_WORLD" ? 240 : 24) === 0;
+    || world.clock.elapsedMonths % (world.baselineReference.mode === "REAL_WORLD" ? 600 : 24) === 0;
   const bytes = (value: unknown) => JSON.stringify(value).length;
   const saveBreakdown = estimateSave ? {
     totalBytes: 0,

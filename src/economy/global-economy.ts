@@ -7,9 +7,11 @@ import type {
   InternationalPortfolioPosition, ReservePortfolio, TradeFlow, TradeRoute, WorldState,
 } from "../domain/model.ts";
 import { convertMinor, fxRatePpm } from "../finance/currencies.ts";
+import { recordBilateralExternalFlow, recordExternalFlow } from "../accounting/country-periods.ts";
 import { createFuture } from "../finance/derivatives.ts";
 import { executeFxConversion } from "../finance/fx-market.ts";
 import { settleFinancialPayment } from "../finance/financial-settlement.ts";
+import { evaluateEconomicPolicyAccess } from "../geoeconomics/access.ts";
 
 const clamp = (value: number, minimum: number, maximum: number): number => Math.min(maximum, Math.max(minimum, value));
 const countryCurrency = (world: WorldState, countryId: string): string => world.countries.find((country) => country.id === countryId)?.currencyReference ?? "USD";
@@ -220,10 +222,15 @@ function calibratedTradeQuantity(world: WorldState, countryId: string, commodity
   const sector = world.tradeSectors.find((item) => item.countryId === countryId);
   const market = world.commodityMarkets.find((item) => item.commodityId === commodityId);
   if (!sector || !market) return 0;
-  const weights = Object.fromEntries(world.globalCommodities.map((commodity, index) => [commodity.id, 300 + (index * 1_103 + countryId.charCodeAt(0) * 31 + countryId.charCodeAt(1) * 17) % 900]));
+  const pack = REAL_COUNTRY_PACKS.find((item) => item.countryId === countryId);
+  const weights = side === "export" ? pack?.exportCommoditySharesBps : pack?.importCommoditySharesBps;
+  if (!weights) return 0;
   const weightTotal = Object.values(weights).reduce((sum, value) => sum + value, 0);
   const monthlyValue = side === "export" ? sector.exportCapacityUsdMinor : sector.importBudgetUsdMinor;
-  return Math.max(1, Math.round(monthlyValue * sector.tradeCalibrationFactorBps / 10_000 * weights[commodityId] / Math.max(1, weightTotal) * 1_000 / Math.max(1, market.spotPriceUsdMinor)));
+  const aliases: Record<string, string> = { "crude-oil": "oil", "natural-gas": "gas", "thermal-coal": "coal", "consumer-goods": "food" };
+  const commodityWeight = weights[commodityId] ?? weights[aliases[commodityId]] ?? 0;
+  if (commodityWeight <= 0) return 0;
+  return Math.max(1, Math.round(monthlyValue * sector.tradeCalibrationFactorBps / 10_000 * commodityWeight / Math.max(1, weightTotal) * 1_000 / Math.max(1, market.spotPriceUsdMinor)));
 }
 
 function updateTradeCalibrationFactors(world: WorldState): void {
@@ -267,22 +274,26 @@ function resetRealWorldRouteCapacity(world: WorldState): void {
   }
 }
 
-function createClearedTradeFlow(world: WorldState, exporterCountryId: string, importerCountryId: string, commodityId: string, quantityMilliUnits: number, route: TradeRoute): TradeFlow | null {
+export function createClearedTradeFlow(world: WorldState, exporterCountryId: string, importerCountryId: string, commodityId: string, quantityMilliUnits: number, route: TradeRoute): TradeFlow | null {
   const exporter = world.tradeSectors.find((item) => item.countryId === exporterCountryId);
   const importer = world.tradeSectors.find((item) => item.countryId === importerCountryId);
   const exporterEntity = exporter ?? representativeCompany(world, exporterCountryId, commodityId);
   const importerEntity = importer ?? representativeCompany(world, importerCountryId, commodityId);
   const market = world.commodityMarkets.find((item) => item.commodityId === commodityId)!;
   if (!exporterEntity || !importerEntity || quantityMilliUnits <= 0) return null;
+  const access = evaluateEconomicPolicyAccess(world, { sourceCountryId: exporterCountryId, destinationCountryId: importerCountryId, kind: "trade", commodityId });
+  if (!access.allowed) return null;
   const invoiceCurrencyId = countryCurrency(world, exporterCountryId);
   const valueUsdMinor = Math.max(1, Math.round(quantityMilliUnits * market.spotPriceUsdMinor / 1_000));
   const transportCostUsdMinor = Math.max(1, Math.round(quantityMilliUnits * route.costUsdMinorPerUnit / 1_000));
   const tradeCostUsdMinor = Math.round(valueUsdMinor * 35 / 10_000);
+  const tariffUsdMinor = Math.round(valueUsdMinor * access.tariffBps / 10_000);
   const invoiceValueMinor = convertMinor(world, valueUsdMinor, "USD", invoiceCurrencyId) ?? valueUsdMinor;
+  const nativeCurrencyId = countryCurrency(world, importerCountryId);
+  const tariffNativeMinor = convertMinor(world, tariffUsdMinor, "USD", nativeCurrencyId) ?? tariffUsdMinor;
   const logistics = world.logisticsSectors.find((item) => item.countryId === exporterCountryId) ?? world.logisticsSectors.find((item) => item.countryId === importerCountryId);
   const id = `trade-flow-${String(world.nextTradeFlowId++).padStart(9, "0")}`;
   if (world.baselineReference.mode === "SYNTHETIC") {
-    const nativeCurrencyId = countryCurrency(world, importerCountryId);
     const nativeAccount = ensureCurrencyAccount(world, importerEntity.id, nativeCurrencyId);
     const invoiceAccount = ensureCurrencyAccount(world, importerEntity.id, invoiceCurrencyId);
     const exporterAccount = ensureCurrencyAccount(world, exporterEntity.id, invoiceCurrencyId);
@@ -290,17 +301,27 @@ function createClearedTradeFlow(world: WorldState, exporterCountryId: string, im
     let fxTradeId: string | null = null;
     if (nativeCurrencyId !== invoiceCurrencyId) {
       const requiredNative = convertMinor(world, Math.ceil(invoiceValueMinor * 1.02), invoiceCurrencyId, nativeCurrencyId) ?? 0;
-      if (requiredNative <= 0 || bankAccountBalance(world, nativeAccount.id) < requiredNative) return null;
+      if (requiredNative <= 0 || bankAccountBalance(world, nativeAccount.id) < requiredNative + tariffNativeMinor) return null;
       const converted = executeFxConversion(world, importerEntity.id, nativeAccount.id, invoiceAccount.id, requiredNative);
       if (!converted.ok) return null;
       fxTradeId = converted.tradeId ?? null;
     }
+    if (bankAccountBalance(world, invoiceAccount.id) < invoiceValueMinor || bankAccountBalance(world, nativeAccount.id) < tariffNativeMinor) return null;
+    const importerGovernment = world.governments.find((item) => item.countryId === importerCountryId);
+    if (importerGovernment && tariffNativeMinor > 0) ensureCurrencyAccount(world, importerGovernment.id, nativeCurrencyId);
     const goodsPayment = settleFinancialPayment(world, importerEntity.id, exporterEntity.id, invoiceCurrencyId, invoiceValueMinor, "GOODS_CLEARING", `Международная поставка ${commodityId}`);
     if (!goodsPayment) return null;
+    const tariffTx = importerGovernment && tariffNativeMinor > 0
+      ? settleFinancialPayment(world, importerEntity.id, importerGovernment.id, nativeCurrencyId, tariffNativeMinor, "TARIFF", `Импортный тариф: ${commodityId}`, [id])
+      : null;
+    if (tariffNativeMinor > 0 && !tariffTx) return null;
+    recordBilateralExternalFlow(world, exporterCountryId, importerCountryId, "goodsExportsMinor", "goodsImportsMinor", valueUsdMinor);
+    recordExternalFlow(world, exporterCountryId, "bankFlowsMinor", -valueUsdMinor);
+    recordExternalFlow(world, importerCountryId, "bankFlowsMinor", valueUsdMinor);
     world.externalClaims.push({ id: `external-claim-${id}`, creditorCountryId: exporterCountryId, debtorCountryId: importerCountryId, ownerId: exporterEntity.id, obligorId: importerEntity.id, currencyId: invoiceCurrencyId, valueUsdMinor, sourceFlowId: id, createdAtMonth: world.clock.elapsedMonths, kind: "DEPOSIT" });
-    return { id, elapsedMonth: world.clock.elapsedMonths, exporterCountryId, importerCountryId, exporterId: exporterEntity.id, importerId: importerEntity.id, commodityId, quantityMilliUnits, unitPriceUsdMinor: market.spotPriceUsdMinor, invoiceCurrencyId, invoiceValueMinor, routeId: route.id, transportCostUsdMinor, tradeCostUsdMinor, landedUnitCostUsdMinor: market.spotPriceUsdMinor + route.costUsdMinorPerUnit + Math.round(market.spotPriceUsdMinor * 35 / 10_000), logisticsProviderId: "", logisticsPaymentTransactionId: null, tariffUsdMinor: 0, paymentTransactionIds: [goodsPayment], fxTradeId, status: "settled" };
+    return { id, elapsedMonth: world.clock.elapsedMonths, exporterCountryId, importerCountryId, exporterId: exporterEntity.id, importerId: importerEntity.id, commodityId, quantityMilliUnits, unitPriceUsdMinor: market.spotPriceUsdMinor, invoiceCurrencyId, invoiceValueMinor, routeId: route.id, transportCostUsdMinor, tradeCostUsdMinor, landedUnitCostUsdMinor: market.spotPriceUsdMinor + route.costUsdMinorPerUnit + Math.round(market.spotPriceUsdMinor * (35 + access.tariffBps) / 10_000), logisticsProviderId: "", logisticsPaymentTransactionId: null, tariffUsdMinor, paymentTransactionIds: [goodsPayment, ...(tariffTx ? [tariffTx] : [])], fxTradeId, status: "settled" };
   }
-  return { id, elapsedMonth: world.clock.elapsedMonths, exporterCountryId, importerCountryId, exporterId: exporterEntity.id, importerId: importerEntity.id, commodityId, quantityMilliUnits, unitPriceUsdMinor: market.spotPriceUsdMinor, invoiceCurrencyId, invoiceValueMinor, routeId: route.id, transportCostUsdMinor, tradeCostUsdMinor, landedUnitCostUsdMinor: market.spotPriceUsdMinor + route.costUsdMinorPerUnit + Math.round(market.spotPriceUsdMinor * 35 / 10_000), logisticsProviderId: logistics?.id ?? "", logisticsPaymentTransactionId: null, tariffUsdMinor: 0, paymentTransactionIds: [], fxTradeId: null, status: "unpaid" };
+  return { id, elapsedMonth: world.clock.elapsedMonths, exporterCountryId, importerCountryId, exporterId: exporterEntity.id, importerId: importerEntity.id, commodityId, quantityMilliUnits, unitPriceUsdMinor: market.spotPriceUsdMinor, invoiceCurrencyId, invoiceValueMinor, routeId: route.id, transportCostUsdMinor, tradeCostUsdMinor, landedUnitCostUsdMinor: market.spotPriceUsdMinor + route.costUsdMinorPerUnit + Math.round(market.spotPriceUsdMinor * (35 + access.tariffBps) / 10_000), logisticsProviderId: logistics?.id ?? "", logisticsPaymentTransactionId: null, tariffUsdMinor, paymentTransactionIds: [], fxTradeId: null, status: "unpaid" };
 }
 
 /**
@@ -326,6 +347,8 @@ function settleClearedTradeBaskets(world: WorldState): void {
     const goodsInvoiceMinor = flows.reduce((sum, flow) => sum + flow.invoiceValueMinor, 0);
     const logisticsUsdMinor = flows.reduce((sum, flow) => sum + flow.transportCostUsdMinor, 0);
     const logisticsInvoiceMinor = convertMinor(world, logisticsUsdMinor, "USD", invoiceCurrencyId) ?? logisticsUsdMinor;
+    const tariffUsdMinor = flows.reduce((sum, flow) => sum + flow.tariffUsdMinor, 0);
+    const tariffNativeMinor = convertMinor(world, tariffUsdMinor, "USD", nativeCurrencyId) ?? tariffUsdMinor;
     const invoiceRequiredMinor = goodsInvoiceMinor + logisticsInvoiceMinor;
     const nativeAccount = ensureCurrencyAccount(world, first.importerId, nativeCurrencyId);
     const invoiceAccount = ensureCurrencyAccount(world, first.importerId, invoiceCurrencyId);
@@ -335,28 +358,37 @@ function settleClearedTradeBaskets(world: WorldState): void {
     if (nativeCurrencyId !== invoiceCurrencyId) {
       const requiredNative = convertMinor(world, Math.ceil(invoiceRequiredMinor * 1.025), invoiceCurrencyId, nativeCurrencyId) ?? 0;
       if (requiredNative <= 0) throw new Error(`Не удалось оценить FX для торговой корзины ${first.id}`);
-      if (bankAccountBalance(world, nativeAccount.id) < requiredNative && importer) extendTradeFinance(world, importer, requiredNative - bankAccountBalance(world, nativeAccount.id), nativeCurrencyId);
-      const converted = bankAccountBalance(world, nativeAccount.id) >= requiredNative
+      const requiredWithTariff = requiredNative + tariffNativeMinor;
+      if (bankAccountBalance(world, nativeAccount.id) < requiredWithTariff && importer) extendTradeFinance(world, importer, requiredWithTariff - bankAccountBalance(world, nativeAccount.id), nativeCurrencyId);
+      const converted = bankAccountBalance(world, nativeAccount.id) >= requiredWithTariff
         ? executeFxConversion(world, first.importerId, nativeAccount.id, invoiceAccount.id, requiredNative)
         : { ok: false, message: "Недостаточно торгового финансирования" };
       if (!converted.ok) throw new Error(`FX settlement торговой корзины отклонён: ${converted.message}`);
       fxTradeId = converted.tradeId ?? null;
     }
-    if (bankAccountBalance(world, invoiceAccount.id) < invoiceRequiredMinor) throw new Error(`Неполное валютное покрытие торговой корзины ${first.id}`);
+    if (bankAccountBalance(world, invoiceAccount.id) < invoiceRequiredMinor || bankAccountBalance(world, nativeAccount.id) < tariffNativeMinor) throw new Error(`Неполное валютное покрытие торговой корзины ${first.id}`);
     const flowIds = flows.map((flow) => flow.id);
     const goodsPayment = settleFinancialPayment(world, first.importerId, first.exporterId, invoiceCurrencyId, goodsInvoiceMinor, "GOODS_CLEARING", `Международная торговая корзина ${first.importerCountryId} → ${first.exporterCountryId}`, flowIds);
     const logisticsPayment = logistics && logisticsInvoiceMinor > 0
       ? settleFinancialPayment(world, first.importerId, logistics.id, invoiceCurrencyId, logisticsInvoiceMinor, "LOGISTICS", `Логистическая корзина ${first.importerCountryId} → ${first.exporterCountryId}`, flowIds)
       : null;
-    if (!goodsPayment || (logistics && !logisticsPayment)) throw new Error(`Денежное settlement торговой корзины ${first.id} не завершено`);
+    const importerGovernment = world.governments.find((item) => item.countryId === first.importerCountryId);
+    if (importerGovernment && tariffNativeMinor > 0) ensureCurrencyAccount(world, importerGovernment.id, nativeCurrencyId);
+    const tariffPayment = importerGovernment && tariffNativeMinor > 0
+      ? settleFinancialPayment(world, first.importerId, importerGovernment.id, nativeCurrencyId, tariffNativeMinor, "TARIFF", `Импортный тариф: ${first.importerCountryId}`, flowIds)
+      : null;
+    if (!goodsPayment || (logistics && !logisticsPayment) || (tariffNativeMinor > 0 && !tariffPayment)) throw new Error(`Денежное settlement торговой корзины ${first.id} не завершено`);
     for (const flow of flows) {
       const valueUsdMinor = Math.round(flow.quantityMilliUnits * flow.unitPriceUsdMinor / 1_000);
-      flow.paymentTransactionIds = [goodsPayment, ...(logisticsPayment ? [logisticsPayment] : [])];
+      recordBilateralExternalFlow(world, flow.exporterCountryId, flow.importerCountryId, "goodsExportsMinor", "goodsImportsMinor", valueUsdMinor);
+      recordExternalFlow(world, flow.exporterCountryId, "bankFlowsMinor", -valueUsdMinor);
+      recordExternalFlow(world, flow.importerCountryId, "bankFlowsMinor", valueUsdMinor);
+      flow.paymentTransactionIds = [goodsPayment, ...(logisticsPayment ? [logisticsPayment] : []), ...(tariffPayment ? [tariffPayment] : [])];
       flow.logisticsPaymentTransactionId = logisticsPayment;
       flow.fxTradeId = fxTradeId;
       flow.status = "settled";
       if (exporter) exporter.lastExportRevenueUsdMinor += valueUsdMinor;
-      if (importer) importer.lastImportCostUsdMinor += valueUsdMinor + flow.transportCostUsdMinor + flow.tradeCostUsdMinor;
+      if (importer) importer.lastImportCostUsdMinor += valueUsdMinor + flow.transportCostUsdMinor + flow.tradeCostUsdMinor + flow.tariffUsdMinor;
       if (logistics) {
         logistics.revenueUsdMinor += flow.transportCostUsdMinor;
         logistics.profitUsdMinor += Math.round(flow.transportCostUsdMinor * 1_800 / 10_000);
@@ -474,18 +506,27 @@ function updateExternalAccounts(world: WorldState): void {
   for (const country of world.countries) {
     const bop = currentBopRecord(world, country.id);
     const flows = world.tradeFlows.filter((flow) => flow.elapsedMonth === world.clock.elapsedMonths && (flow.exporterCountryId === country.id || flow.importerCountryId === country.id));
-    bop.goodsExportsUsdMinor = flows.filter((flow) => flow.exporterCountryId === country.id).reduce((sum, flow) => sum + Math.round(flow.quantityMilliUnits * flow.unitPriceUsdMinor / 1_000), 0);
-    bop.goodsImportsUsdMinor = flows.filter((flow) => flow.importerCountryId === country.id).reduce((sum, flow) => sum + Math.round(flow.quantityMilliUnits * flow.unitPriceUsdMinor / 1_000), 0);
+    const external = world.countryEconomicAccounts.currentByCountry[country.id].external;
+    external.currentAccountMinor = external.goodsExportsMinor - external.goodsImportsMinor + external.servicesExportsMinor - external.servicesImportsMinor + external.primaryIncomeReceivedMinor - external.primaryIncomePaidMinor + external.transfersReceivedMinor - external.transfersPaidMinor;
+    external.financialAccountMinor = external.fdiLiabilitiesMinor - external.fdiAssetsMinor + external.portfolioLiabilitiesMinor - external.portfolioAssetsMinor + external.crossBorderLoanLiabilitiesMinor - external.crossBorderLoanAssetsMinor + external.bankFlowsMinor;
+    external.reconciliationGapMinor = external.currentAccountMinor + external.financialAccountMinor + external.reserveChangeMinor;
+    bop.goodsExportsUsdMinor = external.goodsExportsMinor;
+    bop.goodsImportsUsdMinor = external.goodsImportsMinor;
+    bop.servicesBalanceUsdMinor = external.servicesExportsMinor - external.servicesImportsMinor;
+    bop.primaryIncomeBalanceUsdMinor = external.primaryIncomeReceivedMinor - external.primaryIncomePaidMinor;
+    bop.secondaryIncomeBalanceUsdMinor = external.transfersReceivedMinor - external.transfersPaidMinor;
     bop.causeFlowIds = flows.map((flow) => flow.id);
-    bop.currentAccountUsdMinor = bop.goodsExportsUsdMinor - bop.goodsImportsUsdMinor + bop.servicesBalanceUsdMinor + bop.primaryIncomeBalanceUsdMinor + bop.secondaryIncomeBalanceUsdMinor;
+    bop.currentAccountUsdMinor = external.currentAccountMinor;
     // Every settled cross-border transaction has a second financial leg.  Goods
     // create trade credit/deposit claims; autonomous capital transactions draw
     // down or build those same cross-border settlement claims.  Recording that
     // leg explicitly keeps E&O diagnostic instead of using it as a plug.
-    bop.tradeFinanceNetInflowUsdMinor = bop.goodsImportsUsdMinor - bop.goodsExportsUsdMinor
-      - bop.directInvestmentNetInflowUsdMinor - bop.portfolioNetInflowUsdMinor
-      - bop.otherInvestmentNetInflowUsdMinor - bop.reserveChangeUsdMinor;
-    bop.financialAccountUsdMinor = bop.directInvestmentNetInflowUsdMinor + bop.portfolioNetInflowUsdMinor + bop.otherInvestmentNetInflowUsdMinor + bop.tradeFinanceNetInflowUsdMinor;
+    bop.directInvestmentNetInflowUsdMinor = external.fdiLiabilitiesMinor - external.fdiAssetsMinor;
+    bop.portfolioNetInflowUsdMinor = external.portfolioLiabilitiesMinor - external.portfolioAssetsMinor;
+    bop.otherInvestmentNetInflowUsdMinor = external.crossBorderLoanLiabilitiesMinor - external.crossBorderLoanAssetsMinor;
+    bop.tradeFinanceNetInflowUsdMinor = external.bankFlowsMinor;
+    bop.reserveChangeUsdMinor = external.reserveChangeMinor;
+    bop.financialAccountUsdMinor = external.financialAccountMinor;
     const preResidual = bop.currentAccountUsdMinor + bop.capitalAccountUsdMinor + bop.financialAccountUsdMinor + bop.reserveChangeUsdMinor;
     const residualLimit = Math.max(10_000, Math.round(Math.max(Math.abs(bop.currentAccountUsdMinor), bop.goodsExportsUsdMinor + bop.goodsImportsUsdMinor) * 100 / 10_000));
     bop.errorsAndOmissionsUsdMinor = clamp(-preResidual, -residualLimit, residualLimit);
@@ -496,9 +537,11 @@ function updateExternalAccounts(world: WorldState): void {
     const fdiLiabilities = world.foreignDirectInvestments.filter((item) => item.destinationCountryId === country.id && item.status === "active").reduce((sum, item) => sum + (convertMinor(world, item.investedAmountMinor, item.currencyId, "USD") ?? 0), 0);
     const portfolioAssets = world.internationalPortfolioPositions.filter((item) => item.ownerCountryId === country.id).reduce((sum, item) => sum + (convertMinor(world, item.acquisitionValueMinor, item.currencyId, "USD") ?? 0), 0);
     const portfolioLiabilities = world.internationalPortfolioPositions.filter((item) => item.issuerCountryId === country.id).reduce((sum, item) => sum + (convertMinor(world, item.acquisitionValueMinor, item.currencyId, "USD") ?? 0), 0);
-    const otherAssets = world.crossBorderLoans.filter((loan) => loan.lenderCountryId === country.id && loan.status === "active").reduce((sum, loan) => sum + loan.reportingValueUsdMinor, 0);
-    const otherLiabilities = world.crossBorderLoans.filter((loan) => loan.borrowerCountryId === country.id && loan.status === "active").reduce((sum, loan) => sum + loan.reportingValueUsdMinor, 0) + (world.tradeSectors.find((item) => item.countryId === country.id)?.tradeFinanceLiabilityUsdMinor ?? 0);
-    const point: InternationalInvestmentPosition = { countryId: country.id, elapsedMonth: world.clock.elapsedMonths, directInvestmentAssetsUsdMinor: fdiAssets, directInvestmentLiabilitiesUsdMinor: fdiLiabilities, portfolioAssetsUsdMinor: portfolioAssets, portfolioLiabilitiesUsdMinor: portfolioLiabilities, otherInvestmentAssetsUsdMinor: otherAssets, otherInvestmentLiabilitiesUsdMinor: otherLiabilities, reserveAssetsUsdMinor: reserve?.totalUsdMinor ?? 0, netInternationalInvestmentPositionUsdMinor: fdiAssets + portfolioAssets + otherAssets + (reserve?.totalUsdMinor ?? 0) - fdiLiabilities - portfolioLiabilities - otherLiabilities, publicExternalDebtUsdMinor: world.crossBorderLoans.filter((loan) => loan.borrowerCountryId === country.id && loan.borrowerId.startsWith("government-") && loan.status === "active").reduce((sum, loan) => sum + loan.reportingValueUsdMinor, 0), privateExternalDebtUsdMinor: otherLiabilities, shortTermExternalDebtUsdMinor: world.crossBorderLoans.filter((loan) => loan.borrowerCountryId === country.id && loan.maturityMonth - world.clock.elapsedMonths <= 12 && loan.status === "active").reduce((sum, loan) => sum + loan.reportingValueUsdMinor, 0) };
+    const liveLoan = (loan: CrossBorderLoanExposure) => ["active", "arrears", "restructured"].includes(loan.status);
+    const otherAssets = world.crossBorderLoans.filter((loan) => loan.lenderCountryId === country.id && liveLoan(loan)).reduce((sum, loan) => sum + loan.reportingValueUsdMinor, 0);
+    // Domestic working-capital credit is deliberately excluded from IIP.
+    const otherLiabilities = world.crossBorderLoans.filter((loan) => loan.borrowerCountryId === country.id && liveLoan(loan)).reduce((sum, loan) => sum + loan.reportingValueUsdMinor, 0);
+    const point: InternationalInvestmentPosition = { countryId: country.id, elapsedMonth: world.clock.elapsedMonths, directInvestmentAssetsUsdMinor: fdiAssets, directInvestmentLiabilitiesUsdMinor: fdiLiabilities, portfolioAssetsUsdMinor: portfolioAssets, portfolioLiabilitiesUsdMinor: portfolioLiabilities, otherInvestmentAssetsUsdMinor: otherAssets, otherInvestmentLiabilitiesUsdMinor: otherLiabilities, reserveAssetsUsdMinor: reserve?.totalUsdMinor ?? 0, netInternationalInvestmentPositionUsdMinor: fdiAssets + portfolioAssets + otherAssets + (reserve?.totalUsdMinor ?? 0) - fdiLiabilities - portfolioLiabilities - otherLiabilities, publicExternalDebtUsdMinor: world.crossBorderLoans.filter((loan) => loan.borrowerCountryId === country.id && loan.borrowerType === "government" && liveLoan(loan)).reduce((sum, loan) => sum + loan.reportingValueUsdMinor, 0), privateExternalDebtUsdMinor: world.crossBorderLoans.filter((loan) => loan.borrowerCountryId === country.id && loan.borrowerType !== "government" && liveLoan(loan)).reduce((sum, loan) => sum + loan.reportingValueUsdMinor, 0), shortTermExternalDebtUsdMinor: world.crossBorderLoans.filter((loan) => loan.borrowerCountryId === country.id && loan.maturityMonth - world.clock.elapsedMonths <= 12 && liveLoan(loan)).reduce((sum, loan) => sum + loan.reportingValueUsdMinor, 0) };
     world.internationalInvestmentPositions.push(point);
     const tradePressure = bop.goodsExportsUsdMinor - bop.goodsImportsUsdMinor;
     // Settlement/trade finance is the accounting counterpart of trade and
@@ -560,6 +603,7 @@ export function runGlobalEconomyMonth(world: WorldState): void {
   clearMultilateralCommodityMarkets(world);
   updateSupplyChains(world);
   updateEnergyBalances(world);
+  serviceCrossBorderLoans(world);
   runAutonomousInternationalCapital(world);
   repriceCrossBorderLoans(world);
   updateExternalAccounts(world);
@@ -595,16 +639,27 @@ function runAutonomousInternationalCapital(world: WorldState): void {
     const existing = security && world.internationalPortfolioPositions.filter((item) => item.ownerId === fund.id && item.instrumentId === security.id).length;
     if (security && listing && cash > listing.lastPriceCents * 20 && existing < 3) purchaseForeignEquity(world, fund.id, security.id, Math.max(1, Math.min(100, Math.floor(cash * 40 / 10_000 / Math.max(1, listing.lastPriceCents)))));
   }
-  const highRateCandidates = [...countryScores].sort((a, b) => b.rate - a.rate || b.score - a.score);
-  const lowRateCandidates = [...countryScores].sort((a, b) => a.rate - b.rate || a.score - b.score);
-  const highRate = highRateCandidates[world.clock.elapsedMonths / 3 % Math.min(4, highRateCandidates.length)];
-  const lowRate = lowRateCandidates[(world.clock.elapsedMonths / 3 + 1) % Math.min(4, lowRateCandidates.length)];
-  if (highRate && lowRate && highRate.country.id !== lowRate.country.id && highRate.rate - lowRate.rate >= 150) {
-    const bank = world.banks.find((item) => item.countryId === lowRate.country.id);
-    const borrower = world.tradeSectors.find((item) => item.countryId === highRate.country.id);
-    const amount = Math.max(1, Math.round((world.countryScaleReconciliations.find((item) => item.countryId === highRate.country.id)?.targetMonthlyNominalGdpMinor ?? 1) * 8 / 10_000));
-    const activePairLoans = world.crossBorderLoans.filter((item) => item.lenderCountryId === lowRate.country.id && item.borrowerCountryId === highRate.country.id && item.status === "active").length;
-    if (bank && borrower && activePairLoans < 2) issueCrossBorderLoan(world, bank.id, borrower.id, amount, 36);
+  const opportunities = countryScores.flatMap((borrower) => countryScores.filter((lender) => lender.country.id !== borrower.country.id).map((lender) => {
+    const borrowerTrade = world.tradeSectors.find((item) => item.countryId === borrower.country.id);
+    const demand = Math.max(0, (borrowerTrade?.importBudgetUsdMinor ?? 0) - (borrowerTrade?.lastExportRevenueUsdMinor ?? 0));
+    const risk = Math.max(0, 10_000 - borrower.profile.productivityIndexBps) + Math.max(0, borrower.profile.governmentDebtToGdpBps - 6_000) / 4;
+    return { borrower, lender, score: borrower.rate - lender.rate + demand / 10_000_000 - risk / 8 };
+  })).filter((item) => item.score >= 100).sort((a, b) => b.score - a.score || `${a.lender.country.id}:${a.borrower.country.id}`.localeCompare(`${b.lender.country.id}:${b.borrower.country.id}`));
+  for (const opportunity of opportunities.slice(0, Math.max(2, Math.ceil(world.countries.length / 4)))) {
+    const lenderBanks = world.banks.filter((item) => item.countryId === opportunity.lender.country.id);
+    const bank = lenderBanks[(world.clock.elapsedMonths / 3) % Math.max(1, lenderBanks.length)];
+    const candidates = [
+      ...world.banks.filter((item) => item.countryId === opportunity.borrower.country.id),
+      ...world.companies.filter((item) => item.active && item.headquartersCountryId === opportunity.borrower.country.id),
+      ...world.tradeSectors.filter((item) => item.countryId === opportunity.borrower.country.id),
+    ];
+    const borrower = candidates[(world.clock.elapsedMonths / 3 + opportunities.indexOf(opportunity)) % Math.max(1, candidates.length)];
+    const livePair = world.crossBorderLoans.filter((item) => item.lenderCountryId === opportunity.lender.country.id && item.borrowerCountryId === opportunity.borrower.country.id && ["active", "arrears", "restructured"].includes(item.status));
+    const exposureUsd = livePair.reduce((sum, item) => sum + item.reportingValueUsdMinor, 0);
+    const countryGdpUsd = REAL_COUNTRY_PACKS.find((item) => item.countryId === opportunity.borrower.country.id)?.nominalGdpUsd ?? 1;
+    const prudentialLimitUsdMinor = Math.round(countryGdpUsd * 100 * 150 / 10_000);
+    const amount = Math.max(1, Math.round((world.countryScaleReconciliations.find((item) => item.countryId === opportunity.borrower.country.id)?.targetMonthlyNominalGdpMinor ?? 1) * 5 / 10_000));
+    if (bank && borrower && exposureUsd < prudentialLimitUsdMinor) issueCrossBorderLoan(world, bank.id, borrower.id, amount, 24 + (world.clock.elapsedMonths % 24));
   }
   for (const regime of world.fxRegimes.filter((item) => item.regime !== "FLOATING")) {
     const pressure = [...world.fxPressureHistory].reverse().find((item) => item.countryId === regime.countryId)?.netPressureUsdMinor ?? 0;
@@ -623,6 +678,7 @@ export function createForeignDirectInvestment(world: WorldState, parentCompanyId
   const parent = world.companies.find((company) => company.id === parentCompanyId && company.active);
   const target = world.companies.find((company) => company.headquartersCountryId === destinationCountryId && company.active);
   if (!parent || !target || parent.headquartersCountryId === destinationCountryId || amountMinor <= 0) return null;
+  if (!evaluateEconomicPolicyAccess(world, { sourceCountryId: parent.headquartersCountryId, destinationCountryId, kind: "investment" }).allowed) return null;
   const targetCurrency = countryCurrency(world, destinationCountryId);
   const sourceCurrency = countryCurrency(world, parent.headquartersCountryId);
   const source = ensureCurrencyAccount(world, parent.id, sourceCurrency);
@@ -651,8 +707,10 @@ export function createForeignDirectInvestment(world: WorldState, parentCompanyId
   if (!parent.subsidiaryIds.includes(target.id)) parent.subsidiaryIds.push(target.id);
   const fdi: ForeignDirectInvestment = { id: `fdi-${String(world.nextFdiId++).padStart(7, "0")}`, investorCountryId: parent.headquartersCountryId, destinationCountryId, parentCompanyId: parent.id, subsidiaryCompanyId: target.id, currencyId: targetCurrency, investedAmountMinor: amountMinor, votingShareBps: 5_100, openedAtMonth: world.clock.elapsedMonths, transactionIds: [tx, investmentTx, ...(fxTradeId ? [fxTradeId] : [])], status: "active" };
   world.foreignDirectInvestments.push(fdi);
-  currentBopRecord(world, destinationCountryId).directInvestmentNetInflowUsdMinor += convertMinor(world, amountMinor, targetCurrency, "USD") ?? 0;
-  currentBopRecord(world, parent.headquartersCountryId).directInvestmentNetInflowUsdMinor -= convertMinor(world, amountMinor, targetCurrency, "USD") ?? 0;
+  const fdiUsdMinor = convertMinor(world, amountMinor, targetCurrency, "USD") ?? 0;
+  recordBilateralExternalFlow(world, parent.headquartersCountryId, destinationCountryId, "fdiAssetsMinor", "fdiLiabilitiesMinor", fdiUsdMinor);
+  recordExternalFlow(world, parent.headquartersCountryId, "bankFlowsMinor", fdiUsdMinor);
+  recordExternalFlow(world, destinationCountryId, "bankFlowsMinor", -fdiUsdMinor);
   return fdi;
 }
 
@@ -663,6 +721,7 @@ export function purchaseForeignEquity(world: WorldState, investorId: string, sec
   const seller = security && world.equityHoldings.find((holding) => holding.securityId === securityId && holding.shares >= shares);
   const listing = world.listings.find((item) => item.securityId === securityId);
   if (!investorCountryId || !security || !issuer || !seller || issuer.headquartersCountryId === investorCountryId || shares <= 0) return null;
+  if (!evaluateEconomicPolicyAccess(world, { sourceCountryId: investorCountryId, destinationCountryId: issuer.headquartersCountryId, kind: "investment" }).allowed) return null;
   const price = listing?.lastPriceCents ?? Math.max(1, Math.round(seller.costBasisCents / Math.max(1, seller.shares)));
   const value = price * shares;
   const homeCurrency = countryCurrency(world, investorCountryId);
@@ -679,8 +738,9 @@ export function purchaseForeignEquity(world: WorldState, investorId: string, sec
   const position: InternationalPortfolioPosition = { id: `international-position-${String(world.nextInternationalPositionId++).padStart(8, "0")}`, ownerId: investorId, ownerCountryId: investorCountryId, issuerCountryId: issuer.headquartersCountryId, instrumentType: "equity", instrumentId: securityId, quantity: shares, acquisitionValueMinor: value, currencyId: security.currencyId, openedAtMonth: world.clock.elapsedMonths };
   world.internationalPortfolioPositions.push(position);
   const usd = convertMinor(world, value, security.currencyId, "USD") ?? 0;
-  currentBopRecord(world, issuer.headquartersCountryId).portfolioNetInflowUsdMinor += usd;
-  currentBopRecord(world, investorCountryId).portfolioNetInflowUsdMinor -= usd;
+  recordBilateralExternalFlow(world, investorCountryId, issuer.headquartersCountryId, "portfolioAssetsMinor", "portfolioLiabilitiesMinor", usd);
+  recordExternalFlow(world, investorCountryId, "bankFlowsMinor", usd);
+  recordExternalFlow(world, issuer.headquartersCountryId, "bankFlowsMinor", -usd);
   return position;
 }
 
@@ -688,6 +748,7 @@ export function issueCrossBorderLoan(world: WorldState, lenderBankId: string, bo
   const bank = world.banks.find((item) => item.id === lenderBankId);
   const borrowerCountryId = countryOfEntity(world, borrowerId) ?? world.governments.find((item) => item.id === borrowerId)?.countryId ?? null;
   if (!bank || !borrowerCountryId || borrowerCountryId === bank.countryId || principalMinor <= 0) return null;
+  if (!evaluateEconomicPolicyAccess(world, { sourceCountryId: bank.countryId, destinationCountryId: borrowerCountryId, kind: "finance" }).allowed) return null;
   const lender = ensureCurrencyAccount(world, bank.id, bank.baseCurrency);
   const borrower = ensureCurrencyAccount(world, borrowerId, bank.baseCurrency);
   if (!lender || !borrower || bankAccountBalance(world, lender.id) < principalMinor) return null;
@@ -703,17 +764,84 @@ export function issueCrossBorderLoan(world: WorldState, lenderBankId: string, bo
     { accountId: loanLiabilityId, side: "credit", amountCents: principalMinor },
   ], [tx]);
   const reportingValueUsdMinor = convertMinor(world, principalMinor, bank.baseCurrency, "USD") ?? 0;
-  const exposure: CrossBorderLoanExposure = { id: `cross-border-loan-${String(exposureNumber).padStart(8, "0")}`, lenderId: bank.id, lenderCountryId: bank.countryId, borrowerId, borrowerCountryId, currencyId: bank.baseCurrency, originalPrincipalMinor: principalMinor, remainingPrincipalMinor: principalMinor, annualRateBps: bank.baseSpreadBps + 450, maturityMonth: world.clock.elapsedMonths + termMonths, reportingValueUsdMinor, borrowerCurrencyBurdenMinor: convertMinor(world, principalMinor, bank.baseCurrency, countryCurrency(world, borrowerCountryId)) ?? 0, transactionIds: [tx, recognitionTx], status: "active" };
+  const borrowerType = world.banks.some((item) => item.id === borrowerId) ? "bank" : world.governments.some((item) => item.id === borrowerId) ? "government" : world.tradeSectors.some((item) => item.id === borrowerId) ? "trade-sector" : "firm";
+  const exposure: CrossBorderLoanExposure = { id: `cross-border-loan-${String(exposureNumber).padStart(8, "0")}`, lenderId: bank.id, lenderCountryId: bank.countryId, borrowerId, borrowerCountryId, currencyId: bank.baseCurrency, originalPrincipalMinor: principalMinor, remainingPrincipalMinor: principalMinor, annualRateBps: bank.baseSpreadBps + 450, maturityMonth: world.clock.elapsedMonths + termMonths, reportingValueUsdMinor, borrowerCurrencyBurdenMinor: convertMinor(world, principalMinor, bank.baseCurrency, countryCurrency(world, borrowerCountryId)) ?? 0, transactionIds: [tx, recognitionTx], openedAtMonth: world.clock.elapsedMonths, lastServicedMonth: world.clock.elapsedMonths, principalRepaidMinor: 0, interestPaidMinor: 0, accruedInterestMinor: 0, arrearsMinor: 0, missedPayments: 0, rolloverCount: 0, borrowerType, status: "active" };
   world.crossBorderLoans.push(exposure);
-  currentBopRecord(world, borrowerCountryId).otherInvestmentNetInflowUsdMinor += reportingValueUsdMinor;
-  currentBopRecord(world, bank.countryId).otherInvestmentNetInflowUsdMinor -= reportingValueUsdMinor;
+  recordBilateralExternalFlow(world, bank.countryId, borrowerCountryId, "crossBorderLoanAssetsMinor", "crossBorderLoanLiabilitiesMinor", reportingValueUsdMinor);
+  recordExternalFlow(world, bank.countryId, "bankFlowsMinor", reportingValueUsdMinor);
+  recordExternalFlow(world, borrowerCountryId, "bankFlowsMinor", -reportingValueUsdMinor);
   return exposure;
 }
 
 export function repriceCrossBorderLoans(world: WorldState): void {
-  for (const loan of world.crossBorderLoans.filter((item) => item.status === "active")) {
+  for (const loan of world.crossBorderLoans.filter((item) => item.status === "active" || item.status === "arrears" || item.status === "restructured")) {
     loan.reportingValueUsdMinor = convertMinor(world, loan.remainingPrincipalMinor, loan.currencyId, "USD") ?? loan.reportingValueUsdMinor;
     loan.borrowerCurrencyBurdenMinor = convertMinor(world, loan.remainingPrincipalMinor, loan.currencyId, countryCurrency(world, loan.borrowerCountryId)) ?? loan.borrowerCurrencyBurdenMinor;
+  }
+}
+
+function reduceCrossBorderPrincipal(world: WorldState, loan: CrossBorderLoanExposure, amountMinor: number, cashTx: string): string {
+  const number = Number(loan.id.split("-").at(-1));
+  return postTransaction(world, "LOAN_PRINCIPAL", `Погашение требования ${loan.id}`, [
+    { accountId: `cross-border-loan-liability:${loan.borrowerId}:${number}`, side: "debit", amountCents: amountMinor },
+    { accountId: `cross-border-loan-asset:${loan.lenderId}:${number}`, side: "credit", amountCents: amountMinor },
+  ], [cashTx]);
+}
+
+export function serviceCrossBorderLoans(world: WorldState): void {
+  for (const loan of world.crossBorderLoans.filter((item) => ["active", "arrears", "restructured"].includes(item.status))) {
+    if (loan.lastServicedMonth >= world.clock.elapsedMonths) continue;
+    const interest = Math.max(1, Math.round(loan.remainingPrincipalMinor * loan.annualRateBps / 10_000 / 12)) + loan.accruedInterestMinor;
+    const borrowerCash = ensureCurrencyAccount(world, loan.borrowerId, loan.currencyId);
+    const lenderCash = ensureCurrencyAccount(world, loan.lenderId, loan.currencyId);
+    if (borrowerCash && lenderCash && bankAccountBalance(world, borrowerCash.id) >= interest) {
+      const tx = settleFinancialPayment(world, loan.borrowerId, loan.lenderId, loan.currencyId, interest, "LOAN_INTEREST", `Проценты по ${loan.id}`, [loan.id]);
+      if (tx) {
+        loan.transactionIds.push(tx); loan.interestPaidMinor += interest; loan.accruedInterestMinor = 0;
+        const usd = convertMinor(world, interest, loan.currencyId, "USD") ?? 0;
+        recordBilateralExternalFlow(world, loan.lenderCountryId, loan.borrowerCountryId, "primaryIncomeReceivedMinor", "primaryIncomePaidMinor", usd);
+        recordExternalFlow(world, loan.lenderCountryId, "bankFlowsMinor", -usd);
+        recordExternalFlow(world, loan.borrowerCountryId, "bankFlowsMinor", usd);
+      }
+    } else {
+      loan.accruedInterestMinor = interest; loan.arrearsMinor += interest; loan.missedPayments += 1; loan.status = "arrears";
+    }
+    loan.lastServicedMonth = world.clock.elapsedMonths;
+    if (world.clock.elapsedMonths < loan.maturityMonth) continue;
+    const available = borrowerCash ? bankAccountBalance(world, borrowerCash.id) : 0;
+    if (lenderCash && borrowerCash && available >= loan.remainingPrincipalMinor + loan.accruedInterestMinor) {
+      const amount = loan.remainingPrincipalMinor;
+      const cashTx = transferBankAccountBalance(world, borrowerCash.id, lenderCash.id, amount, "LOAN_PRINCIPAL", `Principal ${loan.id}`, [loan.id]);
+      if (cashTx) {
+        loan.transactionIds.push(cashTx, reduceCrossBorderPrincipal(world, loan, amount, cashTx)); loan.principalRepaidMinor += amount;
+        loan.remainingPrincipalMinor = 0; loan.reportingValueUsdMinor = 0; loan.borrowerCurrencyBurdenMinor = 0; loan.status = "repaid";
+        const usd = convertMinor(world, amount, loan.currencyId, "USD") ?? 0;
+        recordExternalFlow(world, loan.borrowerCountryId, "crossBorderLoanLiabilitiesMinor", -usd);
+        recordExternalFlow(world, loan.lenderCountryId, "crossBorderLoanAssetsMinor", -usd);
+        recordExternalFlow(world, loan.borrowerCountryId, "bankFlowsMinor", usd);
+        recordExternalFlow(world, loan.lenderCountryId, "bankFlowsMinor", -usd);
+      }
+      continue;
+    }
+    const borrowerCompany = world.companies.find((item) => item.id === loan.borrowerId);
+    const viable = !borrowerCompany || (borrowerCompany.active && borrowerCompany.corporateStatus !== "bankrupt");
+    if (loan.missedPayments <= 1 && viable && loan.rolloverCount < 2) {
+      loan.status = "restructured"; loan.rolloverCount += 1; loan.maturityMonth += 12; loan.annualRateBps += 100;
+    } else if (loan.missedPayments >= 3 || !viable) {
+      const number = Number(loan.id.split("-").at(-1));
+      const loss = loan.remainingPrincipalMinor;
+      const lenderLossId = `${loan.lenderId}:expense:cross-border-credit-loss:${loan.currencyId}`;
+      const borrowerGainId = `${loan.borrowerId}:income:cross-border-default:${loan.currencyId}`;
+      ensureAccount(world.ledger, lenderLossId, loan.lenderId, "Убыток по иностранному кредиту", "expense", loan.currencyId);
+      ensureAccount(world.ledger, borrowerGainId, loan.borrowerId, "Доход от дефолта", "income", loan.currencyId);
+      loan.transactionIds.push(postTransaction(world, "LOAN_DEFAULT", `Дефолт ${loan.id}`, [
+        { accountId: lenderLossId, side: "debit", amountCents: loss },
+        { accountId: `cross-border-loan-asset:${loan.lenderId}:${number}`, side: "credit", amountCents: loss },
+        { accountId: `cross-border-loan-liability:${loan.borrowerId}:${number}`, side: "debit", amountCents: loss },
+        { accountId: borrowerGainId, side: "credit", amountCents: loss },
+      ], [loan.id]));
+      loan.remainingPrincipalMinor = 0; loan.reportingValueUsdMinor = 0; loan.borrowerCurrencyBurdenMinor = 0; loan.status = "defaulted";
+    } else loan.status = "arrears";
   }
 }
 
@@ -727,8 +855,8 @@ export function interveneFx(world: WorldState, countryId: string, sellCurrencyId
   if (!result.ok) return { ok: false };
   const usd = convertMinor(world, amountMinor, sellCurrencyId, "USD") ?? 0;
   portfolio.totalUsdMinor = Math.max(0, portfolio.totalUsdMinor - result.quote!.feeMinor);
-  const bop = currentBopRecord(world, countryId);
-  bop.reserveChangeUsdMinor -= usd;
+  recordExternalFlow(world, countryId, "reserveChangeMinor", -usd);
+  recordExternalFlow(world, countryId, "bankFlowsMinor", usd);
   const regime = world.fxRegimes.find((item) => item.countryId === countryId);
   if (regime) { regime.defenseCapacityUsdMinor = portfolio.totalUsdMinor; regime.status = portfolio.totalUsdMinor < 10_000_000 ? "failed" : "under-pressure"; }
   return { ok: true, tradeId: result.tradeId };

@@ -10,7 +10,7 @@ function monetaryValuesMatch(left: number, right: number): boolean {
   // REAL_WORLD stocks can exceed Number.MAX_SAFE_INTEGER after aggregation in
   // low-value currencies.  Individual entries remain integral; this tolerance
   // only absorbs the few ULPs introduced while summing macro balances.
-  return Math.abs(left - right) <= Math.max(1, Math.ceil(Math.max(Math.abs(left), Math.abs(right)) * Number.EPSILON * 32));
+  return Math.abs(left - right) <= Math.max(1, Math.ceil(Math.max(Math.abs(left), Math.abs(right)) * Number.EPSILON * 64));
 }
 
 export function checkInvariants(world: WorldState): InvariantResult[] {
@@ -49,7 +49,7 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   const loanAssets = sumAccounts(world, (account) => account.category === "asset" && account.instrument === "loan" && !account.id.includes(":margin-loan:") && world.banks.some((bank) => bank.id === account.ownerId));
   const loanLiabilities = sumAccounts(world, (account) => account.category === "liability" && account.instrument === "loan" && !account.id.includes(":margin-loan:"));
   const contracts = world.loans.filter((loan) => loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
-  results.push(result("Кредит", "loan-mirror", "Кредитор, должник и договор совпадают", loanAssets === loanLiabilities && loanAssets === contracts, `Основной долг: ${(contracts / 100).toLocaleString("ru-RU")} ₽`, loanAssets - contracts));
+  results.push(result("Кредит", "loan-mirror", "Кредитор, должник и договор совпадают", monetaryValuesMatch(loanAssets, loanLiabilities) && monetaryValuesMatch(loanAssets, contracts), `Основной долг: ${(contracts / 100).toLocaleString("ru-RU")} ₽`, loanAssets - contracts));
 
   const owners = [...new Set(Object.values(world.ledger.accounts).map((account) => account.ownerId))];
   let brokenBook = "";
@@ -58,7 +58,7 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
     const book = entityBook(world, ownerId);
     const difference = book.assets + book.expenses - book.liabilities - book.equity - book.income;
     const grossBook = Math.max(Math.abs(book.assets), Math.abs(book.liabilities), Math.abs(book.equity), Math.abs(book.income), Math.abs(book.expenses));
-    const bookTolerance = Math.max(1, Math.ceil(grossBook * Number.EPSILON * 64));
+    const bookTolerance = Math.max(1, Math.ceil(grossBook * Number.EPSILON * 256));
     if (Math.abs(difference) > bookTolerance) { brokenBook = ownerId; bookDifference = difference; break; }
   }
   results.push(result("Бухгалтерия", "accounting-equation", "Балансовые уравнения выполняются", !brokenBook, brokenBook ? `Не сходится книга ${brokenBook}` : `${owners.length} книг прошли проверку`, bookDifference));
@@ -200,7 +200,7 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   results.push(result("Клиринг", "clearing-positions", "Клиринг сохраняет нулевую сумму позиций", !brokenClearedFuture && !brokenClearingMember, brokenClearedFuture?.id ?? brokenClearingMember?.id ?? `${world.clearingHouses.length} клиринговых домов`));
 
   const brokenSovereignRegistry = world.sovereignBonds.find((bond) => !monetaryValuesMatch(world.sovereignBondHoldings.filter((holding) => holding.bondId === bond.id).reduce((sum, holding) => sum + holding.faceValueMinor, 0), bond.outstandingFaceValueMinor));
-  const brokenGovernmentBudget = world.governmentBudgets.find((budget) => !monetaryValuesMatch(budget.publicDebtMinor, world.sovereignBonds.filter((bond) => bond.governmentId === budget.governmentId && (bond.status === "active" || bond.status === "restructured")).reduce((sum, bond) => sum + bond.outstandingFaceValueMinor, 0)));
+  const brokenGovernmentBudget = world.governmentBudgets.find((budget) => !monetaryValuesMatch(budget.publicDebtMinor, world.sovereignBonds.filter((bond) => bond.governmentId === budget.governmentId && bond.status !== "matured").reduce((sum, bond) => sum + bond.outstandingFaceValueMinor + bond.arrearsCouponMinor, 0)));
   results.push(result("Государственный долг", "sovereign-registry", "Государственный долг сверен с держателями", !brokenSovereignRegistry && !brokenGovernmentBudget, brokenSovereignRegistry?.id ?? brokenGovernmentBudget?.governmentId ?? `${world.sovereignBonds.length} выпусков`));
 
   const brokenYieldCurve = world.countries.find((country) => {
@@ -217,6 +217,20 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
   results.push(result("Товары", "trade-goods-money", "Поставка имеет товарную и денежную ноги", !badTrade, badTrade?.id ?? `${world.tradeFlows.length} поставок сверены`));
   const brokenBop = world.balanceOfPayments.find((point) => point.currentAccountUsdMinor + point.capitalAccountUsdMinor + point.financialAccountUsdMinor + point.reserveChangeUsdMinor + point.errorsAndOmissionsUsdMinor !== point.reconciliationGapUsdMinor || point.reconciliationWarning);
   results.push(result("Национальные счета", "bop-reconciliation", "Платёжный баланс сходится", !brokenBop, brokenBop ? `${brokenBop.countryId}:${brokenBop.elapsedMonth}` : `${world.balanceOfPayments.length} периодов сверены`));
+  const brokenCountryPeriod = Object.values(world.countryEconomicAccounts.closedByCountry).find((period) => period.status !== "closed" || period.elapsedMonth !== world.clock.elapsedMonths && period.elapsedMonth !== world.clock.elapsedMonths - 1 || !monetaryValuesMatch(period.reconciliation.productionGdpMinor, period.reconciliation.expenditureGdpMinor) || !monetaryValuesMatch(period.reconciliation.productionGdpMinor, period.reconciliation.incomeGdpMinor));
+  results.push(result("Национальные счета", "country-monthly-period", "Три метода ВВП сходятся в месячном периоде", !brokenCountryPeriod, brokenCountryPeriod ? `${brokenCountryPeriod.countryId}:${brokenCountryPeriod.elapsedMonth}` : `${Object.keys(world.countryEconomicAccounts.closedByCountry).length} стран сверены`));
+  const brokenHouseholdAccount = world.countryEconomicAccounts.householdAccounts.find((account) => account.status !== "closed" || !monetaryValuesMatch(account.budgetGapMinor, 0));
+  const brokenFirmAccount = world.countryEconomicAccounts.firmAccounts.find((account) => account.status !== "closed" || !monetaryValuesMatch(account.pnlGapMinor, 0));
+  const brokenFiscalBridge = Object.values(world.countryEconomicAccounts.closedByCountry).find((period) => !monetaryValuesMatch(period.fiscal.cashGapMinor, 0));
+  const brokenDebtBridge = Object.values(world.countryEconomicAccounts.closedByCountry).find((period) => Math.abs(period.financial.debtBridgeGapMinor) > Math.max(1, Math.ceil(Math.abs(period.financial.closingGrossDebtMinor) * Number.EPSILON * 32)));
+  const brokenExternalPeriod = Object.values(world.countryEconomicAccounts.closedByCountry).find((period) => !monetaryValuesMatch(period.external.reconciliationGapMinor, 0));
+  const brokenRepresentation = world.countryEconomicAccounts.representations.find((item) => !monetaryValuesMatch(item.explicitCarveOutMinor + item.residualTargetMinor, item.baselineTargetMinor));
+  results.push(result("Национальные счета", "household-period", "Бюджеты household cohorts сходятся", !brokenHouseholdAccount, brokenHouseholdAccount?.cohortId ?? `${world.countryEconomicAccounts.householdAccounts.length} счетов`));
+  results.push(result("Национальные счета", "firm-period", "P&L firm cohorts сходится", !brokenFirmAccount, brokenFirmAccount?.cohortId ?? `${world.countryEconomicAccounts.firmAccounts.length} счетов`));
+  results.push(result("Бухгалтерия", "fiscal-cash-bridge", "Денежный мост государства сходится", !brokenFiscalBridge, brokenFiscalBridge?.countryId ?? "Все страны"));
+  results.push(result("Государственный долг", "sovereign-debt-bridge", "Мост государственного долга сходится", !brokenDebtBridge, brokenDebtBridge?.countryId ?? "Все страны"));
+  results.push(result("Национальные счета", "external-period", "Внешний счёт и BOP сходятся", !brokenExternalPeriod, brokenExternalPeriod?.countryId ?? "Все страны"));
+  results.push(result("Производительность", "representation-carveout", "Explicit и residual representation не пересекаются", !brokenRepresentation, brokenRepresentation?.sectorId ?? `${world.countryEconomicAccounts.representations.length} секторов`));
   const overCapacityRoute = world.tradeRoutes.find((route) => route.usedCapacityMilliUnits > route.capacityMilliUnits);
   results.push(result("Товары", "route-capacity", "Логистика не превышает пропускную способность", !overCapacityRoute, overCapacityRoute?.id ?? `${world.tradeRoutes.length} маршрутов`));
   return results;

@@ -1,33 +1,5 @@
-import { balanceOf, accountIds } from "../core/ledger.ts";
-import type { CurrentAccountingPeriod, MetricPoint, WorldState } from "../domain/model.ts";
-
-export function emptyAccountingPeriod(world: Pick<WorldState, "goods">): CurrentAccountingPeriod {
-  return {
-    openingInventoryValueCents: 0,
-    householdConsumptionCents: 0,
-    governmentConsumptionCents: 0,
-    capitalFormationCents: 0,
-    householdConsumptionByGoodCents: Object.fromEntries(world.goods.map((good) => [good.id, 0])),
-    governmentConsumptionByGoodCents: Object.fromEntries(world.goods.map((good) => [good.id, 0])),
-  };
-}
-
-export function totalInventoryBookValue(world: WorldState): number {
-  return world.companies.reduce((sum, company) => {
-    const finished = balanceOf(world, accountIds.finishedInventory(company.id));
-    const inputs = world.goods.reduce(
-      (inputSum, good) => inputSum + balanceOf(world, accountIds.inputInventory(company.id, good.id)),
-      0,
-    );
-    return sum + finished + inputs;
-  }, 0);
-}
-
-export function beginNationalAccountingMonth(world: WorldState): void {
-  const current = emptyAccountingPeriod(world);
-  current.openingInventoryValueCents = totalInventoryBookValue(world);
-  world.nationalAccounts.current = current;
-}
+import { convertMinor } from "../finance/currencies.ts";
+import type { MetricPoint, WorldState } from "../domain/model.ts";
 
 export interface NationalAccountsResult {
   valueAddedCents: number;
@@ -39,37 +11,20 @@ export interface NationalAccountsResult {
 }
 
 export function calculateNationalAccounts(world: WorldState): NationalAccountsResult {
-  const outputValueCents = world.companies.reduce(
-    (sum, company) => sum + Math.floor((company.lastProductionMilliUnits * company.priceCents) / 1_000),
-    0,
-  );
-  const intermediateConsumptionCents = world.companies.reduce(
-    (sum, company) => sum + company.lastIntermediateConsumptionCents,
-    0,
-  );
-  const valueAddedCents = Math.max(0, outputValueCents - intermediateConsumptionCents);
-  const realOutputCents = world.companies.reduce((sum, company) => {
-    const good = world.goods.find((item) => item.id === company.goodId);
-    return sum + Math.floor((company.lastProductionMilliUnits * (good?.basePriceCents ?? 0)) / 1_000);
-  }, 0);
-  const realIntermediateCents = world.companies.reduce(
-    (sum, company) => sum + company.lastIntermediateConsumptionBaseCents,
-    0,
-  );
-  const realGdpCents = Math.max(0, realOutputCents - realIntermediateCents);
-  const finalDemandCents = world.nationalAccounts.current.householdConsumptionCents
-    + world.nationalAccounts.current.governmentConsumptionCents
-    + world.nationalAccounts.current.capitalFormationCents;
-  // Изменение запасов в национальных счетах оценивается как остаток выпуска,
-  // а бухгалтерская стоимость запасов отдельно сверяется инвариантами.
-  const inventoryChangeCents = valueAddedCents - finalDemandCents;
-  const expenditureCents = Math.max(0, finalDemandCents + inventoryChangeCents);
+  const reportingCurrency = world.player.reportingCurrencyId;
+  const periods = Object.values(world.countryEconomicAccounts.closedByCountry);
+  const converted = (value: number, currencyId: string): number => convertMinor(world, value, currencyId, reportingCurrency) ?? 0;
+  const valueAddedCents = periods.reduce((sum, period) => sum + converted(period.production.valueAddedMinor, period.currencyId), 0);
+  const expenditureCents = periods.reduce((sum, period) => sum + converted(period.expenditure.gdpMinor, period.currencyId), 0);
+  const inventoryChangeCents = periods.reduce((sum, period) => sum + converted(period.expenditure.inventoryChangeMinor, period.currencyId), 0);
+  const cpiBps = world.countryMetricsHistory.length ? Math.round(world.countryMetricsHistory.slice(-world.countries.length).reduce((sum, item) => sum + item.cpiBps, 0) / world.countries.length) : 10_000;
+  const realGdpCents = Math.round(valueAddedCents * 10_000 / Math.max(1, cpiBps));
   return {
     valueAddedCents,
     expenditureCents,
     reconciliationGapCents: valueAddedCents - expenditureCents,
     realGdpCents,
-    deflatorBps: realGdpCents > 0 ? Math.round((valueAddedCents * 10_000) / realGdpCents) : 10_000,
+    deflatorBps: cpiBps,
     inventoryChangeCents,
   };
 }
