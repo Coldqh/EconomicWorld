@@ -28,22 +28,50 @@ function occupationScore(world: WorldState, occupation: Occupation): number {
 export function setPlayerProfile(world: WorldState, name: string, profileId: string): void {
   const person = playerPerson(world);
   const household = playerHousehold(world);
-  const profiles: Record<string, { age: number; education: typeof person.educationLevel; gains: Partial<Record<SkillId, number>> }> = {
-    student: { age: 19, education: "secondary", gains: { economics: 1_100, statistics: 950 } },
-    office: { age: 21, education: "secondary", gains: { communication: 550, accounting: 300 } },
-    analyst: { age: 22, education: "bachelor", gains: { economics: 700, finance: 650, statistics: 600, dataAnalysis: 500 } },
-    developer: { age: 21, education: "secondary", gains: { programming: 900, dataAnalysis: 500, statistics: 300 } },
-  };
-  const profile = profiles[profileId] ?? profiles.student;
+  const profile = { age: 19, education: "secondary" as const, gains: { economics: 1_100, statistics: 950 } };
   person.displayName = name.trim() || "Игрок";
   household.displayName = person.displayName;
   person.ageAtStart = profile.age;
   person.educationLevel = profile.education;
   for (const [skill, gain] of Object.entries(profile.gains) as Array<[SkillId, number]>) person.skills[skill] = Math.max(person.skills[skill], gain);
-  world.player.profileId = profileId;
-  recordCommand(world, "SET_PROFILE", { name: person.displayName, profileId });
-  emitSimpleEvent(world, "PlayerCreated", "Игрок вошёл в экономику", `${person.displayName}, ${person.ageAtStart} лет. Банковский счёт и домохозяйство связаны с Global Ledger.`, [person.id, household.id, household.bankId], "positive");
-  addPlayerTimeline(world, "identity", "Начало экономической жизни", `${person.displayName}, ${person.ageAtStart} лет`);
+  world.player.profileId = "student";
+  recordCommand(world, "SET_PROFILE", { name: person.displayName, profileId: "student", requestedProfileId: profileId });
+  emitSimpleEvent(world, "PlayerCreated", "Начало студенческой жизни", `${person.displayName}, ${person.ageAtStart} лет. Среднее образование, небольшой денежный резерв и ни одной готовой профессии.`, [person.id, household.id, household.bankId], "positive");
+  addPlayerTimeline(world, "identity", "Начало студенческой жизни", `${person.displayName}, ${person.ageAtStart} лет`);
+}
+
+const OCCUPATION_SPECIALIZATIONS: Record<string, string[]> = {
+  worker: ["economics", "software", "finance"],
+  admin: ["economics", "software", "finance"],
+  analyst: ["economics", "finance"],
+  developer: ["software"],
+  "investment-analyst": ["economics", "finance"],
+  "risk-analyst": ["economics", "finance"],
+  "investment-banker": ["finance"],
+  "portfolio-manager": ["finance"],
+  "fund-manager": ["finance"],
+  manager: ["finance"],
+};
+
+function completedPrograms(world: WorldState) {
+  return world.player.completedProgramIds
+    .map((id) => world.universityPrograms.find((program) => program.id === id))
+    .filter((program): program is NonNullable<typeof program> => Boolean(program));
+}
+
+export function hasOccupationQualification(world: WorldState, occupationId: string): boolean {
+  const allowed = OCCUPATION_SPECIALIZATIONS[occupationId] ?? [];
+  return completedPrograms(world).some((program) => allowed.includes(program.specialization));
+}
+
+export function graduateSalaryBonusBps(world: WorldState, occupationId: string): number {
+  const allowed = OCCUPATION_SPECIALIZATIONS[occupationId] ?? [];
+  return completedPrograms(world).filter((program) => allowed.includes(program.specialization)).reduce((best, program) => {
+    const university = world.universities.find((item) => item.id === program.universityId);
+    const degreeBonus = program.degree === "doctorate" ? 1_000 : program.degree === "master" ? 700 : 350;
+    const institutionBonus = Math.max(0, Math.round(((university?.teachingQualityBps ?? 8_000) - 8_000) * 0.3));
+    return Math.max(best, Math.min(1_500, degreeBonus + institutionBonus));
+  }, 0);
 }
 
 export function availableOccupations(world: WorldState, companyId: string): Occupation[] {
@@ -52,7 +80,7 @@ export function availableOccupations(world: WorldState, companyId: string): Occu
   const base = company.goodId === "services" ? ["admin", "analyst", "developer"] : ["worker", "analyst"];
   if (company.industry === "финансы") base.push("investment-analyst", "risk-analyst", "investment-banker", "portfolio-manager");
   if (company.employees.length >= 8) base.push("manager");
-  return world.occupations.filter((occupation) => base.includes(occupation.id));
+  return world.occupations.filter((occupation) => base.includes(occupation.id) && hasOccupationQualification(world, occupation.id));
 }
 
 export function applyForJob(world: WorldState, companyId: string, occupationId: string): { accepted: boolean; reason: string } {
@@ -60,10 +88,12 @@ export function applyForJob(world: WorldState, companyId: string, occupationId: 
   const company = world.companies.find((item) => item.id === companyId);
   const occupation = world.occupations.find((item) => item.id === occupationId);
   if (!company?.active || !occupation) return { accepted: false, reason: "Вакансия недоступна." };
+  if (!hasOccupationQualification(world, occupation.id)) return { accepted: false, reason: "Сначала получите подходящий диплом института." };
   if (company.cityId !== world.player.currentCityId) return { accepted: false, reason: "Вакансия находится в другом городе." };
   if (household.employerId) return { accepted: false, reason: "Сначала завершите текущий трудовой договор." };
   recordCommand(world, "APPLY_JOB", { companyId, occupationId });
-  const score = occupationScore(world, occupation);
+  const qualificationBonusBps = graduateSalaryBonusBps(world, occupation.id);
+  const score = occupationScore(world, occupation) + Math.round(qualificationBonusBps * 0.4);
   const person = playerPerson(world);
   const averageSkill = Object.values(person.skills).reduce((sum, value) => sum + value, 0) / Object.values(person.skills).length;
   const playerMarketIndex = 17_000 + averageSkill * 2 + person.reputationBps * 0.2;
@@ -79,9 +109,9 @@ export function applyForJob(world: WorldState, companyId: string, occupationId: 
   world.player.jobApplications.push({ id: applicationId, companyId, occupationId, submittedAtMonth: world.clock.elapsedMonths, status: accepted ? "offered" : "rejected", reason, offerId: accepted ? `job-offer-${applicationId}` : null });
   emitSimpleEvent(world, "JobApplied", accepted ? "Работодатель подготовил предложение" : "Работодатель отклонил заявку", accepted ? `${company.name} готова предложить должность «${occupation.name}».` : `Требования навыков, конкуренция или финансы ${company.name} не позволяют сделать предложение.`, [world.player.personId, company.id], accepted ? "positive" : "attention", [], { scoreBps: score, strongerApplicants, requirementsMet, affordable });
   if (!accepted) return { accepted, reason };
-  const salaryCents = Math.round(company.wageCents * (0.88 + occupation.level * 0.11));
+  const salaryCents = Math.round(company.wageCents * (0.88 + occupation.level * 0.11) * (10_000 + qualificationBonusBps) / 10_000);
   world.player.pendingJobOffer = { companyId, occupationId, salaryCents, createdAtMonth: world.clock.elapsedMonths, expiresAtMonth: world.clock.elapsedMonths + 2, scoreBps: score };
-  emitSimpleEvent(world, "JobOfferCreated", "Получено предложение о работе", `${company.name}: ${occupation.name}, ${(salaryCents / 100).toLocaleString("ru-RU")} ₽ в месяц.`, [world.player.personId, company.id], "positive", [], { salaryCents, scoreBps: score });
+  emitSimpleEvent(world, "JobOfferCreated", "Получено предложение о работе", `${company.name}: ${occupation.name}, ${(salaryCents / 100).toLocaleString("ru-RU")} ₽ в месяц. Дипломный бонус: ${(qualificationBonusBps / 100).toLocaleString("ru-RU")}%.`, [world.player.personId, company.id], "positive", [], { salaryCents, scoreBps: score, qualificationBonusBps });
   return { accepted, reason };
 }
 

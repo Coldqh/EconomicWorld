@@ -15,6 +15,7 @@ import type { Company, GoodDefinition, Household, LedgerEntry, WorldState } from
 import { defaultBorrowerLoans, issueLoan, settleBorrowerLoansFromCash, serviceLoans } from "../finance/credit.ts";
 import { recordPlayerMonth } from "../player/system.ts";
 import { progressPlayerWorld } from "../player/world-commands.ts";
+import { studentMonthlySupportCents } from "../player/student-journey.ts";
 import { compactLedgerHistory, migratePopulationCohorts, updateAggregateEconomies, updateWorldDiagnostics } from "../world/systems.ts";
 import { runGlobalEconomyMonth } from "./global-economy.ts";
 import { runGeoeconomicMonth } from "../geoeconomics/engine.ts";
@@ -170,9 +171,10 @@ function paySocialTransfers(world: WorldState): void {
   for (const household of world.households) {
     if (household.employerId || household.monthsUnemployed < 1) continue;
     const government = governmentForCountry(world, countryIdForCity(world, household.cityId));
-    const amount = government.monthlyUnemploymentBenefitCents;
+    const studentSupport = household.id === world.player.householdId ? studentMonthlySupportCents(world) : 0;
+    const amount = studentSupport || government.monthlyUnemploymentBenefitCents;
     if (depositOf(world, government.id) < amount) continue;
-    transferDeposit(world, government.id, household.id, amount, "SOCIAL_TRANSFER", `Пособие: ${household.displayName}`);
+    transferDeposit(world, government.id, household.id, amount, "SOCIAL_TRANSFER", `${studentSupport ? "Стипендия" : "Пособие"}: ${household.displayName}`);
   }
 }
 
@@ -262,7 +264,8 @@ function produceGoods(world: WorldState): void {
 function householdBudget(world: WorldState, household: Household): number {
   const cash = depositOf(world, household.id);
   const localGovernment = governmentForCountry(world, countryIdForCity(world, household.cityId));
-  const monthlyIncome = household.employerId ? companyById(world, household.employerId)?.wageCents ?? 0 : localGovernment.monthlyUnemploymentBenefitCents;
+  const studentSupport = household.id === world.player.householdId ? studentMonthlySupportCents(world) : 0;
+  const monthlyIncome = household.employerId ? companyById(world, household.employerId)?.wageCents ?? 0 : studentSupport || localGovernment.monthlyUnemploymentBenefitCents;
   const desiredReserve = Math.round(monthlyIncome * (1.2 + household.liquidityPreferenceBps / 5_000));
   const spendableStock = Math.max(0, cash - desiredReserve);
   const propensity = household.id === world.player.householdId ? world.player.consumptionBudgetBps : household.consumptionPropensityBps;
@@ -359,7 +362,7 @@ function clearHouseholdMarket(world: WorldState): void {
   }
   const player = world.households.find((household) => household.id === world.player.householdId);
   if (player) {
-    player.lastDisposableIncomeCents = player.employerId ? companyById(world, player.employerId)?.wageCents ?? 0 : governmentForCountry(world, countryIdForCity(world, player.cityId)).monthlyUnemploymentBenefitCents;
+    player.lastDisposableIncomeCents = player.employerId ? companyById(world, player.employerId)?.wageCents ?? 0 : studentMonthlySupportCents(world) || governmentForCountry(world, countryIdForCity(world, player.cityId)).monthlyUnemploymentBenefitCents;
     player.lastSpendingByCategoryCents = { food: 0, housing: 0, energy: 0, transport: 0, services: 0, goods: 0, education: 0, entertainment: 0, luxury: 0 };
     const foodQuantityMilliUnits = { minimal: 12_000, basic: 18_000, good: 27_000, premium: 40_000 }[world.player.foodPlanId];
     const seller = chooseSeller(world, player, "food");

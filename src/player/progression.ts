@@ -18,7 +18,7 @@ export const FEATURE_UNLOCKS: FeatureUnlockDefinition[] = [
   { featureId: "finances", label: "Финансы", minimumLevel: 1, discoveryLevel: 1, uiGroup: "FINANCE", tutorialId: "finance" },
   { featureId: "world", label: "Мир", minimumLevel: 1, discoveryLevel: 1, uiGroup: "WORLD", tutorialId: "world" },
   { featureId: "progression", label: "Профиль", minimumLevel: 1, discoveryLevel: 1, uiGroup: "HOME", tutorialId: "progression" },
-  { featureId: "education", label: "Институты", minimumLevel: 2, discoveryLevel: 1, uiGroup: "CAREER", tutorialId: "institutes" },
+  { featureId: "education", label: "Институты", minimumLevel: 1, discoveryLevel: 1, uiGroup: "CAREER", tutorialId: "institutes" },
   { featureId: "portfolio", label: "Портфель", minimumLevel: 4, discoveryLevel: 3, uiGroup: "FINANCE", tutorialId: "portfolio" },
   { featureId: "markets", label: "Рынки", minimumLevel: 6, discoveryLevel: 5, uiGroup: "MARKETS", tutorialId: "markets" },
   { featureId: "economy", label: "Экономика", minimumLevel: 7, discoveryLevel: 5, uiGroup: "WORLD", tutorialId: "economy" },
@@ -147,6 +147,12 @@ export function syncPlayerProgression(world: WorldState): void {
   const household = world.households.find((item) => item.id === world.player.householdId);
   milestone(world, "first-job", Boolean(household?.employerId), 180, "Первая работа");
   milestone(world, "first-bank", world.bankAccounts.some((item) => item.ownerId === world.player.householdId), 90, "Первый банковский счёт");
+  milestone(world, "university-application", world.player.universityApplications.some((item) => item.status !== "rejected"), 120, "Выбор института и успешная заявка");
+  milestone(world, "university-enrollment", Boolean(world.player.activeUniversityEnrollment) || world.player.completedProgramIds.length > 0, 300, "Зачисление в институт");
+  const studiedMonths = world.player.activeUniversityEnrollment?.completedMonths
+    ?? Math.max(0, ...world.player.educationHistory.filter((item) => item.completedAtMonth !== null).map((item) => world.universityPrograms.find((program) => program.id === item.programId)?.durationMonths ?? 0));
+  for (let year = 1; year <= Math.floor(studiedMonths / 12); year += 1) milestone(world, `academic-year-${year}`, true, 450, `Завершён ${year}-й год обучения`);
+  milestone(world, "university-degree", world.player.completedProgramIds.length > 0, 1_500, "Получен первый диплом");
   milestone(world, "first-education", world.player.completedCourseIds.length + world.player.completedProgramIds.length > 0, 240, "Образовательный этап");
   milestone(world, "first-brokerage", world.brokerageAccounts.some((item) => item.ownerId === world.player.householdId), 220, "Первый брокерский счёт");
   milestone(world, "first-investment", world.equityHoldings.some((item) => item.ownerId === world.player.householdId && item.shares > 0), 300, "Первая инвестиция");
