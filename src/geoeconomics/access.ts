@@ -31,6 +31,7 @@ export function evaluateEconomicPolicyAccess(world: WorldState, request: Economi
   let accessScoreBps = 10_000;
   const reasons: string[] = [];
   const evidenceIds: string[] = [];
+  let hardFrozen = false;
   const restrictions = activePolicies(world).filter((policy) => {
     if (!appliesToCommodity(policy, request.commodityId)) return false;
     const inbound = policy.actorCountryId === request.destinationCountryId && policy.targetCountryIds.includes(request.sourceCountryId);
@@ -46,6 +47,11 @@ export function evaluateEconomicPolicyAccess(world: WorldState, request: Economi
       || (request.kind === "asset" && (policy.kind === "asset-freeze" || policy.kind === "sanction"));
     if (!relevant) continue;
     evidenceIds.push(policy.id);
+    if (policy.kind === "asset-freeze" && (request.kind === "asset" || request.kind === "finance" || request.kind === "investment")) {
+      hardFrozen = true;
+      reasons.push(`asset-freeze: ${policy.actorCountryId} → ${policy.targetCountryIds.join(", ")}`);
+      continue;
+    }
     if (policy.kind === "tariff" && inbound && request.kind === "trade") tariffBps += policy.rateBps;
     accessScoreBps -= policy.accessPenaltyBps;
     reasons.push(`${policy.kind}: ${policy.actorCountryId} → ${policy.targetCountryIds.join(", ")}`);
@@ -68,5 +74,5 @@ export function evaluateEconomicPolicyAccess(world: WorldState, request: Economi
   }
   accessScoreBps = Math.max(0, Math.min(10_000, accessScoreBps));
   tariffBps = Math.max(0, Math.min(20_000, tariffBps));
-  return { allowed: accessScoreBps >= 2_500, accessScoreBps, tariffBps, reasons, evidenceIds: [...new Set(evidenceIds)] };
+  return { allowed: !hardFrozen && accessScoreBps >= 2_500, accessScoreBps: hardFrozen ? 0 : accessScoreBps, tariffBps, reasons, evidenceIds: [...new Set(evidenceIds)] };
 }

@@ -4,6 +4,7 @@ import { convertMinor } from "../finance/currencies.ts";
 import { currencyBankAccount, settleFinancialPayment, transferFinancialPrincipal } from "../finance/financial-settlement.ts";
 import { recordBilateralExternalFlow, recordExternalFlow } from "../accounting/country-periods.ts";
 import { createGeoeconomicsState, seedGeoeconomics } from "./state.ts";
+import { getBelief, PUBLIC_INFORMATION_AGENT, recordDecisionTrace } from "../information/system.ts";
 
 const clamp = (value: number, low = 0, high = 10_000): number => Math.max(low, Math.min(high, Math.round(value)));
 const currencyOf = (world: WorldState, countryId: string): string => world.countries.find((item) => item.id === countryId)?.currencyReference ?? "USD";
@@ -16,6 +17,9 @@ function trace(world: WorldState, actorCountryId: string, decision: string, targ
 export function adoptGeoeconomicPolicy(world: WorldState, input: Omit<GeoeconomicPolicy, "id" | "status" | "transactionIds">): GeoeconomicPolicy {
   const policy: GeoeconomicPolicy = { ...input, id: `geo-policy-${String(world.geoeconomics.nextPolicyId++).padStart(6, "0")}`, status: "active", transactionIds: [] };
   world.geoeconomics.policies.push(policy);
+  const governmentId = world.governments.find((item) => item.countryId === policy.actorCountryId)?.id ?? `government-${policy.actorCountryId}`;
+  const beliefs = policy.targetCountryIds.flatMap((targetId) => [getBelief(world, governmentId, "gdp-growth-bps", targetId) ?? getBelief(world, PUBLIC_INFORMATION_AGENT, "gdp-growth-bps", targetId), getBelief(world, governmentId, "financial-stress-bps", targetId) ?? getBelief(world, PUBLIC_INFORMATION_AGENT, "financial-stress-bps", targetId)]).filter((item): item is NonNullable<typeof item> => Boolean(item));
+  recordDecisionTrace(world, governmentId, `GEOECONOMIC_${policy.kind.toUpperCase()}`, policy.targetCountryIds.join(","), beliefs, `Ожидаемый эффект рассчитан по доступным иностранным оценкам; ограничение ${policy.accessPenaltyBps} б.п.`);
   trace(world, policy.actorCountryId, policy.kind, policy.targetCountryIds, { rateBps: policy.rateBps, accessPenaltyBps: policy.accessPenaltyBps }, policy.retaliationOfId ? ["Ответ на действующее ограничение"] : ["Защита стратегического интереса"], policy.retaliationOfId ? [policy.retaliationOfId] : [], policy.retaliationOfId ? "retaliated" : "adopted");
   return policy;
 }
@@ -124,6 +128,40 @@ function autonomousDecisions(world: WorldState): void {
       world.geoeconomics.industrialPolicyPrograms.push(program);
       trace(world, country.id, "industrial-policy", [dependency.targetCountryId], { dependencyBps: dependency.strategicDependencyBps, monthlyBudgetMinor: program.monthlyBudgetMinor }, ["Снижение направленной зависимости"], [`dependency:${country.id}:${dependency.targetCountryId}`], "adopted");
     }
+    const pressure = world.politicalEconomy.interestGroups.filter((item) => item.countryId === country.id && item.type === "business").reduce((sum, item) => sum + item.influenceBps, 0);
+    const domesticCostBps = dependency.strategicDependencyBps;
+    const expectedBenefitBps = clamp(dependency.importDependencyBps * 0.55 + pressure * 0.25 + dependency.financeDependencyBps * 0.2);
+    const alreadyRestricted = world.geoeconomics.policies.some((item) => item.status === "active" && item.actorCountryId === country.id && item.targetCountryIds.includes(dependency.targetCountryId));
+    if (!alreadyRestricted && dependency.strategicDependencyBps >= 2_800 && expectedBenefitBps > domesticCostBps * 0.72 + 1_200) {
+      const kind = dependency.financeDependencyBps > dependency.importDependencyBps ? "investment-screening" as const : dependency.importDependencyBps > 5_500 ? "export-control" as const : "tariff" as const;
+      const policy = adoptGeoeconomicPolicy(world, { actorCountryId: country.id, targetCountryIds: [dependency.targetCountryId], kind, commodityIds: [], rateBps: kind === "tariff" ? 350 : 0, accessPenaltyBps: kind === "tariff" ? 800 : 2_500, startsAtMonth: world.clock.elapsedMonths, endsAtMonth: world.clock.elapsedMonths + 24, retaliationOfId: null });
+      trace(world, country.id, `initial-${kind}`, [dependency.targetCountryId], { dependencyBps: dependency.strategicDependencyBps, expectedDomesticCostBps: domesticCostBps, expectedTargetEffectBps: expectedBenefitBps, politicalSupportBps: pressure }, ["Концентрация стратегической зависимости", "Поддержка внутренней отрасли"], [policy.id, `dependency:${country.id}:${dependency.targetCountryId}`], "adopted");
+    }
+  }
+}
+
+function autonomousAidAndLending(world: WorldState): void {
+  if (world.clock.elapsedMonths === 0 || world.clock.elapsedMonths % 12 !== 0) return;
+  for (const recipient of world.countries) {
+    const budget = world.governmentBudgets.find((item) => item.countryId === recipient.id);
+    if (!budget || budget.fiscalStressBps < 5_500) continue;
+    const allied = world.defenseEconomy.alliances.find((item) => item.memberCountryIds.includes(recipient.id));
+    const donorId = allied?.memberCountryIds.find((id) => id !== recipient.id && (world.geoeconomics.strategicInterests.find((item) => item.countryId === id)?.fiscalSpaceBps ?? 0) > 6_000);
+    if (!donorId) continue;
+    const donorBudget = world.governmentBudgets.find((item) => item.countryId === donorId);
+    const donor = world.governments.find((item) => item.countryId === donorId);
+    const amount = Math.max(1, Math.min(Math.round((donorBudget?.totalRevenueMinor ?? 0) * 5 / 10_000), Math.round(Math.max(0, budget.totalSpendingMinor - budget.interestSpendingMinor) * 10 / 10_000)));
+    const aidTx = provideForeignAid(world, donorId, recipient.id, amount);
+    if (aidTx) trace(world, donorId, "autonomous-aid", [recipient.id], { amountMinor: amount, recipientFiscalStressBps: budget.fiscalStressBps }, ["Союзническая кризисная поддержка"], [aidTx], "adopted");
+    let facility = world.geoeconomics.sovereignLendingFacilities.find((item) => item.lenderCountryId === donorId && item.borrowerCountryId === recipient.id && item.status === "open");
+    if (!facility && donor) {
+      facility = { id: `sovereign-facility-${String(world.geoeconomics.nextFacilityId++).padStart(6, "0")}`, lenderCountryId: donorId, borrowerCountryId: recipient.id, currencyId: donor.currencyId, limitMinor: amount * 12, drawnMinor: 0, annualRateBps: 350, maturityMonths: 60, status: "open", transactionIds: [] };
+      world.geoeconomics.sovereignLendingFacilities.push(facility);
+    }
+    if (facility) {
+      const loanTx = drawSovereignLendingFacility(world, facility.id, Math.min(amount * 2, facility.limitMinor - facility.drawnMinor));
+      if (loanTx) trace(world, donorId, "autonomous-sovereign-lending", [recipient.id], { amountMinor: amount * 2, riskBps: budget.fiscalStressBps }, ["Ограниченная кредитная поддержка при наличии фискального пространства"], [loanTx], "adopted");
+    }
   }
 }
 
@@ -134,7 +172,8 @@ export function runGeoeconomicMonth(world: WorldState): void {
     policy.status = "expired";
     trace(world, policy.actorCountryId, policy.kind, policy.targetCountryIds, {}, ["Срок действия завершён"], [policy.id], "expired");
   }
-  if (world.clock.elapsedMonths % 3 === 0) refreshStrategicInterests(world);
   autonomousDecisions(world);
+  autonomousAidAndLending(world);
+  if (world.clock.elapsedMonths % 3 === 0) refreshStrategicInterests(world);
   runIndustrialPolicy(world);
 }

@@ -39,3 +39,7 @@ yarn-error.log*
 /.wrangler/
 /outputs/
 /work/
+
+# local performance profiler output (benchmark JSON artifacts are committed)
+*.cpuprofile
+*.heapprofile

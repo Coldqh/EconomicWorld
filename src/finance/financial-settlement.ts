@@ -1,5 +1,18 @@
 import { accountIds, bankAccountsForOwner, ensureAccount, postTransaction, transferBankAccountBalance } from "../core/ledger.ts";
 import type { TransactionKind, WorldState } from "../domain/model.ts";
+import { evaluateEconomicPolicyAccess } from "../geoeconomics/access.ts";
+
+function ownerCountryId(world: WorldState, ownerId: string): string | null {
+  const direct = world.governments.find((item) => item.id === ownerId)?.countryId
+    ?? world.banks.find((item) => item.id === ownerId)?.countryId
+    ?? world.companies.find((item) => item.id === ownerId)?.headquartersCountryId
+    ?? world.populationCohorts.find((item) => item.id === ownerId)?.countryId
+    ?? world.firmCohorts.find((item) => item.id === ownerId)?.countryId;
+  if (direct) return direct;
+  const account = world.bankAccounts.find((item) => item.ownerId === ownerId && item.status === "active");
+  if (account) return world.banks.find((item) => item.id === account.bankId)?.countryId ?? null;
+  return null;
+}
 
 export function currencyBankAccount(world: WorldState, ownerId: string, currencyId: string) {
   return bankAccountsForOwner(world, ownerId, currencyId).find((account) => account.isPrimary)
@@ -17,6 +30,10 @@ export function transferFinancialPrincipal(
   memo: string,
   causeIds: string[] = [],
 ): string | null {
+  const sourceCountryId = ownerCountryId(world, payerId);
+  const destinationCountryId = ownerCountryId(world, recipientId);
+  if (sourceCountryId && destinationCountryId && sourceCountryId !== destinationCountryId
+    && !evaluateEconomicPolicyAccess(world, { sourceCountryId, destinationCountryId, kind: "finance" }).allowed) return null;
   const payer = currencyBankAccount(world, payerId, currencyId);
   const recipient = currencyBankAccount(world, recipientId, currencyId);
   if (!payer || !recipient) return null;

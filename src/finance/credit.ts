@@ -12,6 +12,7 @@ import {
 } from "../core/ledger.ts";
 import type { Bank, Loan, WorldState } from "../domain/model.ts";
 import { bankLiquidityRatioBps } from "./liquidity.ts";
+import { getBelief, observedBorrowerCashFlow, recordDecisionTrace } from "../information/system.ts";
 
 export function bankCapitalCents(world: WorldState, bankId: string): number {
   return entityBook(world, bankId).capital;
@@ -53,22 +54,36 @@ export function issueLoan(
   const projectedRatio = newRiskAssets > 0 ? Math.floor((capital * 10_000) / newRiskAssets) : 100_000;
   const company = world.companies.find((item) => item.id === borrowerId);
   const firmCohort = world.firmCohorts.find((item) => item.id === borrowerId);
+  const playerOwnedCompany = company?.ownerHouseholdId === world.player.householdId;
+  // Репутация влияет только на цену риска, а не создаёт деньги и не отменяет
+  // нормативы банка. Диапазон намеренно ограничен ±120 б.п.
+  const reputationSpreadBps = playerOwnedCompany
+    ? Math.max(-120, Math.min(120, -Math.round(world.player.reputation.score * 0.12)))
+    : 0;
   const recentReports = company?.financialReports.slice(-3) ?? [];
-  const averageCashFlow = recentReports.length
+  const reportedCashFlow = recentReports.length
     ? recentReports.reduce((sum, report) => sum + report.operatingCashFlowCents, 0) / recentReports.length
     : company?.lastGrossRevenueCents ?? firmCohort?.revenueCents ?? amountCents;
+  const borrowerObservation = company ? observedBorrowerCashFlow(world, bankId, borrowerId, reportedCashFlow) : { value: reportedCashFlow, confidenceBps: 7_000, status: "PUBLIC" as const };
+  const averageCashFlow = borrowerObservation.value;
   const existingDebt = world.loans
     .filter((loan) => loan.borrowerId === borrowerId && loan.status === "active")
     .reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
   const liquidityRatio = bankLiquidityRatioBps(world, bankId);
   const isAggregateFirm = Boolean(firmCohort);
+  const isFxLiquidityDealer = world.fxDealers.some((dealer) => dealer.id === borrowerId);
   const reasons = {
     capitalConstraint: projectedRatio < bank.minimumCapitalRatioBps,
     liquidityConstraint: liquidityRatio < bank.minimumLiquidityRatioBps,
     borrowerRisk: riskPremiumBps > 900,
-    cashFlowConstraint: averageCashFlow < 0 || existingDebt > Math.max(amountCents * (isAggregateFirm ? 12 : 3), averageCashFlow * (isAggregateFirm ? 60 : 24)),
+    // FX dealers finance temporary currency inventory. Treating them like an
+    // operating company creates a false cash-flow rejection after a few liquidity
+    // draws even though every draw is backed by a matching deposit and remains
+    // subject to the lending bank's capital/liquidity limits.
+    cashFlowConstraint: !isFxLiquidityDealer && (averageCashFlow < 0 || existingDebt > Math.max(amountCents * (isAggregateFirm ? 12 : 3), averageCashFlow * (isAggregateFirm ? 60 : 24))),
   };
   if (Object.values(reasons).some(Boolean)) {
+    if (company) { const cashFlowBelief = getBelief(world, bankId, "operating-cash-flow", borrowerId); recordDecisionTrace(world, bankId, "CREDIT_REJECTION", borrowerId, cashFlowBelief ? [cashFlowBelief] : [], "Кредит отклонён по доступной оценке заёмщика и ограничениям банка"); }
     emitSimpleEvent(world, "LoanRejected", "Банк отказал в кредите", `Заявка ${borrowerId} не прошла ограничения капитала, ликвидности или денежного потока.`, [bankId, borrowerId], "attention", causeIds, { ...reasons, projectedCapitalRatioBps: projectedRatio, liquidityRatioBps: liquidityRatio, averageCashFlowCents: Math.round(averageCashFlow) });
     return null;
   }
@@ -98,12 +113,13 @@ export function issueLoan(
     settlementBankAccountId: settlement.id,
     originalPrincipalCents: amountCents,
     remainingPrincipalCents: amountCents,
-    annualRateBps: Math.round(policyRateBps
+    annualRateBps: Math.max(0, Math.round(policyRateBps
       + bank.baseSpreadBps
       + riskPremiumBps
       + Math.max(0, bank.minimumCapitalRatioBps + 250 - projectedRatio) / 4
       + Math.max(0, bank.minimumLiquidityRatioBps + 250 - liquidityRatio) / 4
-      + (world.countryMacroStates.find((state) => state.countryId === bank.countryId)?.lendingStandardsBps ?? 4_000) / 20),
+      + (world.countryMacroStates.find((state) => state.countryId === bank.countryId)?.lendingStandardsBps ?? 4_000) / 20
+      + reputationSpreadBps)),
     remainingMonths: termMonths,
     missedPayments: 0,
     status: "active",
@@ -122,6 +138,7 @@ export function issueLoan(
     causeIds,
   );
   world.loans.push(loan);
+  if (company) { const cashFlowBelief = getBelief(world, bankId, "operating-cash-flow", borrowerId); recordDecisionTrace(world, bankId, "CREDIT_APPROVAL", borrowerId, cashFlowBelief ? [cashFlowBelief] : [], `Кредит одобрен по ставке ${loan.annualRateBps} б.п.`); }
   emitSimpleEvent(
     world,
     "LoanIssued",
@@ -143,7 +160,9 @@ export function serviceLoans(world: WorldState): void {
   for (const loan of world.loans) {
     if (loan.status !== "active" || loan.remainingPrincipalCents <= 0) continue;
     const aggregateWorkingCapital = world.firmCohorts.some((cohort) => cohort.id === loan.borrowerId);
-    let principalCents = aggregateWorkingCapital && loan.remainingMonths > 1 ? 0 : Math.min(
+    const fxDealerLiquidity = world.fxDealers.some((dealer) => dealer.id === loan.borrowerId);
+    const revolvingWorkingCapital = aggregateWorkingCapital || fxDealerLiquidity;
+    let principalCents = revolvingWorkingCapital && loan.remainingMonths > 1 ? 0 : Math.min(
       loan.remainingPrincipalCents,
       Math.max(1, Math.ceil(loan.remainingPrincipalCents / Math.max(1, loan.remainingMonths))),
     );
@@ -153,7 +172,7 @@ export function serviceLoans(world: WorldState): void {
     );
     const settlement = world.bankAccounts.find((account) => account.id === loan.settlementBankAccountId && account.status === "active");
     const available = settlement ? bankAccountBalance(world, settlement.id) : 0;
-    if (aggregateWorkingCapital && loan.remainingMonths <= 1 && available >= interestCents && available < principalCents + interestCents) {
+    if (revolvingWorkingCapital && loan.remainingMonths <= 1 && available >= interestCents && available < principalCents + interestCents) {
       loan.remainingMonths = 12;
       const lender = bankFor(world, loan.lenderBankId);
       const policyRate = world.centralBanks.find((item) => item.id === lender.centralBankId)?.policyRateBps ?? 0;

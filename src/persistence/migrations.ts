@@ -1,13 +1,16 @@
-import { accountIds, ensureAccount, ensureEntityAccounts, seedDeposit, seedNonCashAsset } from "../core/ledger.ts";
+import { accountIds, bankAccountsForOwner, ensureAccount, ensureEntityAccounts, openBankAccount, seedDeposit, seedNonCashAsset } from "../core/ledger.ts";
 import type { MetricPoint, WorldState } from "../domain/model.ts";
 import { createWorld } from "../economy/create-world.ts";
 import { seedMacroeconomics } from "../economy/macroeconomics.ts";
 import { seedClearingHouses } from "../finance/clearing.ts";
 import { seedDerivativeMarkets } from "../finance/derivatives.ts";
-import { createGeoeconomicsState } from "../geoeconomics/state.ts";
-import { createPoliticalEconomyState } from "../political-economy/state.ts";
+import { createGeoeconomicsState, seedGeoeconomics } from "../geoeconomics/state.ts";
+import { createPoliticalEconomyState, seedPoliticalEconomy } from "../political-economy/state.ts";
 import { createDefenseEconomyState, seedDefenseEconomy } from "../defense-economy/state.ts";
 import { createConflictState } from "../conflict/state.ts";
+import { seedEconomicMarketsCompletion } from "../economy/economic-markets-init.ts";
+import { createInformationState } from "../information/system.ts";
+import { createExperienceState, createReputationState, inferProgressionFromWorld } from "../player/progression.ts";
 
 type LegacyWorld = Omit<Partial<WorldState>, "schemaVersion" | "saveVersion"> & { schemaVersion?: number; saveVersion?: number };
 
@@ -47,18 +50,109 @@ function migrateMetric(metric: Partial<MetricPoint>, world: WorldState): MetricP
   };
 }
 
+function moveLedgerBalance(world: WorldState, sourceId: string, targetId: string, amountMinor: number): number {
+  const available = Math.max(0, world.ledger.balances[sourceId] ?? 0);
+  const moved = Math.min(available, Math.max(0, amountMinor));
+  if (moved <= 0) return 0;
+  world.ledger.balances[sourceId] = available - moved;
+  world.ledger.balances[targetId] = (world.ledger.balances[targetId] ?? 0) + moved;
+  return moved;
+}
+
+/**
+ * Schema 14 financed LBOs directly on the fund. Schema 15 reclassifies each
+ * tracked acquisition loan and target holding to one aggregate HoldCo without
+ * issuing a second loan or creating cash. Historical transaction ids remain
+ * untouched; only the live owner/liability registry used for future service is
+ * converted.
+ */
+function migrateLegacyPeAcquisitionVehicles(world: WorldState): void {
+  world.acquisitionVehicles ??= [];
+  for (const deal of world.privateEquityDeals) {
+    if (deal.acquisitionVehicleId && world.acquisitionVehicles.some((item) => item.id === deal.acquisitionVehicleId)) continue;
+    const fund = world.funds.find((item) => item.id === deal.fundId);
+    if (!fund) continue;
+    const vehicleId = `pe-holdco-${deal.id}`;
+    const trackedLoans = world.loans.filter((loan) => (deal.acquisitionLoanIds ?? []).includes(loan.id));
+    for (const loan of trackedLoans) {
+      if (loan.borrowerId !== deal.fundId) continue;
+      const opened = openBankAccount(world, vehicleId, loan.lenderBankId, !bankAccountsForOwner(world, vehicleId).length);
+      const settlement = world.bankAccounts.find((account) => account.id === opened.accountId)!;
+      const oldLiability = accountIds.loanLiability(deal.fundId, loan.lenderBankId);
+      const newLiability = accountIds.loanLiability(vehicleId, loan.lenderBankId);
+      const oldBankAsset = accountIds.bankLoanAsset(loan.lenderBankId, deal.fundId);
+      const newBankAsset = accountIds.bankLoanAsset(loan.lenderBankId, vehicleId);
+      ensureAccount(world.ledger, newLiability, vehicleId, `Acquisition debt ${deal.id}`, "liability", loan.currencyId);
+      ensureAccount(world.ledger, newBankAsset, loan.lenderBankId, `Acquisition loan ${deal.id}`, "asset", loan.currencyId);
+      moveLedgerBalance(world, oldLiability, newLiability, loan.remainingPrincipalCents);
+      moveLedgerBalance(world, oldBankAsset, newBankAsset, loan.remainingPrincipalCents);
+      loan.borrowerId = vehicleId;
+      loan.settlementBankAccountId = settlement.id;
+    }
+    const security = world.equitySecurities.find((item) => item.companyId === deal.targetCompanyId);
+    const holding = security && world.equityHoldings.find((item) => item.securityId === security.id && item.ownerId === deal.fundId);
+    if (security && holding) {
+      const oldAsset = accountIds.security(deal.fundId, security.id);
+      const newAsset = accountIds.security(vehicleId, security.id);
+      ensureAccount(world.ledger, newAsset, vehicleId, `Target equity ${deal.targetCompanyId}`, "asset", security.currencyId);
+      moveLedgerBalance(world, oldAsset, newAsset, world.ledger.balances[oldAsset] ?? holding.costBasisCents);
+      holding.ownerId = vehicleId;
+      const target = world.companies.find((item) => item.id === deal.targetCompanyId);
+      if (target?.parentCompanyId === deal.fundId) target.parentCompanyId = vehicleId;
+    }
+    const vehicleAccount = bankAccountsForOwner(world, vehicleId, fund.currencyId)[0]
+      ?? (() => { const bankId = world.bankAccounts.find((item) => item.id === fund.bankAccountId)?.bankId ?? world.banks.find((item) => item.baseCurrency === fund.currencyId)?.id; return bankId ? world.bankAccounts.find((item) => item.id === openBankAccount(world, vehicleId, bankId, true).accountId) : undefined; })();
+    if (!vehicleAccount) continue;
+    const fundInvestment = `asset:pe-vehicle:${deal.fundId}:${vehicleId}`;
+    const vehicleEquity = `equity:pe-vehicle:${vehicleId}`;
+    ensureAccount(world.ledger, fundInvestment, deal.fundId, `Investment in ${vehicleId}`, "asset", fund.currencyId);
+    ensureAccount(world.ledger, vehicleEquity, vehicleId, `Sponsor equity ${deal.id}`, "equity", fund.currencyId);
+    if ((world.ledger.balances[fundInvestment] ?? 0) === 0 && deal.sponsorEquityMinor > 0) {
+      world.ledger.balances[fundInvestment] = deal.sponsorEquityMinor;
+      world.ledger.balances[vehicleEquity] = (world.ledger.balances[vehicleEquity] ?? 0) + deal.sponsorEquityMinor;
+    }
+    const vehicle = {
+      id: vehicleId, dealId: deal.id, fundId: deal.fundId, targetCompanyId: deal.targetCompanyId, currencyId: fund.currencyId,
+      bankAccountId: vehicleAccount.id, status: deal.status === "exited" ? "exited" as const : deal.status === "failed" ? "failed" as const : deal.status === "diligence" ? "funding" as const : "holding" as const,
+      sponsorEquityMinor: deal.sponsorEquityMinor, debtMinor: trackedLoans.filter((loan) => loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0),
+      targetShares: holding?.shares ?? 0, createdAtMonth: deal.entryMonth, closedAtMonth: deal.exitMonth, transactionIds: [],
+    };
+    world.acquisitionVehicles.push(vehicle);
+    deal.acquisitionVehicleId = vehicle.id;
+  }
+}
+
 export function migrateWorldState(raw: unknown): WorldState {
   const legacy = structuredClone(raw) as LegacyWorld;
-  if ((legacy.schemaVersion ?? 1) > 14 || (legacy.saveVersion ?? 1) > 14) {
+  if ((legacy.schemaVersion ?? 1) > 16 || (legacy.saveVersion ?? 1) > 16) {
     throw new Error("Сохранение создано более новой версией приложения");
   }
   const template = createWorld();
+  const legacyRecord = legacy as unknown as Record<string, unknown>;
+  // Текущие development-снимки иногда содержали null вместо новых массивов.
+  // Старые схемы нельзя заполнять заранее: их поэтапные миграции специально
+  // определяют отсутствие полей и восстанавливают валютный реестр иначе.
+  if ((legacy.schemaVersion ?? 1) >= 16) {
+    for (const [key, templateValue] of Object.entries(template)) {
+      if (Array.isArray(templateValue) && !Array.isArray(legacyRecord[key])) {
+        legacyRecord[key] = structuredClone(templateValue);
+      }
+    }
+  }
   const upgradeLongRun = (source: LegacyWorld): WorldState => {
+    // Development saves can contain explicit `undefined` values for fields that
+    // were introduced while a schema version was still in progress. Spreading
+    // those values over the template removes valid defaults and can crash the
+    // first render before the user can recover the save.
+    const definedSource = Object.fromEntries(
+      Object.entries(source).filter(([, value]) => value !== undefined && value !== null),
+    ) as LegacyWorld;
     const upgraded = {
     ...template,
-    ...source,
-    schemaVersion: 14,
-    saveVersion: 14,
+    ...definedSource,
+    schemaVersion: 16,
+    saveVersion: 16,
+    initializationComplete: false,
     calibratedParameters: { ...template.calibratedParameters, ...(source.calibratedParameters ?? {}) },
     countryCalibratedParameters: source.countryCalibratedParameters ?? {},
     governmentBudgets: (source.governmentBudgets ?? []).map((budget) => ({
@@ -66,15 +160,48 @@ export function migrateWorldState(raw: unknown): WorldState {
       ...budget,
     })),
     longRunDiagnostics: source.longRunDiagnostics ?? { points: [], warnings: [], lastRecordedMonth: -1 },
+    player: {
+      ...template.player,
+      ...(source.player ?? {}),
+      experience: source.player?.experience ?? createExperienceState(),
+      reputation: source.player?.reputation ?? createReputationState(),
+      interfacePreferences: { ...template.player.interfacePreferences, ...(source.player?.interfacePreferences ?? {}) },
+    },
+    information: source.information ?? createInformationState((source.countries ?? template.countries).map((country) => country.id)),
     defenseEconomy: source.defenseEconomy ?? createDefenseEconomyState(),
     conflicts: source.conflicts ?? createConflictState(),
     geoeconomics: source.geoeconomics ?? createGeoeconomicsState(),
     politicalEconomy: source.politicalEconomy ?? createPoliticalEconomyState(),
     countryEconomicAccounts: { currentByCountry: {}, closedByCountry: {}, history: [], hotHistoryMonths: 24, householdAccounts: [], firmAccounts: [], representations: [] },
+    history: {
+      ...template.history,
+      ...(source.history ?? {}),
+      policy: { ...template.history.policy, ...(source.history?.policy ?? {}) },
+      compactedAuctionRecords: source.history?.compactedAuctionRecords ?? [],
+    },
+    marketOrders: (source.marketOrders ?? []).map((order) => ({ ...order, exchangeId: order.exchangeId ?? (source.listings ?? template.listings).find((listing) => listing.securityId === order.securityId)?.exchangeId ?? "" })),
+    archivedMarketOrders: (source.archivedMarketOrders ?? []).map((order) => ({ ...order, exchangeId: order.exchangeId ?? (source.listings ?? template.listings).find((listing) => listing.securityId === order.securityId)?.exchangeId ?? "" })),
+    insuranceLossEvents: (source.insuranceLossEvents ?? []).map((loss) => ({
+      ...loss,
+      assetId: loss.assetId ?? `legacy-exposure:${loss.ownerId}`,
+      category: loss.category ?? "other-covered",
+      sourceSystem: loss.sourceSystem ?? "legacy-migration",
+      claimedAmountMinor: loss.claimedAmountMinor ?? ((source.insuranceClaims ?? []).filter((claim) => claim.lossEventId === loss.id).reduce((sum, claim) => sum + (claim.paidMinor ?? 0), 0)),
+    })),
+    insuranceClaims: (source.insuranceClaims ?? []).map((claim) => ({ ...claim, lossEventId: claim.lossEventId ?? `legacy-loss:${claim.id}` })),
+    acquisitionVehicles: source.acquisitionVehicles ?? [],
     } as WorldState;
     seedDefenseEconomy(upgraded);
+    seedGeoeconomics(upgraded);
+    seedPoliticalEconomy(upgraded);
+    seedEconomicMarketsCompletion(upgraded);
+    migrateLegacyPeAcquisitionVehicles(upgraded);
+    inferProgressionFromWorld(upgraded);
+    upgraded.initializationComplete = true;
     return upgraded;
   };
+  if (legacy.schemaVersion === 16 && legacy.saveVersion === 16) return upgradeLongRun(legacy);
+  if (legacy.schemaVersion === 15 && legacy.saveVersion === 15) return upgradeLongRun(legacy);
   if (legacy.schemaVersion === 14 && legacy.saveVersion === 14) return upgradeLongRun(legacy);
   if (legacy.schemaVersion === 13 && legacy.saveVersion === 13) return upgradeLongRun(legacy);
   if (legacy.schemaVersion === 12 && legacy.saveVersion === 12) return upgradeLongRun(legacy);
@@ -89,8 +216,12 @@ export function migrateWorldState(raw: unknown): WorldState {
   if (legacy.schemaVersion === 9 && legacy.saveVersion === 9) {
     return {
       ...legacy,
-      schemaVersion: 14 as const,
-      saveVersion: 14 as const,
+      schemaVersion: 16 as const,
+      saveVersion: 16 as const,
+      initializationComplete: true,
+      player: { ...template.player, ...(legacy.player ?? {}), experience: legacy.player?.experience ?? createExperienceState(), reputation: legacy.player?.reputation ?? createReputationState(), interfacePreferences: { ...template.player.interfacePreferences, ...(legacy.player?.interfacePreferences ?? {}) } },
+      information: legacy.information ?? createInformationState((legacy.countries ?? template.countries).map((country) => country.id)),
+      acquisitionVehicles: [],
       countryEconomicAccounts: { currentByCountry: {}, closedByCountry: {}, history: [], hotHistoryMonths: 24, householdAccounts: [], firmAccounts: [], representations: [] },
       geoeconomics: createGeoeconomicsState(),
       politicalEconomy: createPoliticalEconomyState(),
@@ -105,8 +236,12 @@ export function migrateWorldState(raw: unknown): WorldState {
   if (legacy.schemaVersion === 8 && legacy.saveVersion === 8) {
     return {
       ...legacy,
-      schemaVersion: 14 as const,
-      saveVersion: 14 as const,
+      schemaVersion: 16 as const,
+      saveVersion: 16 as const,
+      initializationComplete: true,
+      player: { ...template.player, ...(legacy.player ?? {}), experience: legacy.player?.experience ?? createExperienceState(), reputation: legacy.player?.reputation ?? createReputationState(), interfacePreferences: { ...template.player.interfacePreferences, ...(legacy.player?.interfacePreferences ?? {}) } },
+      information: legacy.information ?? createInformationState((legacy.countries ?? template.countries).map((country) => country.id)),
+      acquisitionVehicles: [],
       baselineReference: { ...template.baselineReference, ...(legacy.baselineReference ?? {}), replayObservedExternalShocks: false },
       companies: (legacy.companies ?? template.companies).map((company) => ({ ...company, baselineFinancials: null })),
       banks: (legacy.banks ?? template.banks).map((bank) => ({ ...bank, baselineFinancials: null })),
@@ -119,8 +254,12 @@ export function migrateWorldState(raw: unknown): WorldState {
     const migrated = {
       ...template,
       ...legacy,
-      schemaVersion: 14 as const,
-      saveVersion: 14 as const,
+      schemaVersion: 16 as const,
+      saveVersion: 16 as const,
+      initializationComplete: true,
+      player: { ...template.player, ...(legacy.player ?? {}), experience: legacy.player?.experience ?? createExperienceState(), reputation: legacy.player?.reputation ?? createReputationState(), interfacePreferences: { ...template.player.interfacePreferences, ...(legacy.player?.interfacePreferences ?? {}) } },
+      information: legacy.information ?? createInformationState((legacy.countries ?? template.countries).map((country) => country.id)),
+      acquisitionVehicles: [],
       baselineReference: template.baselineReference,
       companies: (legacy.companies ?? template.companies).map((company) => ({ ...company, globalInputConstraintBps: company.globalInputConstraintBps ?? 10_000 })),
       history: {
@@ -144,8 +283,10 @@ export function migrateWorldState(raw: unknown): WorldState {
   const world = {
     ...template,
     ...legacy,
-    schemaVersion: 14 as const,
-    saveVersion: 14 as const,
+    schemaVersion: 16 as const,
+    saveVersion: 16 as const,
+    initializationComplete: false,
+    acquisitionVehicles: [],
     goods: template.goods.map((good) => ({ ...good, ...(legacy.goods?.find((item) => item.id === good.id) ?? {}), essential: good.essential })),
     countries: template.countries.map((base) => ({ ...base, ...(legacy.countries?.find((item) => item.id === base.id) ?? {}) })),
     cities: template.cities.map((base) => ({ ...base, ...(legacy.cities?.find((item) => item.id === base.id) ?? {}) })),
@@ -169,7 +310,8 @@ export function migrateWorldState(raw: unknown): WorldState {
     brokers: template.brokers.map((base) => ({ ...base, ...(legacy.brokers?.find((item) => item.id === base.id) ?? {}), supportedCurrencyIds: base.supportedCurrencyIds, marginAvailable: base.marginAvailable })),
     bankFunding: legacy.bankFunding ?? [],
     occupations: legacy.occupations ?? template.occupations,
-    player: { ...template.player, ...(legacy.player ?? {}) },
+    player: { ...template.player, ...(legacy.player ?? {}), experience: legacy.player?.experience ?? createExperienceState(), reputation: legacy.player?.reputation ?? createReputationState(), interfacePreferences: { ...template.player.interfacePreferences, ...(legacy.player?.interfacePreferences ?? {}) } },
+    information: legacy.information ?? createInformationState((legacy.countries ?? template.countries).map((country) => country.id)),
     nextFundingId: legacy.nextFundingId ?? 1,
     derivativeContracts: [],
     optionMarketSeries: [],
@@ -189,14 +331,17 @@ export function migrateWorldState(raw: unknown): WorldState {
     depositInsuranceSchemes: [],
     countryMacroStates: [],
     macroHistory: [],
-    nextDerivativeId: 1,
-    nextDerivativeMarginCallId: 1,
-    nextNettingSetId: 1,
-    nextClearingPositionId: 1,
-    nextSovereignBondId: 1,
-    nextSovereignHoldingId: 1,
-    nextSovereignAuctionId: 1,
-    nextMonetaryDecisionId: 1,
+    // Сброшенные подсистемы начинают с пустого состояния, но идентификаторы
+    // продолжаются после legacy-счётчиков. Иначе новые бумаги переиспользуют
+    // идентификаторы старых ledger-счетов с другой валютой.
+    nextDerivativeId: legacy.nextDerivativeId ?? 1,
+    nextDerivativeMarginCallId: legacy.nextDerivativeMarginCallId ?? 1,
+    nextNettingSetId: legacy.nextNettingSetId ?? 1,
+    nextClearingPositionId: legacy.nextClearingPositionId ?? 1,
+    nextSovereignBondId: legacy.nextSovereignBondId ?? 1,
+    nextSovereignHoldingId: legacy.nextSovereignHoldingId ?? 1,
+    nextSovereignAuctionId: legacy.nextSovereignAuctionId ?? 1,
+    nextMonetaryDecisionId: legacy.nextMonetaryDecisionId ?? 1,
   } as WorldState;
   world.diagnostics = { ...template.diagnostics, ...(legacy.diagnostics ?? {}) };
   world.history = { ...template.history, ...(legacy.history ?? {}), policy: { ...template.history.policy, ...(legacy.history?.policy ?? {}) } };
@@ -270,6 +415,8 @@ export function migrateWorldState(raw: unknown): WorldState {
     for (const company of world.companies) ownerCurrency.set(company.id, currencyForCountry(company.headquartersCountryId));
     for (const cohort of world.populationCohorts) ownerCurrency.set(cohort.id, currencyForCountry(cohort.countryId));
     for (const cohort of world.firmCohorts) ownerCurrency.set(cohort.id, currencyForCountry(cohort.countryId));
+    for (const cohort of world.sovereignHolderCohorts) ownerCurrency.set(cohort.id, currencyForCountry(cohort.countryId));
+    for (const insurer of world.insurers) ownerCurrency.set(insurer.id, insurer.currencyId);
     for (const university of world.universities) ownerCurrency.set(university.id, currencyForCountry(world.cities.find((city) => city.id === university.cityId)?.countryId ?? "ru"));
     for (const broker of world.brokers) ownerCurrency.set(broker.id, world.banks.find((bank) => bank.id === broker.bankId)?.baseCurrency ?? "RUB");
     for (const exchange of world.exchanges) ownerCurrency.set(exchange.id, world.banks.find((bank) => bank.id === exchange.bankId)?.baseCurrency ?? "RUB");
@@ -278,10 +425,21 @@ export function migrateWorldState(raw: unknown): WorldState {
       ownerCurrency.set(manager.ownerId, currencyForCountry(manager.countryId));
     }
     for (const fund of world.funds) ownerCurrency.set(fund.id, fund.currencyId);
+    for (const account of world.bankAccounts) {
+      if (account.ownerId.startsWith("sovereign-coupon-clearing:")) ownerCurrency.set(account.ownerId, account.currencyId);
+    }
     for (const scheme of legacy.depositInsuranceSchemes ?? []) ownerCurrency.set(scheme.id, scheme.currencyId);
     for (const ccp of legacy.clearingHouses ?? []) ownerCurrency.set(ccp.id, ccp.currencyId);
     for (const account of Object.values(world.ledger.accounts)) {
       if (!account.id.endsWith(":legacy-v4")) account.currency = ownerCurrency.get(account.ownerId) ?? account.currency;
+    }
+    // У части финансовых счетов валюта является последним сегментом id
+    // (например, sovereign-loss:EUR). Она точнее базовой валюты владельца:
+    // один владелец вправе держать позиции сразу в нескольких валютах.
+    const knownCurrencies = new Set(world.currencies.map((currency) => currency.id));
+    for (const account of Object.values(world.ledger.accounts)) {
+      const encodedCurrency = account.id.split(":").at(-1);
+      if (!account.id.endsWith(":legacy-v4") && encodedCurrency && knownCurrencies.has(encodedCurrency)) account.currency = encodedCurrency;
     }
     world.bankAccounts = structuredClone(template.bankAccounts);
     for (const account of world.bankAccounts) {
@@ -340,8 +498,20 @@ export function migrateWorldState(raw: unknown): WorldState {
     }
     if (!world.ledger.accounts[accountIds.productiveCapital(company.id)] && company.productiveCapital.bookValueCents > 0) seedNonCashAsset(world, company.id, accountIds.productiveCapital(company.id), "Производственный капитал", company.productiveCapital.bookValueCents);
   }
+  // Повторяем нормализацию после восстановления банковских и корпоративных
+  // счетов: некоторые старые снимки содержат валютные счета с корректным id,
+  // но с унаследованным значением RUB в метаданных.
+  const currencyIds = new Set(world.currencies.map((currency) => currency.id));
+  for (const account of Object.values(world.ledger.accounts)) {
+    const encodedCurrency = account.id.split(":").at(-1);
+    if (!account.id.endsWith(":legacy-v4") && encodedCurrency && currencyIds.has(encodedCurrency)) account.currency = encodedCurrency;
+  }
   seedMacroeconomics(world);
   seedClearingHouses(world);
   seedDerivativeMarkets(world);
+  seedEconomicMarketsCompletion(world);
+  migrateLegacyPeAcquisitionVehicles(world);
+  inferProgressionFromWorld(world);
+  world.initializationComplete = true;
   return world;
 }

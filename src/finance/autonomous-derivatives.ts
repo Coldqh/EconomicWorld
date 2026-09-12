@@ -119,12 +119,64 @@ function createBankAlmHedges(world: WorldState): number {
     const contract = mismatch > 0
       ? createInterestRateSwap(world, bank.id, counterparty.id, area.id, notional, reference, 24)
       : createInterestRateSwap(world, counterparty.id, bank.id, area.id, notional, reference, 24);
-    if (attachDecision(contract, {
+    const attached = attachDecision(contract, {
       motive: "RATE_HEDGE", initiatedById: bank.id, strategyProfileId: "BANK_ALM", targetExposureMinor: Math.abs(mismatch), expectedBenefitMinor: Math.round(notional * 90 / 10_000), expectedCostMinor: Math.round(notional * 12 / 10_000), hedgeRatioBps: 2_500,
       decisionInputs: { loanBookMinor: loanBook, depositFundingMinor: deposits, mismatchMinor: mismatch, floatingReferenceRateBps: reference },
-    }, world)) created += 1;
+    }, world);
+    if (attached) { created += 1; const state = world.bankAlmStates.find((item) => item.bankId === bank.id); if (state && !state.hedgeContractIds.includes(attached.id)) state.hedgeContractIds.push(attached.id); }
+  }
+  for (const bank of world.banks) {
+    const state = world.bankAlmStates.find((item) => item.bankId === bank.id);
+    if (!state) continue;
+    const exposure = Object.keys({ ...state.assetsByCurrency, ...state.liabilitiesByCurrency })
+      .filter((currency) => currency !== bank.baseCurrency)
+      .map((currency) => ({ currency, netMinor: (state.assetsByCurrency[currency] ?? 0) - (state.liabilitiesByCurrency[currency] ?? 0) }))
+      .filter((item) => Math.abs(item.netMinor) >= INSTITUTION_STRATEGY_PROFILES.BANK_ALM.minimumExposureMinor)
+      .sort((left, right) => Math.abs(right.netMinor) - Math.abs(left.netMinor))[0];
+    if (!exposure) continue;
+    const pair = pairFor(world, exposure.currency, bank.baseCurrency);
+    const dealer = world.fxDealers[0];
+    if (!pair || !dealer || activeDecision(world, bank.id, "FX_HEDGE", pair.id)) continue;
+    const targetForeign = Math.floor(Math.abs(exposure.netMinor) * INSTITUTION_STRATEGY_PROFILES.BANK_ALM.hedgeRatioBps / 10_000);
+    const baseAmount = pair.baseCurrencyId === exposure.currency ? targetForeign : convertMinor(world, targetForeign, exposure.currency, pair.baseCurrencyId) ?? 0;
+    if (baseAmount <= 0) continue;
+    const bankSellsBase = exposure.netMinor > 0 && pair.baseCurrencyId === exposure.currency || exposure.netMinor < 0 && pair.baseCurrencyId === bank.baseCurrency;
+    const contract = createForward(world, bankSellsBase ? dealer.id : bank.id, bankSellsBase ? bank.id : dealer.id, { kind: "currency-pair", pairId: pair.id }, baseAmount, pair.lastRatePpm, 6, "physical");
+    const attached = attachDecision(contract, { motive: "FX_HEDGE", initiatedById: bank.id, strategyProfileId: "BANK_ALM", targetExposureMinor: Math.abs(exposure.netMinor), expectedBenefitMinor: Math.round(targetForeign * 160 / 10_000), expectedCostMinor: Math.max(1, Math.round(targetForeign * pair.spreadBps / 10_000)), hedgeRatioBps: INSTITUTION_STRATEGY_PROFILES.BANK_ALM.hedgeRatioBps, decisionInputs: { foreignCurrencyId: exposure.currency, reportingCurrencyId: bank.baseCurrency, netForeignExposureMinor: exposure.netMinor, pairId: pair.id } }, world);
+    if (attached) { created += 1; state.hedgeContractIds.push(attached.id); }
   }
   return created;
+}
+
+export function runOptionDealerHedges(world: WorldState): number {
+  let submitted = 0;
+  const exposures = new Map<string, { writerId: string; securityId: string; targetShares: number }>();
+  for (const contract of world.derivativeContracts.filter((item): item is Extract<DerivativeContract, { type: "option" }> => item.type === "option" && item.status === "active")) {
+    const series = world.optionMarketSeries.find((item) => item.id === contract.seriesId);
+    const listing = series && world.listings.find((item) => item.securityId === series.underlyingSecurityId);
+    if (!series || !listing) continue;
+    const callDeltaBps = listing.lastPriceCents > series.strikeMinor * 1.05 ? 7_500 : listing.lastPriceCents < series.strikeMinor * 0.95 ? 2_500 : 5_000;
+    const deltaBps = series.optionType === "call" ? callDeltaBps : callDeltaBps - 10_000;
+    const key = `${contract.writerId}:${series.underlyingSecurityId}`;
+    const prior = exposures.get(key) ?? { writerId: contract.writerId, securityId: series.underlyingSecurityId, targetShares: 0 };
+    prior.targetShares += Math.round(contract.quantity * contract.contractMultiplier * deltaBps / 10_000);
+    exposures.set(key, prior);
+  }
+  for (const exposure of exposures.values()) {
+    if (Math.abs(exposure.targetShares) < 25) continue;
+    openBrokerageAccount(world, exposure.writerId);
+    const listing = world.listings.find((item) => item.securityId === exposure.securityId);
+    const account = world.brokerageAccounts.find((item) => item.ownerId === exposure.writerId && item.currencyId === listing?.currencyId && item.status === "active");
+    if (!listing || !account) continue;
+    const currentShares = world.equityHoldings.find((item) => item.ownerId === exposure.writerId && item.securityId === exposure.securityId)?.shares ?? 0;
+    const pending = world.marketOrders.filter((item) => item.brokerageAccountId === account.id && item.securityId === exposure.securityId && (item.status === "open" || item.status === "partially-filled")).reduce((sum, item) => sum + (item.side === "buy" ? item.remainingQuantity : -item.remainingQuantity), 0);
+    const adjustment = exposure.targetShares - currentShares - pending;
+    const quantity = adjustment > 0 ? adjustment : Math.min(Math.abs(adjustment), currentShares);
+    if (quantity <= 0) continue;
+    const result = placeOrder(world, account.id, exposure.securityId, adjustment > 0 ? "buy" : "sell", "limit", quantity, listing.lastPriceCents, listing.exchangeId);
+    if (result.orderId) submitted += 1;
+  }
+  return submitted;
 }
 
 function createFundEquityHedges(world: WorldState, fund: Fund): number {
@@ -216,5 +268,6 @@ export function runAutonomousDerivativeDecisions(world: WorldState): number {
     created += createCoveredCall(world, fund);
     created += createTrsExposure(world, fund);
   }
+  created += runOptionDealerHedges(world);
   return created;
 }

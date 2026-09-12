@@ -1,0 +1,10 @@
+{
+  "scenario": "peace50",
+  "run": 3,
+  "warmup": false,
+  "completedMonths": 600,
+  "totalMonths": 600,
+  "elapsedMs": 124163,
+  "timestamp": "2026-08-27T21:01:57.706Z",
+  "commitOrDiffId": "working-tree:0.16.6"
+}

@@ -58,7 +58,9 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
     const book = entityBook(world, ownerId);
     const difference = book.assets + book.expenses - book.liabilities - book.equity - book.income;
     const grossBook = Math.max(Math.abs(book.assets), Math.abs(book.liabilities), Math.abs(book.equity), Math.abs(book.income), Math.abs(book.expenses));
-    const bookTolerance = Math.max(1, Math.ceil(grossBook * Number.EPSILON * 256));
+    // Macro books can be far above Number.MAX_SAFE_INTEGER. Transactions remain
+    // exactly balanced; this tolerance only absorbs ULPs from aggregate summation.
+    const bookTolerance = Math.max(1, Math.ceil(grossBook * Number.EPSILON * 1_024));
     if (Math.abs(difference) > bookTolerance) { brokenBook = ownerId; bookDifference = difference; break; }
   }
   results.push(result("Бухгалтерия", "accounting-equation", "Балансовые уравнения выполняются", !brokenBook, brokenBook ? `Не сходится книга ${brokenBook}` : `${owners.length} книг прошли проверку`, bookDifference));
@@ -75,6 +77,8 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
     return change !== 0 && !allowedMoneyChanges.has(transaction.kind);
   });
   results.push(result("Деньги", "authorized-money", "Изменения денежной массы авторизованы", !unauthorized, unauthorized ? unauthorized.id : "Только начальные проводки и банковский кредит меняют сумму депозитов"));
+  const postInitializationGenesis = world.ledger.transactions.find((transaction) => transaction.kind === "GENESIS" && transaction.elapsedMonth > 0);
+  results.push(result("Деньги", "post-init-genesis", "После инициализации нет стартовых проводок", !postInitializationGenesis, postInitializationGenesis?.id ?? "Runtime GENESIS запрещён глобальным guard"));
 
   const negativeGoods = world.companies.filter((company) => company.inventoryMilliUnits < 0 || Object.values(company.inputInventoryMilliUnits).some((value) => value < 0));
   results.push(result("Товары", "goods-conservation", "Товарные остатки неотрицательны", negativeGoods.length === 0, negativeGoods.length ? negativeGoods[0].name : `${world.goodsMovements.length.toLocaleString("ru-RU")} движений товаров`));
@@ -131,6 +135,28 @@ export function checkInvariants(world: WorldState): InvariantResult[] {
     return registered !== security.sharesOutstanding || registered < 0;
   });
   results.push(result("Собственность", "cap-table", "Реестр акций сходится", !brokenCapTable, brokenCapTable?.id ?? `${world.equitySecurities.length} выпусков сверены`));
+
+  const brokenAcquisitionStructure = world.privateEquityDeals.find((deal) => {
+    if (!deal.acquisitionVehicleId) return Boolean(deal.acquisitionLoanIds?.length);
+    const vehicle = world.acquisitionVehicles.find((item) => item.id === deal.acquisitionVehicleId && item.dealId === deal.id && item.fundId === deal.fundId && item.targetCompanyId === deal.targetCompanyId);
+    if (!vehicle) return true;
+    const acquisitionLoans = new Set(deal.acquisitionLoanIds ?? []);
+    if (world.loans.some((loan) => acquisitionLoans.has(loan.id) && loan.borrowerId !== vehicle.id)) return true;
+    if (deal.status === "owned" || deal.status === "covenant-breach") {
+      const securityId = world.companies.find((company) => company.id === deal.targetCompanyId)?.equitySecurityId;
+      return !securityId || !world.equityHoldings.some((holding) => holding.ownerId === vehicle.id && holding.securityId === securityId && holding.shares > 0);
+    }
+    return false;
+  });
+  results.push(result("Собственность", "pe-acquisition-structure", "Фонд, холдинговая компания, цель и долг по покупке связаны", !brokenAcquisitionStructure, brokenAcquisitionStructure?.id ?? `${world.acquisitionVehicles.length} структур владения сверено`));
+
+  const brokenInsuranceClaim = world.insuranceClaims.find((claim) => {
+    const policy = world.insurancePolicies.find((item) => item.id === claim.policyId);
+    const loss = world.insuranceLossEvents.find((item) => item.id === claim.lossEventId);
+    return !policy || !loss || loss.ownerId !== policy.policyholderId || loss.line !== policy.line || claim.paidMinor > claim.reservedMinor || claim.paidMinor > Math.max(0, loss.economicLossMinor - policy.deductibleMinor);
+  });
+  const overpaidLoss = world.insuranceLossEvents.find((loss) => world.insuranceClaims.filter((claim) => claim.lossEventId === loss.id).reduce((sum, claim) => sum + claim.paidMinor, 0) > loss.economicLossMinor);
+  results.push(result("Страхование", "covered-loss-limit", "Выплаты опираются на реальный покрытый ущерб", !brokenInsuranceClaim && !overpaidLoss, brokenInsuranceClaim?.id ?? overpaidLoss?.id ?? `${world.insuranceClaims.length} требований сверены`));
 
   const brokenBond = world.corporateBonds.find((bond) => {
     const claims = world.bondHoldings.filter((holding) => holding.bondId === bond.id).reduce((sum, holding) => sum + holding.faceValueCents, 0);

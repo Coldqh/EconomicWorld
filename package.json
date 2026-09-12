@@ -1,6 +1,6 @@
 {
   "name": "economic-world",
-  "version": "0.12.8",
+  "version": "0.17.0",
   "private": true,
   "description": "Детерминированная экономическая симуляция с двойной бухгалтерией",
   "type": "module",
@@ -12,9 +12,15 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "test": "node --experimental-strip-types --test tests/simulation.test.ts",
+    "test:patch-16-6": "node --experimental-strip-types --test tests/patch-16-5.test.ts tests/patch-16-6.test.ts tests/patch-16-6-completion.test.ts tests/patch-16-6-integrity.test.ts tests/patch-16-6-performance.test.ts",
+    "test:phase-17": "node --experimental-strip-types --test tests/phase-17.test.ts",
+    "benchmark:phase-17": "node --expose-gc --experimental-strip-types tests/phase-17-benchmark.ts",
+    "benchmark:patch-16-6": "node --expose-gc --experimental-strip-types tests/patch-16-6-benchmark.ts",
     "benchmark:20y": "node --experimental-strip-types tests/long-run-benchmark.ts",
     "benchmark:reconciliation": "node --experimental-strip-types tests/reconciliation-benchmark.ts",
-    "lint": "eslint src tests vite.config.ts"
+    "lint": "eslint src tests vite.config.ts",
+    "test:integrity": "node --experimental-strip-types --test tests/patch-16-6-integrity.test.ts",
+    "audit:patch-16-6": "node --experimental-strip-types tests/patch-16-6-final-audit.ts"
   },
   "dependencies": {
     "react": "19.2.6",

@@ -166,6 +166,7 @@ const IMPORTANT_LEDGER_KINDS = new Set<TransactionKind>([
   "ACQUISITION", "IPO", "LOAN_DEFAULT", "BANKRUPTCY_DISTRIBUTION", "PRIME_BROKER_LOSS", "DERIVATIVE_DEFAULT",
   "SOVEREIGN_RESTRUCTURE", "DEPOSIT_INSURANCE", "CENTRAL_BANK_FACILITY",
 ]);
+const ledgerOwnerGroupCaches = new WeakMap<WorldState, Map<string, string>>();
 
 function stableHash(value: string): string {
   let hash = 2_166_136_261;
@@ -174,14 +175,20 @@ function stableHash(value: string): string {
 }
 
 function ledgerOwnerGroup(world: WorldState, accountId: string): string {
+  let cache = ledgerOwnerGroupCaches.get(world);
+  if (!cache) { cache = new Map(); ledgerOwnerGroupCaches.set(world, cache); }
+  const cached = cache.get(accountId);
+  if (cached) return cached;
   const ownerId = world.ledger.accounts[accountId]?.ownerId ?? "unknown";
-  if (ownerId === world.player.householdId || ownerId === world.player.personId) return "player";
-  if (ownerId.startsWith("bank-") || ownerId.startsWith("central-bank-") || ownerId.startsWith("monetary-authority-")) return "banking";
-  if (ownerId.startsWith("government-") || ownerId.startsWith("deposit-insurance-")) return "government";
-  if (ownerId.startsWith("company-")) return "companies";
-  if (ownerId.startsWith("fund-") || ownerId.startsWith("asset-manager-") || ownerId.startsWith("broker-")) return "institutional-finance";
-  if (ownerId.startsWith("population-") || ownerId.startsWith("household-")) return "households";
-  return "other";
+  const group = ownerId === world.player.householdId || ownerId === world.player.personId ? "player"
+    : ownerId.startsWith("bank-") || ownerId.startsWith("central-bank-") || ownerId.startsWith("monetary-authority-") ? "banking"
+    : ownerId.startsWith("government-") || ownerId.startsWith("deposit-insurance-") ? "government"
+    : ownerId.startsWith("company-") ? "companies"
+    : ownerId.startsWith("fund-") || ownerId.startsWith("asset-manager-") || ownerId.startsWith("broker-") ? "institutional-finance"
+    : ownerId.startsWith("population-") || ownerId.startsWith("household-") ? "households"
+    : "other";
+  if (ownerId !== "unknown") cache.set(accountId, group);
+  return group;
 }
 
 function isPlayerTransaction(world: WorldState, transaction: LedgerTransaction): boolean {
@@ -231,12 +238,16 @@ function compactTransactions(world: WorldState, transactions: readonly LedgerTra
 
 function collapseOldLedgerRecords(world: WorldState): void {
   const cutoff = world.clock.elapsedMonths - world.history.policy.detailedArchiveMonths;
-  const recent = world.history.compactedLedgerRecords.filter((record) => record.fromMonth >= cutoff);
+  const recent: typeof world.history.compactedLedgerRecords = [];
   const annual = new Map<string, (typeof world.history.compactedLedgerRecords)[number]>();
-  for (const record of world.history.compactedLedgerRecords.filter((item) => item.fromMonth < cutoff)) {
+  for (const record of world.history.compactedLedgerRecords) {
+    if (record.fromMonth >= cutoff) { recent.push(record); continue; }
     const fromMonth = Math.floor(record.fromMonth / 12) * 12;
-    const key = `${fromMonth}|${record.category}|${record.currencyId}|${record.sourceAccountGroup}|${record.destinationAccountGroup}`;
-    const aggregate = annual.get(key) ?? { ...record, id: `ledger-annual-${stableHash(key)}`, fromMonth, toMonth: fromMonth + 11, totalDebitMinor: 0, totalCreditMinor: 0, transactionCount: 0, accountGroupNetFlows: {}, checksum: "" };
+    // Annual history retains category, currency and net flows by owner group.
+    // Keeping a separate record for every source→destination pair multiplied the
+    // long-run save without adding information beyond accountGroupNetFlows.
+    const key = `${fromMonth}|${record.category}|${record.currencyId}`;
+    const aggregate = annual.get(key) ?? { ...record, id: `ledger-annual-${stableHash(key)}`, fromMonth, toMonth: fromMonth + 11, sourceAccountGroup: "aggregate", destinationAccountGroup: "aggregate", totalDebitMinor: 0, totalCreditMinor: 0, transactionCount: 0, accountGroupNetFlows: {}, checksum: "" };
     aggregate.totalDebitMinor += record.totalDebitMinor;
     aggregate.totalCreditMinor += record.totalCreditMinor;
     aggregate.transactionCount += record.transactionCount;
@@ -271,13 +282,16 @@ function compactAnalyticalHistory(world: WorldState): void {
 
 function compactCompanyHistory(world: WorldState): void {
   const cutoff = world.clock.elapsedMonths - world.history.policy.companyReportMonths;
+  const existingAnnual = new Set(world.history.companyAnnualRecords.map((record) => `${record.companyId}\u0000${record.year}`));
   for (const company of world.companies) {
     const old = company.financialReports.filter((report) => report.elapsedMonth < cutoff);
     const byYear = new Map<number, typeof old>();
     for (const report of old) (byYear.get(report.year) ?? (byYear.set(report.year, []), byYear.get(report.year)!)).push(report);
     for (const [year, reports] of byYear) {
-      if (world.history.companyAnnualRecords.some((record) => record.companyId === company.id && record.year === year)) continue;
+      const key = `${company.id}\u0000${year}`;
+      if (existingAnnual.has(key)) continue;
       world.history.companyAnnualRecords.push({ companyId: company.id, year, revenueMinor: reports.reduce((sum, item) => sum + item.revenueCents, 0), netIncomeMinor: reports.reduce((sum, item) => sum + item.netIncomeCents, 0), assetsMinor: reports.at(-1)?.assetsCents ?? 0, liabilitiesMinor: reports.at(-1)?.liabilitiesCents ?? 0, equityMinor: reports.at(-1)?.equityCents ?? 0 });
+      existingAnnual.add(key);
     }
     company.financialReports = company.financialReports.filter((report) => report.elapsedMonth >= cutoff);
   }
@@ -285,19 +299,124 @@ function compactCompanyHistory(world: WorldState): void {
 
 function compactMarketHistory(world: WorldState): void {
   const cutoff = world.clock.elapsedMonths - world.history.policy.marketDetailMonths;
-  const oldTrades = world.marketTrades.filter((trade) => trade.elapsedMonth < cutoff);
-  const oldOrders = world.archivedMarketOrders.filter((order) => order.placedAtMonth < cutoff);
-  const keys = new Set([...oldTrades.map((trade) => `${trade.elapsedMonth}|${trade.securityId}`), ...oldOrders.map((order) => `${order.placedAtMonth}|${order.securityId}`)]);
-  for (const key of keys) {
-    const [monthText, securityId] = key.split("|");
-    const month = Number(monthText);
-    const trades = oldTrades.filter((trade) => trade.elapsedMonth === month && trade.securityId === securityId);
-    world.history.compactedMarketRecords.push({ elapsedMonth: month, securityId, orderCount: oldOrders.filter((order) => order.placedAtMonth === month && order.securityId === securityId).length, tradeCount: trades.length, volume: trades.reduce((sum, trade) => sum + trade.quantity, 0), turnoverMinor: trades.reduce((sum, trade) => sum + trade.quantity * trade.priceCents, 0) });
+  const retainedTrades: typeof world.marketTrades = [];
+  const retainedTradeOrderIds = new Set<string>();
+  const grouped = new Map<string, (typeof world.history.compactedMarketRecords)[number]>();
+  for (const trade of world.marketTrades) {
+    if (trade.elapsedMonth >= cutoff) {
+      retainedTrades.push(trade);
+      retainedTradeOrderIds.add(trade.buyOrderId);
+      retainedTradeOrderIds.add(trade.sellOrderId);
+      continue;
+    }
+    const key = `${trade.elapsedMonth}|${trade.securityId}`;
+    const record = grouped.get(key) ?? { elapsedMonth: trade.elapsedMonth, securityId: trade.securityId, orderCount: 0, tradeCount: 0, volume: 0, turnoverMinor: 0 };
+    record.tradeCount += 1;
+    record.volume += trade.quantity;
+    record.turnoverMinor += trade.quantity * trade.priceCents;
+    grouped.set(key, record);
   }
-  world.marketTrades = world.marketTrades.filter((trade) => trade.elapsedMonth >= cutoff);
-  world.archivedMarketOrders = world.archivedMarketOrders.filter((order) => order.placedAtMonth >= cutoff);
+  const retainedOrders: typeof world.archivedMarketOrders = [];
+  for (const order of world.archivedMarketOrders) {
+    if (order.placedAtMonth >= cutoff || retainedTradeOrderIds.has(order.id)) { retainedOrders.push(order); continue; }
+    const key = `${order.placedAtMonth}|${order.securityId}`;
+    const record = grouped.get(key) ?? { elapsedMonth: order.placedAtMonth, securityId: order.securityId, orderCount: 0, tradeCount: 0, volume: 0, turnoverMinor: 0 };
+    record.orderCount += 1;
+    grouped.set(key, record);
+  }
+  world.history.compactedMarketRecords.push(...grouped.values());
+  world.marketTrades = retainedTrades;
+  world.archivedMarketOrders = retainedOrders;
+  const annualCutoff = world.clock.elapsedMonths - 24;
+  const annual = new Map<string, (typeof world.history.compactedMarketRecords)[number]>();
+  const recentRecords: typeof world.history.compactedMarketRecords = [];
+  for (const record of world.history.compactedMarketRecords) {
+    if (record.elapsedMonth >= annualCutoff) { recentRecords.push(record); continue; }
+    const yearMonth = Math.floor(record.elapsedMonth / 12) * 12;
+    const key = `${yearMonth}|${record.securityId}`;
+    const aggregate = annual.get(key) ?? { ...record, elapsedMonth: yearMonth, orderCount: 0, tradeCount: 0, volume: 0, turnoverMinor: 0 };
+    aggregate.orderCount += record.orderCount;
+    aggregate.tradeCount += record.tradeCount;
+    aggregate.volume += record.volume;
+    aggregate.turnoverMinor += record.turnoverMinor;
+    annual.set(key, aggregate);
+  }
+  world.history.compactedMarketRecords = [...annual.values(), ...recentRecords];
+  // OHLCV is authoritative market history but old monthly candles are not
+  // needed by pricing/risk hot paths (they use a bounded recent window). Keep
+  // two years monthly and fold older candles into deterministic annual bars.
+  const monthlyBarCutoff = world.clock.elapsedMonths - 24;
+  const recentBars: typeof world.ohlcvBars = [];
+  const annualBars = new Map<string, typeof world.ohlcvBars[number]>();
+  const annualLastMonth = new Map<string, number>();
+  for (const bar of world.ohlcvBars) {
+    if (bar.elapsedMonth >= monthlyBarCutoff) { recentBars.push(bar); continue; }
+    const yearMonth = Math.floor(bar.elapsedMonth / 12) * 12;
+    const key = `${yearMonth}|${bar.securityId}`;
+    const aggregate = annualBars.get(key);
+    if (!aggregate) {
+      annualBars.set(key, { ...bar, elapsedMonth: yearMonth });
+      annualLastMonth.set(key, bar.elapsedMonth);
+      continue;
+    }
+    aggregate.highCents = Math.max(aggregate.highCents, bar.highCents);
+    aggregate.lowCents = Math.min(aggregate.lowCents, bar.lowCents);
+    aggregate.volume += bar.volume;
+    if (bar.elapsedMonth >= (annualLastMonth.get(key) ?? yearMonth)) {
+      aggregate.closeCents = bar.closeCents;
+      annualLastMonth.set(key, bar.elapsedMonth);
+    }
+  }
+  world.ohlcvBars = [...annualBars.values(), ...recentBars];
   world.fxTrades = world.fxTrades.filter((trade) => trade.elapsedMonth >= cutoff);
   world.optionMarketSeries = world.optionMarketSeries.filter((series) => series.expirationMonth >= world.clock.elapsedMonths || series.openInterest > 0);
+
+  // PATCH 16.6 creates a large amount of decision-time market evidence. Keep
+  // settlement records and compact results, but do not serialize every stale
+  // quote, rejected offer, losing bid or already-paid redemption forever.
+  const detailedOrderIds = new Set([
+    ...world.marketOrders.map((order) => order.id),
+    ...world.archivedMarketOrders.map((order) => order.id),
+  ]);
+  world.executionQuality = world.executionQuality.filter((quality) => detailedOrderIds.has(quality.orderId));
+
+  for (const offer of world.creditOffers) {
+    if (offer.status === "offered" && offer.createdAtMonth < cutoff) offer.status = "expired";
+  }
+  world.creditOffers = world.creditOffers.filter((offer) => offer.createdAtMonth >= cutoff || offer.status === "accepted");
+  world.arbitrageRecords = world.arbitrageRecords.filter((record) => record.elapsedMonth >= cutoff);
+  world.etfArbitrageEvents = world.etfArbitrageEvents.filter((event) => event.elapsedMonth >= cutoff);
+  world.fundRedemptionRequests = world.fundRedemptionRequests.filter((request) =>
+    request.status === "requested" || request.status === "liquidating" || request.requestedAtMonth >= cutoff,
+  );
+  world.fundPerformanceHistory = world.fundPerformanceHistory.filter((point) => point.elapsedMonth >= world.clock.elapsedMonths - 120);
+
+  const oldAuctions = world.economicAuctions.filter((auction) => auction.status !== "open" && auction.closesAtMonth < cutoff);
+  const compactedAuctionIds = new Set(world.history.compactedAuctionRecords.map((record) => record.id));
+  for (const auction of oldAuctions) {
+    if (compactedAuctionIds.has(auction.id)) continue;
+    world.history.compactedAuctionRecords.push({
+      id: auction.id,
+      objectType: auction.objectType,
+      objectId: auction.objectId,
+      mechanism: auction.mechanism,
+      status: auction.status === "settled" ? "settled" : "failed",
+      openedAtMonth: auction.openedAtMonth,
+      closedAtMonth: auction.closesAtMonth,
+      reserveMinor: auction.reserveMinor,
+      offeredQuantity: auction.quantity,
+      allocatedQuantity: auction.allocations.reduce((sum, allocation) => sum + allocation.quantity, 0),
+      proceedsMinor: auction.allocations.reduce((sum, allocation) => sum + allocation.quantity * allocation.clearingPriceMinor, 0),
+      winnerCount: new Set(auction.allocations.map((allocation) => allocation.bidderId)).size,
+    });
+  }
+  const oldAuctionIds = new Set(oldAuctions.map((auction) => auction.id));
+  world.economicAuctions = world.economicAuctions.filter((auction) => !oldAuctionIds.has(auction.id));
+
+  const claimedPolicyIds = new Set(world.insuranceClaims.map((claim) => claim.policyId));
+  world.insurancePolicies = world.insurancePolicies.filter((policy) =>
+    policy.status === "active" || policy.expiryMonth >= cutoff || claimedPolicyIds.has(policy.id),
+  );
 }
 
 function compactDerivativeHistory(world: WorldState): void {
@@ -310,27 +429,57 @@ function compactDerivativeHistory(world: WorldState): void {
   });
   const ids = new Set(removable.map((contract) => contract.id));
   world.derivativeContracts = world.derivativeContracts.filter((contract) => !ids.has(contract.id));
-  world.nettingSets = world.nettingSets.filter((set) => set.contractIds.some((id) => world.derivativeContracts.some((contract) => contract.id === id)));
+  const activeContractIds = new Set(world.derivativeContracts.map((contract) => contract.id));
+  world.nettingSets = world.nettingSets.filter((set) => set.contractIds.some((id) => activeContractIds.has(id)));
 }
 
 function compactEvents(world: WorldState): void {
-  const cutoff = world.clock.elapsedMonths - (world.baselineReference.mode === "REAL_WORLD" ? 12 : 24);
-  const old = world.events.filter((event) => event.elapsedMonth < cutoff && !event.actorIds.includes(world.player.householdId));
+  // HOT keeps four detailed months in the large REAL_WORLD simulation. Older
+  // routine UI events move to monthly counts; material events keep their
+  // identity indefinitely so the archive remains auditable.
+  const cutoff = world.clock.elapsedMonths - (world.baselineReference.mode === "REAL_WORLD" ? 4 : 24);
+  const majorEventTypes = new Set<typeof world.events[number]["type"]>([
+    "WorldCreated",
+    "CompanyBankrupt",
+    "CompanyFounded",
+    "AcquisitionClosed",
+    "CompanyListed",
+    "SovereignDefault",
+    "ClearingMemberDefault",
+    "PrimeBrokerLoss",
+    "ForcedLiquidation",
+    "UniversityGraduated",
+    "PropertyPurchased",
+  ]);
   const counts = new Map<string, number>();
-  for (const event of old) counts.set(`${event.elapsedMonth}|${event.type}`, (counts.get(`${event.elapsedMonth}|${event.type}`) ?? 0) + 1);
+  const retained: typeof world.events = [];
+  for (const event of world.events) {
+    if (
+      event.elapsedMonth >= cutoff
+      || event.severity === "critical"
+      || majorEventTypes.has(event.type)
+      || event.actorIds.includes(world.player.householdId)
+      || event.actorIds.includes(world.player.personId)
+    ) { retained.push(event); continue; }
+    counts.set(`${event.elapsedMonth}|${event.type}`, (counts.get(`${event.elapsedMonth}|${event.type}`) ?? 0) + 1);
+  }
   for (const [key, count] of counts) {
     const [month, type] = key.split("|");
-    world.history.compactedEventRecords.push({ elapsedMonth: Number(month), type: type as typeof old[number]["type"], count });
+    world.history.compactedEventRecords.push({ elapsedMonth: Number(month), type: type as typeof world.events[number]["type"], count });
   }
-  const ids = new Set(old.map((event) => event.id));
-  world.events = world.events.filter((event) => !ids.has(event.id));
+  world.events = retained;
 }
 
 export function compactLedgerHistory(world: WorldState): void {
   if (world.clock.elapsedMonths < 12 || world.clock.elapsedMonths % 6 !== 0 || world.history.lastCompactedMonth === world.clock.elapsedMonths) return;
   const cutoff = world.clock.elapsedMonths - world.history.policy.hotLedgerMonths;
   const archived = world.ledger.transactions.filter((transaction) => transaction.elapsedMonth < cutoff);
-  const expiredPlayerDetail = world.history.importantLedgerTransactions.filter((transaction) => !IMPORTANT_LEDGER_KINDS.has(transaction.kind) && transaction.elapsedMonth < world.clock.elapsedMonths - world.history.policy.playerDetailMonths);
+  const expiredPlayerDetail = world.history.importantLedgerTransactions.filter((transaction) => {
+    const retentionMonths = isPlayerTransaction(world, transaction)
+      ? world.history.policy.playerDetailMonths
+      : world.history.policy.detailedArchiveMonths;
+    return transaction.elapsedMonth < world.clock.elapsedMonths - retentionMonths;
+  });
   if (expiredPlayerDetail.length) {
     compactTransactions(world, expiredPlayerDetail);
     const expiredIds = new Set(expiredPlayerDetail.map((transaction) => transaction.id));
@@ -403,7 +552,7 @@ export function updateWorldDiagnostics(world: WorldState): void {
     saveBreakdown.totalBytes = subtotal + saveBreakdown.otherBytes;
   }
   const estimatedSaveBytes = saveBreakdown.totalBytes;
-  const historyRecordCount = world.history.compactedLedgerRecords.length + world.history.importantLedgerTransactions.length + world.history.compactedDerivativeRecords.length + world.history.compactedMarketRecords.length + world.history.companyAnnualRecords.length + world.history.compactedEventRecords.length;
+  const historyRecordCount = world.history.compactedLedgerRecords.length + world.history.importantLedgerTransactions.length + world.history.compactedDerivativeRecords.length + world.history.compactedMarketRecords.length + world.history.compactedAuctionRecords.length + world.history.companyAnnualRecords.length + world.history.compactedEventRecords.length;
   world.diagnostics = {
     populationRepresented: world.populationCohorts.reduce((sum, cohort) => sum + cohort.populationCount, 0) + world.people.length,
     businessesRepresented: world.firmCohorts.reduce((sum, cohort) => sum + cohort.firmCount, 0) + world.companies.filter((company) => company.active).length,

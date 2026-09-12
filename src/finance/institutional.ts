@@ -259,7 +259,7 @@ export function seedInstitutionalFinance(world: WorldState): void {
       if (type === "etf" && fund.unitSecurityId) {
         const exchange = world.exchanges.find((item) => item.countryId === countryId)!;
         const shares = Math.floor(fund.unitsOutstandingMicros / UNIT_MICROS);
-        world.equitySecurities.push({ id: fund.unitSecurityId, companyId: fund.id, className: "Паи ETF", currencyId: fund.currencyId, sharesOutstanding: shares, votesPerShare: 0, status: "listed" });
+        world.equitySecurities.push({ id: fund.unitSecurityId, companyId: fund.id, className: "Паи биржевого фонда", currencyId: fund.currencyId, sharesOutstanding: shares, votesPerShare: 0, status: "listed" });
         world.listings.push({ id: `listing-${fund.id}`, exchangeId: exchange.id, companyId: fund.id, securityId: fund.unitSecurityId, ticker: `${countryId.toUpperCase()}ETF`, currencyId: fund.currencyId, listedAtMonth: 0, lastPriceCents: INITIAL_NAV_PER_UNIT_MINOR, previousCloseCents: INITIAL_NAV_PER_UNIT_MINOR });
         exchange.listedSecurityIds.push(fund.unitSecurityId);
         world.marketIndices.find((index) => index.exchangeId === exchange.id)?.constituentSecurityIds.push(fund.unitSecurityId);

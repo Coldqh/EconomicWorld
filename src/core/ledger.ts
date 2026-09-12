@@ -41,16 +41,20 @@ function bankAccountLookupIndex(world: WorldState): BankAccountLookupIndex {
 // Aggregate ledger queries are comparatively rare. Computing them on demand is
 // cheaper than maintaining three string-key indexes for every transaction leg.
 
-interface LedgerTransactionIndex {
+interface MonthTransactionIndex {
   source: LedgerTransaction[];
   indexedLength: number;
   byMonth: Map<number, LedgerTransaction[]>;
+}
+
+interface LedgerTransactionIndex {
+  source: LedgerTransaction[];
+  indexedLength: number;
   byAccount: Map<string, LedgerTransaction[]>;
-  byCurrency: Map<string, LedgerTransaction[]>;
-  byKind: Map<TransactionKind, LedgerTransaction[]>;
   byEntity: Map<string, LedgerTransaction[]>;
 }
 
+const monthTransactionIndexes = new WeakMap<LedgerState, MonthTransactionIndex>();
 const transactionIndexes = new WeakMap<LedgerState, LedgerTransactionIndex>();
 
 function pushIndexed<T>(map: Map<T, LedgerTransaction[]>, key: T, transaction: LedgerTransaction): void {
@@ -59,25 +63,35 @@ function pushIndexed<T>(map: Map<T, LedgerTransaction[]>, key: T, transaction: L
   map.set(key, values);
 }
 
-function transactionIndex(world: WorldState): LedgerTransactionIndex {
-  let index = transactionIndexes.get(world.ledger);
+function monthTransactionIndex(world: WorldState): MonthTransactionIndex {
+  let index = monthTransactionIndexes.get(world.ledger);
   if (!index || index.source !== world.ledger.transactions) {
-    index = { source: world.ledger.transactions, indexedLength: 0, byMonth: new Map(), byAccount: new Map(), byCurrency: new Map(), byKind: new Map(), byEntity: new Map() };
-    transactionIndexes.set(world.ledger, index);
+    index = { source: world.ledger.transactions, indexedLength: 0, byMonth: new Map() };
+    monthTransactionIndexes.set(world.ledger, index);
   }
   for (let position = index.indexedLength; position < world.ledger.transactions.length; position += 1) {
     const transaction = world.ledger.transactions[position];
     pushIndexed(index.byMonth, transaction.elapsedMonth, transaction);
-    pushIndexed(index.byKind, transaction.kind, transaction);
+  }
+  index.indexedLength = world.ledger.transactions.length;
+  return index;
+}
+
+function transactionIndex(world: WorldState): LedgerTransactionIndex {
+  let index = transactionIndexes.get(world.ledger);
+  if (!index || index.source !== world.ledger.transactions) {
+    index = { source: world.ledger.transactions, indexedLength: 0, byAccount: new Map(), byEntity: new Map() };
+    transactionIndexes.set(world.ledger, index);
+  }
+  for (let position = index.indexedLength; position < world.ledger.transactions.length; position += 1) {
+    const transaction = world.ledger.transactions[position];
     const entryAccountIds = new Set(transaction.entries.map((entry) => entry.accountId));
-    const currencies = new Set<string>();
     const entities = new Set<string>();
     for (const accountId of entryAccountIds) {
       pushIndexed(index.byAccount, accountId, transaction);
       const account = world.ledger.accounts[accountId];
-      if (account) { currencies.add(account.currency); entities.add(account.ownerId); }
+      if (account) entities.add(account.ownerId);
     }
-    for (const currency of currencies) pushIndexed(index.byCurrency, currency, transaction);
     for (const entity of entities) pushIndexed(index.byEntity, entity, transaction);
   }
   index.indexedLength = world.ledger.transactions.length;
@@ -85,11 +99,11 @@ function transactionIndex(world: WorldState): LedgerTransactionIndex {
 }
 
 export function transactionsForMonth(world: WorldState, elapsedMonth: number): readonly LedgerTransaction[] {
-  return transactionIndex(world).byMonth.get(elapsedMonth) ?? [];
+  return monthTransactionIndex(world).byMonth.get(elapsedMonth) ?? [];
 }
 
 export function transactionsSince(world: WorldState, elapsedMonth: number): LedgerTransaction[] {
-  const index = transactionIndex(world);
+  const index = monthTransactionIndex(world);
   const result: LedgerTransaction[] = [];
   for (let month = elapsedMonth; month <= world.clock.elapsedMonths; month += 1) result.push(...(index.byMonth.get(month) ?? []));
   return result;
@@ -130,6 +144,7 @@ export const accountIds = {
   finishedInventory: (ownerId: string) => `${ownerId}:asset:inventory:finished`,
   inputInventory: (ownerId: string, goodId: string) => `${ownerId}:asset:inventory:input:${goodId}`,
   productiveCapital: (ownerId: string) => `${ownerId}:asset:productive-capital`,
+  constructionInProgress: (ownerId: string, projectId: string) => `${ownerId}:asset:cip:${projectId}`,
   property: (ownerId: string, propertyId: string) => `${ownerId}:asset:property:${propertyId}`,
   durable: (ownerId: string, assetId: string) => `${ownerId}:asset:durable:${assetId}`,
   cohortCapital: (ownerId: string) => `${ownerId}:asset:cohort-capital`,
@@ -289,6 +304,9 @@ export function postTransaction(
   entries: LedgerEntry[],
   causeIds: string[] = [],
 ): string {
+  if (kind === "GENESIS" && world.initializationComplete) {
+    throw new Error(`RUNTIME_GENESIS_FORBIDDEN: ${memo} at month ${world.clock.elapsedMonths}`);
+  }
   if (entries.length < 2) throw new Error(`Транзакция ${kind} не имеет двух сторон`);
   let debits = 0;
   let credits = 0;
@@ -302,7 +320,10 @@ export function postTransaction(
       throw new Error(`Неизвестный счёт ${entry.accountId}`);
     }
     transactionCurrency ??= account.currency;
-    if (account.currency !== transactionCurrency) throw new Error(`Межвалютная транзакция ${kind} требует отдельных ledger-ног: ${transactionCurrency}/${account.currency}`);
+    if (account.currency !== transactionCurrency) {
+      const firstAccountId = entries[0]?.accountId ?? "неизвестный счёт";
+      throw new Error(`Межвалютная транзакция ${kind} требует отдельных проводок: ${firstAccountId} (${transactionCurrency}) / ${entry.accountId} (${account.currency})`);
+    }
     if (entry.side === "debit") debits += entry.amountCents;
     else credits += entry.amountCents;
   }
@@ -636,6 +657,9 @@ export function seedDeposit(
   bankId: string,
   amountCents: number,
 ): void {
+  if (world.initializationComplete) {
+    throw new Error(`RUNTIME_GENESIS_FORBIDDEN: initial deposit for ${ownerId} at month ${world.clock.elapsedMonths}`);
+  }
   const centralBankId = centralBankIdForBank(world, bankId);
   const currency = world.banks.find((bank) => bank.id === bankId)?.baseCurrency ?? "RUB";
   let bankAccount = world.bankAccounts.find((account) => account.ownerId === ownerId && account.bankId === bankId && account.currencyId === currency && account.status === "active");
@@ -679,6 +703,9 @@ export function seedBankCapital(
   bankId: string,
   amountCents: number,
 ): void {
+  if (world.initializationComplete) {
+    throw new Error(`RUNTIME_GENESIS_FORBIDDEN: regulatory capital for ${bankId} at month ${world.clock.elapsedMonths}`);
+  }
   const centralBankId = centralBankIdForBank(world, bankId);
   const currency = world.banks.find((bank) => bank.id === bankId)?.baseCurrency ?? "RUB";
   ensureAccount(world.ledger, accountIds.bankReserve(bankId), bankId, "Резервы в ЦБ", "asset", currency);
