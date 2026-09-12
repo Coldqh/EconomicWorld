@@ -5,7 +5,7 @@ import { createWorld } from "../src/economy/create-world.ts";
 import { checkInvariants } from "../src/economy/invariants.ts";
 import { deterministicFingerprint } from "../src/economy/metrics.ts";
 import { runMonths } from "../src/economy/simulation.ts";
-import { acceptJobOffer, applyForJob, setPlayerProfile } from "../src/player/commands.ts";
+import { acceptJobOffer, applyForJob, availableOccupations, graduateSalaryBonusBps, hasOccupationQualification, setPlayerProfile } from "../src/player/commands.ts";
 import { playerFinancialSummary, playerPerson } from "../src/player/system.ts";
 import { applyUniversity, buyDurable, enrollUniversity, rentProperty, sellDurable, startTravel } from "../src/player/world-commands.ts";
 import { dematerializePerson, materializePerson } from "../src/world/fidelity.ts";
@@ -248,6 +248,9 @@ test("одинаковое состояние воспроизводит оди�
 test("игрок получает местную работу и зарплату через общий реестр", () => {
   const world = createWorld();
   setPlayerProfile(world, "Тестовый игрок", "student");
+  assert.equal(applyForJob(world, world.companies[0].id, "worker").accepted, false);
+  world.player.completedProgramIds.push("hse-economics");
+  playerPerson(world).educationLevel = "bachelor";
   const answer = applyForJob(world, world.companies[0].id, "worker");
   assert.equal(answer.accepted, true);
   assert.equal(acceptJobOffer(world), true);
@@ -263,13 +266,45 @@ test("поступление в институт учитывает конкур
   const program = world.universityPrograms.find((item) => item.id === "hse-economics")!;
   assert.equal(program.durationMonths, 48);
   assert.equal(applyUniversity(world, program.id), true);
+  const cashBefore = bankAccountsForOwner(world, world.player.householdId).reduce((sum, account) => sum + bankAccountBalance(world, account.id), 0);
   assert.equal(enrollUniversity(world, program.id), true);
-  assert.ok(world.ledger.transactions.some((transaction) => transaction.kind === "UNIVERSITY_TUITION"));
+  assert.ok(world.ledger.transactions.some((transaction) => transaction.kind === "UNIVERSITY_TUITION" && transaction.memo.includes("Бюджетное место")));
+  assert.equal(bankAccountsForOwner(world, world.player.householdId).reduce((sum, account) => sum + bankAccountBalance(world, account.id), 0), cashBefore);
   assert.equal(world.player.activeUniversityEnrollment?.durationMonths, 48);
+  const economicsBefore = playerPerson(world).skills.economics;
+  runMonths(world, 1);
+  assert.ok(playerPerson(world).skills.economics > economicsBefore);
+  assert.ok(world.ledger.transactions.some((transaction) => transaction.kind === "SOCIAL_TRANSFER" && transaction.memo.includes("Стипендия")));
   world.player.activeUniversityEnrollment!.completedMonths = 47;
   runMonths(world, 1);
   assert.ok(world.player.completedProgramIds.includes(program.id));
   assert.equal(playerPerson(world).educationLevel, "bachelor");
+});
+
+test("новый игрок — обычный студент без компании, акций и стартового миллиона", () => {
+  const world = createWorld();
+  setPlayerProfile(world, "Студент", "developer");
+  assert.equal(world.player.profileId, "student");
+  assert.equal(playerPerson(world).educationLevel, "secondary");
+  assert.equal(bankAccountsForOwner(world, world.player.householdId).reduce((sum, account) => sum + bankAccountBalance(world, account.id), 0), 35_000_00);
+  assert.equal(world.companies.some((company) => company.ownerHouseholdId === world.player.householdId), false);
+  assert.equal(world.equityHoldings.some((holding) => holding.ownerId === world.player.householdId), false);
+  assert.equal(world.companies.some((company) => company.employees.includes(world.player.householdId)), false);
+  runMonths(world, 1);
+  assert.ok(playerFinancialSummary(world).netWorthCents < 100_000_00);
+});
+
+test("специальность института открывает связанные профессии и влияет на зарплату", () => {
+  const world = createWorld();
+  const services = world.companies.find((company) => company.goodId === "services" && company.cityId === "moscow")!;
+  assert.equal(availableOccupations(world, services.id).length, 0);
+  world.player.completedProgramIds.push("hse-economics");
+  playerPerson(world).educationLevel = "bachelor";
+  assert.equal(hasOccupationQualification(world, "analyst"), true);
+  assert.equal(hasOccupationQualification(world, "developer"), false);
+  assert.ok(graduateSalaryBonusBps(world, "analyst") > 0);
+  assert.ok(availableOccupations(world, services.id).some((occupation) => occupation.id === "analyst"));
+  assert.equal(availableOccupations(world, services.id).some((occupation) => occupation.id === "developer"), false);
 });
 
 test("материализация и возврат в когорту сохраняют население и деньги", () => {
@@ -288,6 +323,7 @@ test("материализация и возврат в когорту сохр�
 
 test("переезд между городами оплачивается и меняет местный контур", () => {
   const world = createWorld();
+  seedDeposit(world, world.player.householdId, world.households[0].bankId, 500_000_00);
   const before = playerFinancialSummary(world).depositsCents;
   assert.equal(startTravel(world, "berlin", "air", true), true);
   runMonths(world, 1);
@@ -301,6 +337,7 @@ test("переезд между городами оплачивается и м�
 
 test("вторичная продажа актива не добавляет ВВП", () => {
   const world = createWorld();
+  seedDeposit(world, world.player.householdId, world.households[0].bankId, 250_000_00);
   const product = world.products[0];
   assert.equal(buyDurable(world, product.id), true);
   const assetId = world.player.durableAssetIds[0];
@@ -419,6 +456,9 @@ test("еврозона имеет общую денежную власть, а �
 test("переезд сохраняет старый счёт, Сеул платит KRW и корейский брокер использует settlement account", () => {
   const world = createWorld();
   setPlayerProfile(world, "Глобальный игрок", "student");
+  seedDeposit(world, world.player.householdId, world.households[0].bankId, 500_000_00);
+  world.player.completedProgramIds.push("hse-economics");
+  playerPerson(world).educationLevel = "bachelor";
   const rubId = bankAccountsForOwner(world, world.player.householdId, "RUB")[0].id;
   assert.equal(startTravel(world, "seoul", "air", true), true);
   runMonths(world, 1);
@@ -452,6 +492,7 @@ test("очная программа требует город, но зарубе
 
 test("Player покупает еду ежемесячно, жильё списывает аренду, durable — только вручную", () => {
   const world = createWorld();
+  seedDeposit(world, world.player.householdId, world.households[0].bankId, 500_000_00);
   assert.equal(world.player.automaticBasicSpending, false);
   assert.equal(world.ledger.transactions.some((transaction) => transaction.kind === "DURABLE_PURCHASE"), false);
   const home = world.housingCohorts.find((cohort) => cohort.cityId === "moscow" && cohort.type === "rental-apartment")!;
@@ -468,6 +509,9 @@ test("Player покупает еду ежемесячно, жильё списы
 test("SELL из портфеля создаёт настоящую биржевую заявку", () => {
   const world = createWorld();
   const listing = world.listings.find((item) => item.companyId === "company-001")!;
+  const ownerId = world.companies.find((company) => company.id === listing.companyId)!.ownerHouseholdId;
+  seedDeposit(world, world.player.householdId, world.households[0].bankId, 100_000_00);
+  assert.equal(transferShares(world, listing.securityId, ownerId, world.player.householdId, 25, listing.lastPriceCents).ok, true);
   assert.equal(openBrokerageAccount(world, world.player.householdId).ok, true);
   const brokerage = world.brokerageAccounts.find((account) => account.ownerId === world.player.householdId)!;
   const answer = placeOrder(world, brokerage.id, listing.securityId, "sell", "limit", 25, listing.lastPriceCents * 2);

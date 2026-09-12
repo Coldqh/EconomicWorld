@@ -140,7 +140,9 @@ function createCompanies(profiles: readonly CountryEconomicProfile[], cities: re
     const companyId = `company-${String(index + 1).padStart(3, "0")}`;
     return {
       id: companyId, name, goodId,
-      ownerHouseholdId: `household-${String(index + 1).padStart(3, "0")}`,
+      // household-001 is always the player: an ordinary student must not
+      // inherit a seeded company or its shares at world creation.
+      ownerHouseholdId: `household-${String((index % 99) + 2).padStart(3, "0")}`,
       bankId: pack.banks[localIndex % pack.banks.length].id, active: true, employees: [], wageCents, priceCents,
       capacityMilliUnits, productivityBps, inventoryMilliUnits,
       inventoryValueCents: Math.round((inventoryMilliUnits * good.basePriceCents * 0.66) / 1_000),
@@ -476,7 +478,7 @@ export function createWorld(scenario: SimulationScenario = "baseline", options: 
     dealer.bankAccountIds.push(account.id);
     dealer.targetInventoryByCurrency[currency.id] = 50_000_000_00;
   }
-  households.forEach((household, index) => seedDeposit(world, household.id, household.bankId, index === 0 ? 850_000_00 : 85_000_00 + ((index * 1_937_00) % 130_000_00)));
+  households.forEach((household, index) => seedDeposit(world, household.id, household.bankId, index === 0 ? 35_000_00 : 85_000_00 + ((index * 1_937_00) % 130_000_00)));
   companies.forEach((company, index) => {
     seedDeposit(world, company.id, company.bankId, 5_500_000_00 + index * 270_000_00);
     seedNonCashAsset(world, company.id, accountIds.finishedInventory(company.id), "Готовая продукция", company.inventoryValueCents);

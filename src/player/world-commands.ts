@@ -2,6 +2,7 @@ import { emitSimpleEvent } from "../core/events.ts";
 import { accountIds, balanceOf, ensureAccount, postTransaction, settleDepositPayment, transferDeposit, transferOwnedAsset } from "../core/ledger.ts";
 import type { DurableAsset, HousingCohort, PropertyInstance, SkillId, TravelOption, WorldState } from "../domain/model.ts";
 import { addPlayerTimeline, playerHousehold, playerPerson } from "./system.ts";
+import { isStateFundedFirstDegree } from "./student-journey.ts";
 
 function command(world: WorldState, type: WorldState["player"]["commandLog"][number]["type"], payload: Record<string, string | number | boolean>): void {
   world.player.commandLog.push({ id: `command-${String(world.player.nextCommandId++).padStart(6, "0")}`, elapsedMonth: world.clock.elapsedMonths, type, payload });
@@ -66,14 +67,18 @@ export function enrollUniversity(world: WorldState, programId: string): boolean 
   if (!application || !program || !university || world.player.activeUniversityEnrollment) return false;
   if (program.attendanceMode === "ON_CAMPUS" && world.player.currentCityId !== university.cityId) return false;
   const tuition = program.tuitionPerYearCents;
-  const tx = transferDeposit(world, world.player.householdId, university.id, tuition, "UNIVERSITY_TUITION", `Обучение: ${university.shortName} · ${program.name}`);
+  const stateFunded = isStateFundedFirstDegree(world, program);
+  const payerId = stateFunded
+    ? world.governments.find((government) => government.countryId === world.cities.find((city) => city.id === university.cityId)?.countryId)?.id
+    : world.player.householdId;
+  const tx = payerId && transferDeposit(world, payerId, university.id, tuition, "UNIVERSITY_TUITION", `${stateFunded ? "Бюджетное место" : "Обучение"}: ${university.shortName} · ${program.name}`);
   if (!tx) return false;
   application.status = "enrolled";
   program.occupiedSeats += 1;
   world.player.activeUniversityEnrollment = { universityId: university.id, programId, startedAtMonth: world.clock.elapsedMonths, completedMonths: 0, durationMonths: program.durationMonths, nextTuitionMonth: world.clock.elapsedMonths + 12, status: "active" };
   world.player.educationHistory.push({ universityId: university.id, programId, startedAtMonth: world.clock.elapsedMonths, completedAtMonth: null });
   command(world, "ENROLL_UNIVERSITY", { programId, tuitionCents: tuition });
-  emitSimpleEvent(world, "UniversityEnrolled", "Зачисление", `${university.shortName} · ${program.name}`, [world.player.personId, university.id], "positive", [tx], { tuitionCents: tuition, durationMonths: program.durationMonths });
+  emitSimpleEvent(world, "UniversityEnrolled", "Зачисление", `${university.shortName} · ${program.name} · ${stateFunded ? "бюджетное место" : "платное обучение"}`, [world.player.personId, university.id], "positive", [tx], { tuitionCents: tuition, durationMonths: program.durationMonths, stateFunded });
   addPlayerTimeline(world, "education", "Поступление", `${university.shortName} · ${program.name}`);
   return true;
 }
@@ -205,11 +210,28 @@ export function progressPlayerWorld(world: WorldState): void {
     if (program && university) {
       if (program.attendanceMode === "ON_CAMPUS" && world.player.currentCityId !== university.cityId) enrollment.status = "paused";
       if (world.clock.elapsedMonths >= enrollment.nextTuitionMonth) {
-        const tx = transferDeposit(world, world.player.householdId, university.id, program.tuitionPerYearCents, "UNIVERSITY_TUITION", `Следующий год обучения: ${university.shortName}`);
+        const stateFunded = isStateFundedFirstDegree(world, program);
+        const payerId = stateFunded
+          ? world.governments.find((government) => government.countryId === world.cities.find((city) => city.id === university.cityId)?.countryId)?.id
+          : world.player.householdId;
+        const tx = payerId && transferDeposit(world, payerId, university.id, program.tuitionPerYearCents, "UNIVERSITY_TUITION", `${stateFunded ? "Бюджетное место" : "Следующий год обучения"}: ${university.shortName}`);
         if (tx) enrollment.nextTuitionMonth += 12;
         else enrollment.status = "paused";
       }
-      if (enrollment.status === "active") enrollment.completedMonths += 1;
+      if (enrollment.status === "active") {
+        enrollment.completedMonths += 1;
+        const person = playerPerson(world);
+        for (const [skill, outcome] of Object.entries(program.skillOutcomes) as Array<[SkillId, number]>) {
+          const qualityAdjustedOutcome = Math.min(10_000, Math.round(outcome * university.teachingQualityBps / 9_000));
+          const monthlyGain = Math.max(1, Math.round(qualityAdjustedOutcome * 0.45 / Math.max(1, program.durationMonths)));
+          person.skills[skill] = Math.min(qualityAdjustedOutcome, person.skills[skill] + monthlyGain);
+        }
+        if (enrollment.completedMonths < enrollment.durationMonths && enrollment.completedMonths % 12 === 0) {
+          const year = enrollment.completedMonths / 12;
+          emitSimpleEvent(world, "UniversityYearCompleted", `Завершён ${year}-й курс`, `${university.shortName} · ${program.name}`, [world.player.personId, university.id], "positive");
+          addPlayerTimeline(world, "education", `Завершён ${year}-й курс`, `${university.shortName} · ${program.name}`);
+        }
+      }
       if (enrollment.completedMonths >= enrollment.durationMonths) {
         enrollment.status = "completed";
         world.player.completedProgramIds.push(program.id);
@@ -217,7 +239,10 @@ export function progressPlayerWorld(world: WorldState): void {
         if (history) history.completedAtMonth = world.clock.elapsedMonths;
         const person = playerPerson(world);
         person.educationLevel = program.degree;
-        for (const [skill, outcome] of Object.entries(program.skillOutcomes) as Array<[SkillId, number]>) person.skills[skill] = Math.max(person.skills[skill], outcome);
+        for (const [skill, outcome] of Object.entries(program.skillOutcomes) as Array<[SkillId, number]>) {
+          const qualityAdjustedOutcome = Math.min(10_000, Math.round(outcome * university.teachingQualityBps / 9_000));
+          person.skills[skill] = Math.max(person.skills[skill], qualityAdjustedOutcome);
+        }
         program.occupiedSeats = Math.max(0, program.occupiedSeats - 1);
         world.player.activeUniversityEnrollment = null;
         emitSimpleEvent(world, "UniversityGraduated", "Получен диплом", `${university.shortName} · ${program.name}`, [person.id, university.id], "positive");

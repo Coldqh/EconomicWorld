@@ -372,6 +372,7 @@ export type EventType =
   | "UniversityAdmitted"
   | "UniversityRejected"
   | "UniversityEnrolled"
+  | "UniversityYearCompleted"
   | "UniversityGraduated"
   | "TravelStarted"
   | "TravelCompleted"
