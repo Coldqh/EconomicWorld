@@ -1,3 +1,11 @@
+import type {
+  AcquisitionVehicle, ArbitrageRecord, BankAlmState, CapitalProject, CausalExplanation, CircuitBreakerState, CompanyDecisionState,
+  CreditOffer, DataCoverageSnapshot, EconomicAuction, EtfArbitrageEvent, EtfBasket, ExecutionQuality, FundFlow, GovernanceProposal,
+  FundPerformance, FundRedemptionRequest, InsuranceClaim, InsuranceLossEvent, InsurancePolicy, InsurerState, IPOProcess, MAndADeal, MarketAgentState,
+  LockupRestriction, MarketMakerQuote, PrivateEquityDeal, PrivateEquityFundState, RealBankProfile, RealCompanyProfile, ReinsuranceTreaty, RestructuringCase,
+} from "./economic-markets.ts";
+export type * from "./economic-markets.ts";
+
 export type AccountCategory = "asset" | "liability" | "equity" | "income" | "expense";
 export type EntrySide = "debit" | "credit";
 
@@ -110,6 +118,7 @@ export type TransactionKind =
   | "PRODUCTION"
   | "DEPRECIATION"
   | "CAPITAL_INVESTMENT"
+  | "ASSET_IMPAIRMENT"
   | "ACCOUNTING_CLOSE"
   | "INTERBANK_LOAN"
   | "CENTRAL_BANK_FACILITY"
@@ -184,7 +193,11 @@ export type TransactionKind =
   | "OPEN_MARKET_SALE"
   | "QE"
   | "QT"
-  | "DEPOSIT_INSURANCE";
+  | "DEPOSIT_INSURANCE"
+  | "INSURANCE_PREMIUM"
+  | "INSURANCE_CLAIM"
+  | "REINSURANCE_PREMIUM"
+  | "AUCTION_SETTLEMENT";
 
 export interface LedgerTransaction {
   id: string;
@@ -292,6 +305,21 @@ export interface CompactedTradeRecord {
   flowCount: number;
 }
 
+export interface CompactedAuctionRecord {
+  id: string;
+  objectType: "sovereign-bond" | "procurement" | "privatization" | "bankruptcy-asset" | "license" | "company";
+  objectId: string;
+  mechanism: "english" | "dutch" | "first-price" | "reverse-first-price" | "vickrey" | "uniform-price" | "pay-as-bid";
+  status: "settled" | "failed";
+  openedAtMonth: number;
+  closedAtMonth: number;
+  reserveMinor: number;
+  offeredQuantity: number;
+  allocatedQuantity: number;
+  proceedsMinor: number;
+  winnerCount: number;
+}
+
 export interface HistoryState {
   policy: HistoryRetentionPolicy;
   importantLedgerTransactions: LedgerTransaction[];
@@ -301,6 +329,7 @@ export interface HistoryState {
   companyAnnualRecords: CompactCompanyAnnualRecord[];
   compactedEventRecords: CompactEventRecord[];
   compactedTradeRecords: CompactedTradeRecord[];
+  compactedAuctionRecords: CompactedAuctionRecord[];
   globalSeries: CompactNumericSeries;
   countrySeries: Record<string, CompactNumericSeries>;
   lastCompactedMonth: number;
@@ -587,6 +616,8 @@ export interface TradeRoute {
   costUsdMinorPerUnit: number;
   transitDays: number;
   active: boolean;
+  conflictDamageBps?: number;
+  reconstructionBacklogMinor?: number;
 }
 
 export interface PortNode {
@@ -1190,6 +1221,12 @@ export type DefenseCapabilityDomain = "land" | "air" | "naval" | "airDefense" | 
 export interface DefenseIndustrySector {
   id: string; countryId: string; category: DefenseIndustryCategory; supplierCohortId: string;
   capacityMinor: number; utilizedCapacityBps: number; technologyBps: number; inputAvailabilityBps: number; importDependencyBps: number; expansionMonthsRemaining: number;
+  civilianCapacityTransferredMinor?: number;
+  researchProgressMinor?: number;
+}
+export interface DefenseDomainState {
+  domain: DefenseCapabilityDomain; grossCapitalMinor: number; serviceableCapitalMinor: number; unavailableCapitalMinor: number;
+  personnelShareBps: number; maintenanceRequirementMinor: number; technologyBps: number; readinessBps: number; supplyDependencyBps: number;
 }
 export interface DefenseCountryState {
   countryId: string; targetSpendingToGdpBps: number;
@@ -1198,18 +1235,25 @@ export interface DefenseCountryState {
   equipmentStockMinor: number; munitionsStockMinor: number; fuelStockMinor: number; sparePartsStockMinor: number; medicalLogisticsStockMinor: number;
   readinessBps: number; equipmentConditionBps: number; trainingBps: number; logisticsReadinessBps: number; importDependencyBps: number;
   capabilitiesBps: Record<DefenseCapabilityDomain, number>; lastCauseCodes: string[];
+  mobilizedPersonnel?: number; personnelRequiredCostMinor?: number; payrollCoverageBps?: number;
+  requiredMaintenanceMinor?: number; maintenanceCoverageBps?: number; maintenanceBacklogMinor?: number;
+  serviceableEquipmentMinor?: number; unavailableEquipmentMinor?: number; retiredEquipmentMinor?: number; averageEquipmentAgeMonths?: number;
+  infrastructureStockMinor?: number; infrastructureConditionBps?: number; researchProgressMinor?: number;
+  domainStates?: DefenseDomainState[]; baselineTargetSpendingToGdpBps?: number;
 }
 export interface DefenseAidTransfer { id: string; donorCountryId: string; recipientCountryId: string; elapsedMonth: number; equipmentMinor: number; suppliesMinor: number; fundingMinor: number; transactionId: string | null; }
 export interface SecurityAlliance { id: string; memberCountryIds: string[]; defenseCooperationBps: number; accessBps: number; mutualSupportCommitmentBps: number; }
 export interface DefenseEconomyState { countries: DefenseCountryState[]; industries: DefenseIndustrySector[]; aidTransfers: DefenseAidTransfer[]; alliances: SecurityAlliance[]; nextAidId: number; }
 
-export type ConflictStatus = "proposed" | "active" | "ceasefire" | "settled";
+export type ConflictStatus = "proposed" | "approved" | "rejected" | "mobilizing" | "active" | "ceasefire" | "negotiation" | "settled" | "terminated";
 export interface ArmedConflict {
   id: string; participantCountryIds: string[]; initiatorCountryId: string; defenderCountryId: string; startMonth: number; endMonth: number | null;
   objective: "defend" | "coerce" | "secure-access" | "limited-political"; scope: string; intensityBps: number; status: ConflictStatus;
   mobilizationByCountry: Record<string, number>; industrialConversionBpsByCountry: Record<string, number>; militaryLossesByCountry: Record<string, number>;
   equipmentLossMinorByCountry: Record<string, number>; capitalDamageMinorByCountry: Record<string, number>; tradeDisruptionBpsByCountry: Record<string, number>;
   fiscalCostMinorByCountry: Record<string, number>; civilianConsumptionLossMinorByCountry: Record<string, number>; continuationPressureBpsByCountry: Record<string, number>; causeCodes: string[];
+  proposalMonth?: number; approvedMonth?: number | null; ceasefireMonth?: number | null; negotiationMonth?: number | null;
+  decisionScoreBps?: number; expectedCostBps?: number; allianceRiskBps?: number; monthsInStatus?: number;
 }
 export interface ConflictState { conflicts: ArmedConflict[]; nextConflictId: number; }
 
@@ -1471,6 +1515,11 @@ export interface ShadowEconomyAccount {
   assessedTaxMinor: number;
   collectedTaxMinor: number;
   taxGapMinor: number;
+  intermediateInputsMinor?: number;
+  informalWagesMinor?: number;
+  undeclaredProfitMinor?: number;
+  informalConsumptionMinor?: number;
+  transactionIds?: string[];
 }
 
 export interface ComplianceProfile {
@@ -1986,6 +2035,146 @@ export interface PlayerState {
   bankAccountIds: string[];
   reportingCurrencyId: string;
   foodPlanId: "minimal" | "basic" | "good" | "premium";
+  experience: PlayerExperienceState;
+  reputation: PlayerReputationState;
+  interfacePreferences: PlayerInterfacePreferences;
+}
+
+export type FeatureAccessState = "UNDISCOVERED" | "DISCOVERED_LOCKED" | "VISIBLE" | "ACTIONABLE";
+
+export interface PlayerExperienceEvent {
+  id: string;
+  elapsedMonth: number;
+  actionId: string;
+  xp: number;
+  reason: string;
+}
+
+export interface PlayerExperienceState {
+  level: number;
+  currentXp: number;
+  lifetimeXp: number;
+  xpEvents: PlayerExperienceEvent[];
+  unlockedFeatures: string[];
+  discoveredFeatures: string[];
+  actionCounts: Record<string, number>;
+  completedMilestones: string[];
+  pendingLevelUp: number | null;
+}
+
+export interface ReputationEvent {
+  id: string;
+  elapsedMonth: number;
+  delta: number;
+  event: string;
+  reason: string;
+}
+
+export interface PlayerReputationState {
+  score: number;
+  history: ReputationEvent[];
+}
+
+export interface PlayerInterfacePreferences {
+  progressiveInterface: boolean;
+  showLockedSections: boolean;
+  fullInterface: boolean;
+  developerTrueState: boolean;
+  completedTutorialIds: string[];
+  skippedTutorials: boolean;
+}
+
+export type InformationSourceType = "PUBLIC_STATISTICS" | "COMPANY_REPORT" | "MARKET_PRICE" | "BANK_INTERNAL_DATA" | "COMPANY_INTERNAL_DATA" | "GOVERNMENT_INTERNAL_DATA" | "REGULATORY_DATA" | "TRADE_DATA" | "SATELLITE_SENSOR_ESTIMATE" | "INTELLIGENCE_ESTIMATE" | "NEWS_PUBLIC_REPORT";
+export type InformationStatus = "OBSERVED" | "ESTIMATED" | "STALE" | "INTERNAL" | "PUBLIC" | "UNKNOWN" | "NO_ACCESS";
+export type InformationConfidence = "LOW" | "MEDIUM" | "HIGH";
+
+export interface InformationSource {
+  id: string;
+  type: InformationSourceType;
+  ownerId: string | null;
+  delayMonths: number;
+  accuracyBps: number;
+  biasBps: number;
+  reliabilityBps: number;
+  costMinor: number;
+  scope: string[];
+  access: "PUBLIC" | "OWNER" | "GOVERNMENT" | "DILIGENCE";
+}
+
+export interface ObservedMetric {
+  id: string;
+  metricId: string;
+  subjectId: string;
+  observedValue: number;
+  confidence: InformationConfidence;
+  confidenceBps: number;
+  observationMonth: number;
+  releaseMonth: number;
+  informationAge: number;
+  sourceIds: string[];
+  qualityBps: number;
+  status: InformationStatus;
+  lowerBound: number;
+  upperBound: number;
+  revisionOfId: string | null;
+}
+
+export interface BeliefMetric extends ObservedMetric {
+  agentId: string;
+  priorValue: number | null;
+  updatedAtMonth: number;
+}
+
+export interface InformationSurprise {
+  id: string;
+  agentId: string;
+  metricId: string;
+  subjectId: string;
+  expectedValue: number;
+  realizedValue: number;
+  magnitudeBps: number;
+  elapsedMonth: number;
+  cause: string;
+}
+
+export interface DecisionInformationTrace {
+  id: string;
+  agentId: string;
+  decisionType: string;
+  subjectId: string;
+  elapsedMonth: number;
+  observedInputIds: string[];
+  beliefValues: Record<string, number>;
+  confidenceBps: number;
+  decision: string;
+  realizedResult: number | null;
+  realizedAtMonth: number | null;
+}
+
+export interface StrategicIntelligenceCapability {
+  countryId: string;
+  collectionBps: number;
+  analysisBps: number;
+  economicIntelligenceBps: number;
+  militaryIntelligenceBps: number;
+  counterintelligenceBps: number;
+  opacityBps: number;
+  monthlyCostMinor: number;
+  focus: "MILITARY" | "ECONOMIC" | "FINANCIAL" | "TECHNOLOGY";
+}
+
+export interface InformationState {
+  sources: InformationSource[];
+  observations: ObservedMetric[];
+  beliefs: BeliefMetric[];
+  surprises: InformationSurprise[];
+  decisionTraces: DecisionInformationTrace[];
+  intelligence: StrategicIntelligenceCapability[];
+  archivedSummaries: Array<{ key: string; count: number; averageSurpriseBps: number; throughMonth: number }>;
+  nextObservationId: number;
+  nextSurpriseId: number;
+  nextTraceId: number;
+  lastReleaseMonth: number;
 }
 
 export interface EquitySecurity {
@@ -2040,7 +2229,7 @@ export interface CorporateAction {
   id: string;
   companyId: string;
   elapsedMonth: number;
-  type: "founded" | "equity-raise" | "share-transfer" | "dividend" | "bond-issue" | "bond-repaid" | "acquisition" | "ipo" | "bankruptcy";
+  type: "founded" | "equity-raise" | "share-transfer" | "dividend" | "buyback" | "bond-issue" | "bond-repaid" | "acquisition" | "ipo" | "bankruptcy";
   title: string;
   amountCents: number;
   relatedEntityIds: string[];
@@ -2106,6 +2295,7 @@ export interface MarketOrder {
   id: string;
   brokerageAccountId: string;
   securityId: string;
+  exchangeId: string;
   side: "buy" | "sell";
   type: "market" | "limit";
   quantity: number;
@@ -2753,8 +2943,9 @@ export interface MacroMonthlyPoint extends CountryMacroState {
 export type SimulationScenario = "baseline" | "high-demand" | "supply-constraint" | "high-rates" | "bank-liquidity-stress";
 
 export interface WorldState {
-  schemaVersion: 14;
-  saveVersion: 14;
+  schemaVersion: 16;
+  saveVersion: 16;
+  initializationComplete: boolean;
   seed: string;
   scenario: SimulationScenario;
   baselineReference: WorldBaselineReference;
@@ -2783,6 +2974,7 @@ export interface WorldState {
   conflicts: ConflictState;
   occupations: Occupation[];
   player: PlayerState;
+  information: InformationState;
   events: DomainEvent[];
   metricsHistory: MetricPoint[];
   countryMetricsHistory: CountryMetricPoint[];
@@ -2872,6 +3064,38 @@ export interface WorldState {
   depositInsuranceSchemes: DepositInsuranceScheme[];
   countryMacroStates: CountryMacroState[];
   macroHistory: MacroMonthlyPoint[];
+  realCompanyProfiles: RealCompanyProfile[];
+  realBankProfiles: RealBankProfile[];
+  companyDecisionStates: CompanyDecisionState[];
+  capitalProjects: CapitalProject[];
+  bankAlmStates: BankAlmState[];
+  creditOffers: CreditOffer[];
+  marketAgents: MarketAgentState[];
+  marketMakerQuotes: MarketMakerQuote[];
+  executionQuality: ExecutionQuality[];
+  circuitBreakers: CircuitBreakerState[];
+  arbitrageRecords: ArbitrageRecord[];
+  fundFlows: FundFlow[];
+  fundRedemptionRequests: FundRedemptionRequest[];
+  fundPerformanceHistory: FundPerformance[];
+  etfBaskets: EtfBasket[];
+  etfArbitrageEvents: EtfArbitrageEvent[];
+  privateEquityFunds: PrivateEquityFundState[];
+  privateEquityDeals: PrivateEquityDeal[];
+  acquisitionVehicles: AcquisitionVehicle[];
+  mAndADeals: MAndADeal[];
+  ipoProcesses: IPOProcess[];
+  lockupRestrictions: LockupRestriction[];
+  economicAuctions: EconomicAuction[];
+  insurers: InsurerState[];
+  insurancePolicies: InsurancePolicy[];
+  insuranceLossEvents: InsuranceLossEvent[];
+  insuranceClaims: InsuranceClaim[];
+  reinsuranceTreaties: ReinsuranceTreaty[];
+  causalExplanations: CausalExplanation[];
+  governanceProposals: GovernanceProposal[];
+  restructuringCases: RestructuringCase[];
+  dataCoverageHistory: DataCoverageSnapshot[];
   globalCommodities: GlobalCommodityDefinition[];
   commodityMarkets: CommodityMarketState[];
   resourceDeposits: ResourceDeposit[];
@@ -2928,7 +3152,7 @@ export interface WorldState {
 
 export interface InvariantResult {
   id: string;
-  section: "Национальные счета" | "Бухгалтерия" | "Товары" | "Деньги" | "Валюты" | "Кредит" | "Ликвидность банков" | "Игрок" | "Население" | "География" | "Жильё" | "Образование" | "Производительность" | "Собственность" | "Рынки" | "Фонды" | "Обеспечение" | "Деривативы" | "Клиринг" | "Государственный долг" | "Денежная политика";
+  section: "Национальные счета" | "Бухгалтерия" | "Товары" | "Деньги" | "Валюты" | "Кредит" | "Ликвидность банков" | "Игрок" | "Население" | "География" | "Жильё" | "Образование" | "Производительность" | "Собственность" | "Рынки" | "Фонды" | "Обеспечение" | "Деривативы" | "Клиринг" | "Государственный долг" | "Денежная политика" | "Страхование";
   title: string;
   ok: boolean;
   detail: string;

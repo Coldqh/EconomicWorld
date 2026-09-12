@@ -11,6 +11,7 @@ import {
 } from "../core/ledger.ts";
 import type { CollateralPledge, MarginAccount, WorldState } from "../domain/model.ts";
 import { matchOrderBook, openBrokerageAccount, placeOrder } from "../markets/exchange.ts";
+import { recentOhlcvBars } from "../markets/runtime-index.ts";
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
@@ -23,7 +24,7 @@ function listingFor(world: WorldState, securityId: string) {
 export function securityHaircutBps(world: WorldState, securityId: string): number {
   const listing = listingFor(world, securityId);
   if (!listing) return 7_500;
-  const bars = world.ohlcvBars.filter((bar) => bar.securityId === securityId).slice(-12);
+  const bars = recentOhlcvBars(world, securityId, 12);
   const averageVolume = bars.length ? bars.reduce((sum, bar) => sum + bar.volume, 0) / bars.length : 0;
   const volatilityBps = bars.length > 1 ? Math.round(bars.reduce((sum, bar) => sum + Math.abs(bar.highCents - bar.lowCents) * 10_000 / Math.max(1, bar.closeCents), 0) / bars.length) : 1_200;
   const company = world.companies.find((item) => item.id === listing.companyId);
@@ -39,8 +40,9 @@ function pledgedSecurityQuantity(world: WorldState, ownerId: string, securityId:
 export function pledgeSecurityCollateral(world: WorldState, ownerId: string, securedPartyId: string, securityId: string, quantity: number, purpose: "margin" | "repo" | "prime-brokerage" | "derivative-margin" | "central-bank"): CollateralPledge | null {
   const holding = world.equityHoldings.find((item) => item.ownerId === ownerId && item.securityId === securityId);
   const listing = listingFor(world, securityId);
+  const reservedForSale = world.marketOrders.filter((order) => order.securityId === securityId && order.side === "sell" && (order.status === "open" || order.status === "partially-filled") && world.brokerageAccounts.find((account) => account.id === order.brokerageAccountId)?.ownerId === ownerId).reduce((sum, order) => sum + order.remainingQuantity, 0);
   quantity = Math.floor(quantity);
-  if (!holding || !listing || quantity <= 0 || holding.shares - pledgedSecurityQuantity(world, ownerId, securityId) < quantity) return null;
+  if (!holding || !listing || quantity <= 0 || holding.shares - pledgedSecurityQuantity(world, ownerId, securityId) - reservedForSale < quantity) return null;
   const haircutBps = securityHaircutBps(world, securityId);
   const pledge: CollateralPledge = {
     id: `collateral-${String(world.nextCollateralId++).padStart(8, "0")}`,
@@ -151,7 +153,7 @@ export function checkMaintenanceMargin(world: WorldState, marginAccountId: strin
   if (state.grossExposureMinor <= 0 || state.equityMinor >= required) return true;
   const existing = world.marginCalls.find((call) => call.marginAccountId === account.id && call.status === "open");
   if (!existing) {
-    const call = { id: `margin-call-${String(world.nextMarginCallId++).padStart(8, "0")}`, marginAccountId: account.id, requiredEquityMinor: required, currentEquityMinor: state.equityMinor, issuedAtMonth: world.clock.elapsedMonths, deadlineMonth: world.clock.elapsedMonths + 1, status: "open" as const, reason: "Equity ratio below maintenance margin" };
+    const call = { id: `margin-call-${String(world.nextMarginCallId++).padStart(8, "0")}`, marginAccountId: account.id, requiredEquityMinor: required, currentEquityMinor: state.equityMinor, issuedAtMonth: world.clock.elapsedMonths, deadlineMonth: world.clock.elapsedMonths + 1, status: "open" as const, reason: "Доля собственного капитала ниже поддерживающей маржи" };
     world.marginCalls.push(call);
     account.status = "margin-call";
     emitSimpleEvent(world, "MarginCallIssued", "Маржинальное требование", `${account.ownerId}: требуется обеспечение`, [account.ownerId, account.primeBrokerId], "critical", [], { requiredEquityMinor: required, currentEquityMinor: state.equityMinor });

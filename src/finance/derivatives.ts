@@ -14,6 +14,7 @@ import type {
   WorldState,
 } from "../domain/model.ts";
 import { matchOrderBook, openBrokerageAccount, placeOrder } from "../markets/exchange.ts";
+import { recentOhlcvBars } from "../markets/runtime-index.ts";
 import { convertMinorAtRate } from "./currencies.ts";
 import { createNettingSet, novateFuture, pledgeDerivativeCashCollateral, settleBilateralNet, settleFuturesVariationMargin } from "./clearing.ts";
 import { currencyBankAccount, settleFinancialPayment } from "./financial-settlement.ts";
@@ -208,7 +209,7 @@ export function refreshOptionQuotes(world: WorldState): void {
     const area = world.monetaryAreas.find((item) => item.currencyId === series.currencyId);
     const rate = world.centralBanks.find((bank) => bank.id === area?.monetaryAuthorityId)?.policyRateBps ?? 0;
     if (!listing || !exchange) continue;
-    const bars = world.ohlcvBars.filter((bar) => bar.securityId === series.underlyingSecurityId).slice(-12);
+    const bars = recentOhlcvBars(world, series.underlyingSecurityId, 12);
     const realizedVolBps = bars.length > 1
       ? clamp(Math.round(Math.sqrt(bars.reduce((sum, bar, index) => index === 0 ? sum : sum + ((bar.closeCents - bars[index - 1].closeCents) / Math.max(1, bars[index - 1].closeCents)) ** 2, 0) / (bars.length - 1)) * Math.sqrt(12) * 10_000), 800, 12_000)
       : 2_500;

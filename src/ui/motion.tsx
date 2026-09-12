@@ -94,7 +94,7 @@ export function Stagger({ children, index }: PropsWithChildren<{ index: number }
 export function LiveIndicator({ running }: { running: boolean }) {
   return (
     <span className={`live-indicator ${running ? "is-running" : "is-paused"}`}>
-      <i /> {running ? "LIVE" : "PAUSED"}
+      <i /> {running ? "В РАБОТЕ" : "ПАУЗА"}
     </span>
   );
 }

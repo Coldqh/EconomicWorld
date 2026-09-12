@@ -9,12 +9,26 @@ import type {
 import { convertMinor, fxRatePpm } from "../finance/currencies.ts";
 import { recordBilateralExternalFlow, recordExternalFlow } from "../accounting/country-periods.ts";
 import { createFuture } from "../finance/derivatives.ts";
-import { executeFxConversion } from "../finance/fx-market.ts";
+import { executeFxConversion, quoteFxConversion } from "../finance/fx-market.ts";
 import { settleFinancialPayment } from "../finance/financial-settlement.ts";
 import { evaluateEconomicPolicyAccess } from "../geoeconomics/access.ts";
 
 const clamp = (value: number, minimum: number, maximum: number): number => Math.min(maximum, Math.max(minimum, value));
 const countryCurrency = (world: WorldState, countryId: string): string => world.countries.find((country) => country.id === countryId)?.currencyReference ?? "USD";
+
+function fxSourceForTarget(world: WorldState, fromCurrencyId: string, toCurrencyId: string, targetToMinor: number): number | null {
+  targetToMinor = Math.max(0, Math.floor(targetToMinor));
+  if (targetToMinor === 0) return 0;
+  let sourceMinor = convertMinor(world, Math.ceil(targetToMinor * 1.05), toCurrencyId, fromCurrencyId) ?? 0;
+  if (sourceMinor <= 0) return null;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const quote = quoteFxConversion(world, fromCurrencyId, toCurrencyId, sourceMinor);
+    if (!quote) return null;
+    if (quote.amountToMinor >= targetToMinor) return sourceMinor;
+    sourceMinor = Math.max(sourceMinor + 1, Math.ceil(sourceMinor * targetToMinor / Math.max(1, quote.amountToMinor)) + 1);
+  }
+  return null;
+}
 const countryOfEntity = (world: WorldState, entityId: string): string | null => {
   const company = world.companies.find((item) => item.id === entityId);
   if (company) return company.headquartersCountryId;
@@ -268,9 +282,18 @@ function resetRealWorldRouteCapacity(world: WorldState): void {
     const destinationTrade = world.tradeSectors.find((item) => item.countryId === route.destinationCountryId);
     if (!originTrade || !destinationTrade) continue;
     const target = Math.round(Math.min(originTrade.exportCapacityUsdMinor, destinationTrade.importBudgetUsdMinor) / 8);
-    // Route infrastructure adapts gradually to structural trade demand while
-    // current-month congestion still constrains supplier choice.
-    route.capacityMilliUnits = Math.max(25_000_000, Math.round(route.capacityMilliUnits * 0.92 + target * 0.08));
+    const backlog = route.reconstructionBacklogMinor ?? 0;
+    if (backlog > 0) {
+      const reconstruction = world.defenseEconomy.countries
+        .filter((item) => item.countryId === route.originCountryId || item.countryId === route.destinationCountryId)
+        .reduce((sum, item) => sum + item.infrastructureSpendingMinor, 0);
+      const restored = Math.min(backlog, Math.round(reconstruction * 50));
+      route.reconstructionBacklogMinor = backlog - restored;
+      route.capacityMilliUnits += restored;
+      continue;
+    }
+    // Structural demand may guide undamaged capacity, but never repairs war damage.
+    route.capacityMilliUnits = Math.max(25_000_000, Math.round(route.capacityMilliUnits * 0.98 + target * 0.02));
   }
 }
 
@@ -300,7 +323,8 @@ export function createClearedTradeFlow(world: WorldState, exporterCountryId: str
     if (!nativeAccount || !invoiceAccount || !exporterAccount) return null;
     let fxTradeId: string | null = null;
     if (nativeCurrencyId !== invoiceCurrencyId) {
-      const requiredNative = convertMinor(world, Math.ceil(invoiceValueMinor * 1.02), invoiceCurrencyId, nativeCurrencyId) ?? 0;
+      const invoiceShortfall = Math.max(0, invoiceValueMinor - bankAccountBalance(world, invoiceAccount.id));
+      const requiredNative = fxSourceForTarget(world, nativeCurrencyId, invoiceCurrencyId, invoiceShortfall) ?? 0;
       if (requiredNative <= 0 || bankAccountBalance(world, nativeAccount.id) < requiredNative + tariffNativeMinor) return null;
       const converted = executeFxConversion(world, importerEntity.id, nativeAccount.id, invoiceAccount.id, requiredNative);
       if (!converted.ok) return null;
@@ -356,13 +380,23 @@ function settleClearedTradeBaskets(world: WorldState): void {
     if (!nativeAccount || !invoiceAccount || !exporterAccount) throw new Error(`Не удалось открыть счета для торговой корзины ${first.importerCountryId} → ${first.exporterCountryId}`);
     let fxTradeId: string | null = null;
     if (nativeCurrencyId !== invoiceCurrencyId) {
-      const requiredNative = convertMinor(world, Math.ceil(invoiceRequiredMinor * 1.025), invoiceCurrencyId, nativeCurrencyId) ?? 0;
-      if (requiredNative <= 0) throw new Error(`Не удалось оценить FX для торговой корзины ${first.id}`);
+      const invoiceShortfall = Math.max(0, invoiceRequiredMinor - bankAccountBalance(world, invoiceAccount.id));
+      const requiredNative = fxSourceForTarget(world, nativeCurrencyId, invoiceCurrencyId, invoiceShortfall);
+      if (requiredNative == null) throw new Error(`Не удалось оценить FX для торговой корзины ${first.id}`);
       const requiredWithTariff = requiredNative + tariffNativeMinor;
-      if (bankAccountBalance(world, nativeAccount.id) < requiredWithTariff && importer) extendTradeFinance(world, importer, requiredWithTariff - bankAccountBalance(world, nativeAccount.id), nativeCurrencyId);
-      const converted = bankAccountBalance(world, nativeAccount.id) >= requiredWithTariff
+      if (importer) for (let attempt = 0; attempt < 2 && bankAccountBalance(world, nativeAccount.id) < requiredWithTariff; attempt += 1) {
+        const shortfall = requiredWithTariff - bankAccountBalance(world, nativeAccount.id);
+        // Macro balances can exceed MAX_SAFE_INTEGER even though every ledger leg is
+        // safely tranched. Fund a tiny relative reserve so floating-point ULPs cannot
+        // leave an economically funded basket a few units below its cash constraint.
+        const precisionReserve = Math.max(1, Math.ceil(Math.abs(requiredWithTariff) * 1e-9));
+        extendTradeFinance(world, importer, shortfall + precisionReserve, nativeCurrencyId);
+      }
+      const converted = requiredNative === 0
+        ? { ok: true, message: "Валютное покрытие уже доступно" }
+        : bankAccountBalance(world, nativeAccount.id) >= requiredWithTariff
         ? executeFxConversion(world, first.importerId, nativeAccount.id, invoiceAccount.id, requiredNative)
-        : { ok: false, message: "Недостаточно торгового финансирования" };
+        : { ok: false, message: `Недостаточно торгового финансирования: ${bankAccountBalance(world, nativeAccount.id)} / ${requiredWithTariff}` };
       if (!converted.ok) throw new Error(`FX settlement торговой корзины отклонён: ${converted.message}`);
       fxTradeId = converted.tradeId ?? null;
     }
@@ -585,9 +619,11 @@ function compactTradeFlows(world: WorldState): void {
     world.tradeFlows = world.tradeFlows.filter((flow) => flow.elapsedMonth >= cutoff);
   }
   const quarterlyCutoff = world.clock.elapsedMonths - 24;
+  const annualCutoff = world.clock.elapsedMonths - 60;
   const quarterly = new Map<string, typeof world.history.compactedTradeRecords[number]>();
+  const annual = new Map<string, typeof world.history.compactedTradeRecords[number]>();
   const recent = world.history.compactedTradeRecords.filter((record) => record.elapsedMonth >= quarterlyCutoff);
-  for (const record of world.history.compactedTradeRecords.filter((item) => item.elapsedMonth < quarterlyCutoff)) {
+  for (const record of world.history.compactedTradeRecords.filter((item) => item.elapsedMonth >= annualCutoff && item.elapsedMonth < quarterlyCutoff)) {
     const quarterMonth = Math.floor(record.elapsedMonth / 3) * 3;
     const key = `${quarterMonth}:${record.exporterCountryId}:${record.importerCountryId}:${record.commodityId}`;
     const aggregate = quarterly.get(key) ?? { ...record, elapsedMonth: quarterMonth, quantityMilliUnits: 0, valueUsdMinor: 0, flowCount: 0 };
@@ -596,7 +632,16 @@ function compactTradeFlows(world: WorldState): void {
     aggregate.flowCount += record.flowCount;
     quarterly.set(key, aggregate);
   }
-  world.history.compactedTradeRecords = [...quarterly.values(), ...recent];
+  for (const record of world.history.compactedTradeRecords.filter((item) => item.elapsedMonth < annualCutoff)) {
+    const yearMonth = Math.floor(record.elapsedMonth / 12) * 12;
+    const key = `${yearMonth}:${record.exporterCountryId}:${record.importerCountryId}:${record.commodityId}`;
+    const aggregate = annual.get(key) ?? { ...record, elapsedMonth: yearMonth, quantityMilliUnits: 0, valueUsdMinor: 0, flowCount: 0 };
+    aggregate.quantityMilliUnits += record.quantityMilliUnits;
+    aggregate.valueUsdMinor += record.valueUsdMinor;
+    aggregate.flowCount += record.flowCount;
+    annual.set(key, aggregate);
+  }
+  world.history.compactedTradeRecords = [...annual.values(), ...quarterly.values(), ...recent];
 }
 
 export function runGlobalEconomyMonth(world: WorldState): void {

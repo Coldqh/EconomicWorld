@@ -2,12 +2,24 @@ import { emitSimpleEvent } from "../core/events.ts";
 import { accountIds, bankAccountBalance, bankAccountsForOwner, depositOf, ensureAccount, postTransaction, primaryBankAccount, settleDepositPayment, transferBankAccountBalance } from "../core/ledger.ts";
 import { transferShares } from "../corporate/finance.ts";
 import type { BrokerageAccount, MarketOrder, MarketTrade, WorldState } from "../domain/model.ts";
+import {
+  bestOrder,
+  brokerageOpenCommitment,
+  marketPairKey,
+  marketRuntimeIndex,
+  ohlcvBarForMonth,
+  ownerReservedShares,
+  registerOhlcvBar,
+  registerMarketOrder,
+} from "./runtime-index.ts";
+import { finishSimulationPhaseTiming, startSimulationPhaseTiming } from "../economy/performance-timing.ts";
 
 export interface MarketResult {
   ok: boolean;
   message: string;
   orderId?: string;
   tradeIds?: string[];
+  filledQuantity?: number;
 }
 
 function ownerCountryId(world: WorldState, ownerId: string): string | null {
@@ -59,7 +71,7 @@ function executablePrice(buy: MarketOrder, sell: MarketOrder, lastPriceCents: nu
 }
 
 function orderOwner(world: WorldState, order: MarketOrder): string {
-  return world.brokerageAccounts.find((account) => account.id === order.brokerageAccountId)!.ownerId;
+  return marketRuntimeIndex(world).brokerageById.get(order.brokerageAccountId)!.ownerId;
 }
 
 function settleFee(world: WorldState, payerId: string, recipientId: string, amountCents: number, kind: "BROKER_FEE" | "EXCHANGE_FEE", memo: string, payerBankAccountId?: string): string | null {
@@ -82,15 +94,22 @@ function settleFee(world: WorldState, payerId: string, recipientId: string, amou
 }
 
 function orderSettlement(world: WorldState, order: MarketOrder) {
-  const brokerage = world.brokerageAccounts.find((account) => account.id === order.brokerageAccountId);
-  return brokerage && world.bankAccounts.find((account) => brokerage.settlementBankAccountIds.includes(account.id) && account.currencyId === brokerage.currencyId && account.status === "active");
+  const index = marketRuntimeIndex(world);
+  const brokerage = index.brokerageById.get(order.brokerageAccountId);
+  if (!brokerage) return undefined;
+  for (const accountId of brokerage.settlementBankAccountIds) {
+    const account = index.bankAccountById.get(accountId);
+    if (account?.currencyId === brokerage.currencyId && account.status === "active") return account;
+  }
+  return undefined;
 }
 
 function updateOhlcv(world: WorldState, trade: MarketTrade): void {
-  let bar = world.ohlcvBars.find((item) => item.securityId === trade.securityId && item.elapsedMonth === trade.elapsedMonth);
+  let bar = ohlcvBarForMonth(world, trade.securityId, trade.elapsedMonth);
   if (!bar) {
     bar = { securityId: trade.securityId, elapsedMonth: trade.elapsedMonth, openCents: trade.priceCents, highCents: trade.priceCents, lowCents: trade.priceCents, closeCents: trade.priceCents, volume: 0 };
     world.ohlcvBars.push(bar);
+    registerOhlcvBar(world, bar);
   }
   bar.highCents = Math.max(bar.highCents, trade.priceCents);
   bar.lowCents = Math.min(bar.lowCents, trade.priceCents);
@@ -98,23 +117,24 @@ function updateOhlcv(world: WorldState, trade: MarketTrade): void {
   bar.volume += trade.quantity;
 }
 
-export function matchOrderBook(world: WorldState, securityId: string): string[] {
-  const listing = world.listings.find((item) => item.securityId === securityId);
-  if (!listing) return [];
-  const exchange = world.exchanges.find((item) => item.id === listing.exchangeId)!;
+export function matchOrderBook(world: WorldState, securityId: string, venueId?: string): string[] {
+  const matchingStarted = startSimulationPhaseTiming();
+  const index = marketRuntimeIndex(world);
+  if (!venueId) {
+    const tradeIds = (index.securityVenueIndex.get(securityId) ?? []).flatMap((exchangeId) => matchOrderBook(world, securityId, exchangeId));
+    finishSimulationPhaseTiming("Order Matching", matchingStarted);
+    return tradeIds;
+  }
+  const listing = index.listingByPair.get(marketPairKey(securityId, venueId));
+  if (!listing) {
+    finishSimulationPhaseTiming("Order Matching", matchingStarted);
+    return [];
+  }
+  const exchange = index.exchangeById.get(listing.exchangeId)!;
   const tradeIds: string[] = [];
   while (true) {
-    const open = world.marketOrders.filter((order) => order.securityId === securityId && (order.status === "open" || order.status === "partially-filled") && order.remainingQuantity > 0);
-    const buys = open.filter((order) => order.side === "buy").sort((a, b) => {
-      if (a.type !== b.type) return a.type === "market" ? -1 : 1;
-      return (b.limitPriceCents ?? 0) - (a.limitPriceCents ?? 0) || a.sequence - b.sequence;
-    });
-    const sells = open.filter((order) => order.side === "sell").sort((a, b) => {
-      if (a.type !== b.type) return a.type === "market" ? -1 : 1;
-      return (a.limitPriceCents ?? 0) - (b.limitPriceCents ?? 0) || a.sequence - b.sequence;
-    });
-    const buy = buys[0];
-    const sell = sells[0];
+    const buy = bestOrder(world, securityId, venueId, "buy");
+    const sell = bestOrder(world, securityId, venueId, "sell");
     if (!buy || !sell) break;
     const priceCents = executablePrice(buy, sell, listing.lastPriceCents);
     if (!priceCents || priceCents <= 0) break;
@@ -124,8 +144,8 @@ export function matchOrderBook(world: WorldState, securityId: string): string[] 
     const buyerSettlement = orderSettlement(world, buy);
     const sellerSettlement = orderSettlement(world, sell);
     const grossCents = quantity * priceCents;
-    const brokerAccount = world.brokerageAccounts.find((account) => account.id === buy.brokerageAccountId)!;
-    const broker = world.brokers.find((item) => item.id === brokerAccount.brokerId)!;
+    const brokerAccount = index.brokerageById.get(buy.brokerageAccountId)!;
+    const broker = index.brokerById.get(brokerAccount.brokerId)!;
     const brokerFee = Math.max(1, Math.floor((grossCents * exchange.brokerFeeBps) / 10_000));
     const exchangeFee = Math.max(1, Math.floor((grossCents * exchange.exchangeFeeBps) / 10_000));
     if (!buyerSettlement || !sellerSettlement || bankAccountBalance(world, buyerSettlement.id) < grossCents + brokerFee + exchangeFee) {
@@ -133,7 +153,9 @@ export function matchOrderBook(world: WorldState, securityId: string): string[] 
       buy.remainingQuantity = 0;
       continue;
     }
+    const settlementStarted = startSimulationPhaseTiming();
     const transfer = transferShares(world, securityId, sellerId, buyerId, quantity, priceCents, "MARKET_TRADE", { buyerBankAccountId: buyerSettlement.id, sellerBankAccountId: sellerSettlement.id });
+    finishSimulationPhaseTiming("Settlement", settlementStarted);
     if (!transfer.ok) {
       sell.status = transfer.message.includes("акций") ? "rejected" : sell.status;
       buy.status = transfer.message.includes("денег") ? "rejected" : buy.status;
@@ -164,6 +186,7 @@ export function matchOrderBook(world: WorldState, securityId: string): string[] 
     tradeIds.push(trade.id);
     emitSimpleEvent(world, "TradeExecuted", "Биржевая сделка", `${listing.ticker}: ${quantity.toLocaleString("ru-RU")} × ${priceCents}`, [buyerId, sellerId, exchange.id], "info", transfer.transactionIds, { quantity, priceCents });
   }
+  finishSimulationPhaseTiming("Order Matching", matchingStarted);
   return tradeIds;
 }
 
@@ -175,10 +198,13 @@ export function placeOrder(
   type: "market" | "limit",
   quantity: number,
   limitPriceCents: number | null = null,
+  venueId?: string,
 ): MarketResult {
-  const account = world.brokerageAccounts.find((item) => item.id === brokerageAccountId && item.status === "active");
-  const listing = world.listings.find((item) => item.securityId === securityId);
-  const broker = account && world.brokers.find((item) => item.id === account.brokerId);
+  const index = marketRuntimeIndex(world);
+  const account = index.brokerageById.get(brokerageAccountId);
+  const broker = account && index.brokerById.get(account.brokerId);
+  const listings = index.listingsBySecurity.get(securityId) ?? [];
+  const listing = listings.find((item) => (!venueId || item.exchangeId === venueId) && broker?.exchangeIds.includes(item.exchangeId));
   if (!account || !listing || !broker || !broker.exchangeIds.includes(listing.exchangeId)) return { ok: false, message: "Инструмент недоступен у брокера" };
   if (account.currencyId !== listing.currencyId) return { ok: false, message: "Валютный рынок ещё не реализован: выберите локальную биржу" };
   quantity = Math.floor(quantity);
@@ -186,21 +212,21 @@ export function placeOrder(
   const ownerId = account.ownerId;
   if (side === "sell") {
     const shares = world.equityHoldings.find((holding) => holding.ownerId === ownerId && holding.securityId === securityId)?.shares ?? 0;
-    const reserved = world.marketOrders.filter((order) => order.securityId === securityId && order.side === "sell" && (order.status === "open" || order.status === "partially-filled") && orderOwner(world, order) === ownerId).reduce((sum, order) => sum + order.remainingQuantity, 0);
-    if (shares - reserved < quantity) return { ok: false, message: "Недостаточно свободных акций" };
+    const locked = world.lockupRestrictions.filter((item) => item.ownerId === ownerId && item.securityId === securityId && item.expiresAtMonth > world.clock.elapsedMonths).reduce((sum, item) => sum + item.shares, 0);
+    const pledged = world.collateralPledges.filter((item) => item.ownerId === ownerId && item.assetType === "security" && item.assetId === securityId && item.status === "active").reduce((sum, item) => sum + item.quantity, 0);
+    const reserved = ownerReservedShares(world, ownerId, securityId);
+    if (shares - locked - pledged - reserved < quantity) return { ok: false, message: "Недостаточно свободных акций: часть позиции продана, заблокирована или передана в залог" };
   } else {
     const estimatedPrice = limitPriceCents ?? listing.lastPriceCents;
-    const settlement = world.bankAccounts.find((item) => account.settlementBankAccountIds.includes(item.id) && item.currencyId === account.currencyId && item.status === "active");
-    const openCommitment = world.marketOrders.filter((order) => order.side === "buy" && (order.status === "open" || order.status === "partially-filled") && order.brokerageAccountId === account.id).reduce((sum, order) => {
-      const price = order.limitPriceCents ?? world.listings.find((item) => item.securityId === order.securityId)?.lastPriceCents ?? 0;
-      return sum + order.remainingQuantity * price;
-    }, 0);
+    const settlement = account.settlementBankAccountIds.map((accountId) => index.bankAccountById.get(accountId)).find((item) => item?.currencyId === account.currencyId && item.status === "active");
+    const openCommitment = brokerageOpenCommitment(world, account.id);
     if (!settlement || bankAccountBalance(world, settlement.id) - openCommitment < quantity * estimatedPrice) return { ok: false, message: "Недостаточно свободных денег" };
   }
   const order: MarketOrder = {
     id: `order-${String(world.nextOrderId++).padStart(8, "0")}`,
     brokerageAccountId,
     securityId,
+    exchangeId: listing.exchangeId,
     side,
     type,
     quantity,
@@ -211,13 +237,23 @@ export function placeOrder(
     status: "open",
   };
   world.marketOrders.push(order);
+  registerMarketOrder(world, order);
   emitSimpleEvent(world, "OrderPlaced", "Заявка принята", `${side === "buy" ? "Покупка" : "Продажа"}: ${quantity.toLocaleString("ru-RU")}`, [ownerId, listing.exchangeId], "info", [], { quantity });
-  const tradeIds = matchOrderBook(world, securityId);
-  return { ok: true, message: tradeIds.length ? "Заявка исполнена полностью или частично" : "Заявка в книге", orderId: order.id, tradeIds };
+  const firstNewTrade = world.marketTrades.length;
+  const tradeIds = matchOrderBook(world, securityId, listing.exchangeId);
+  const fills = world.marketTrades.slice(firstNewTrade).filter((trade) => trade.buyOrderId === order.id || trade.sellOrderId === order.id);
+  const filledQuantity = fills.reduce((sum, trade) => sum + trade.quantity, 0);
+  if (filledQuantity > 0) {
+    const expectedPriceMinor = limitPriceCents ?? listing.lastPriceCents;
+    const averagePriceMinor = Math.round(fills.reduce((sum, trade) => sum + trade.priceCents * trade.quantity, 0) / filledQuantity);
+    const direction = side === "buy" ? 1 : -1;
+    world.executionQuality.push({ orderId: order.id, expectedPriceMinor, averagePriceMinor, slippageBps: Math.round(direction * (averagePriceMinor - expectedPriceMinor) * 10_000 / Math.max(1, expectedPriceMinor)), marketImpactBps: Math.round(direction * (listing.lastPriceCents - expectedPriceMinor) * 10_000 / Math.max(1, expectedPriceMinor)), filledQuantity });
+  }
+  return { ok: true, message: tradeIds.length ? "Заявка исполнена полностью или частично" : "Заявка в книге", orderId: order.id, tradeIds, filledQuantity };
 }
 
 export function cancelOrder(world: WorldState, orderId: string, ownerId: string): MarketResult {
-  const order = world.marketOrders.find((item) => item.id === orderId);
+  const order = marketRuntimeIndex(world).orderById.get(orderId);
   if (!order || orderOwner(world, order) !== ownerId || (order.status !== "open" && order.status !== "partially-filled")) return { ok: false, message: "Заявку нельзя отменить" };
   order.status = "cancelled";
   emitSimpleEvent(world, "OrderCancelled", "Заявка отменена", order.id, [ownerId], "info");
@@ -247,6 +283,7 @@ export function portfolioSummary(world: WorldState, ownerId: string): {
 
 export function runMarketAgents(world: WorldState): void {
   for (const listing of world.listings) listing.previousCloseCents = listing.lastPriceCents;
+  for (const order of world.marketOrders.filter((item) => item.placedAtMonth < world.clock.elapsedMonths - 2 && (item.status === "open" || item.status === "partially-filled") && orderOwner(world, item) !== world.player.householdId)) order.status = "cancelled";
   const archived = world.marketOrders.filter((order) => order.placedAtMonth < world.clock.elapsedMonths - 2 && ["filled", "cancelled", "rejected"].includes(order.status));
   if (archived.length) {
     world.archivedMarketOrders.push(...archived);

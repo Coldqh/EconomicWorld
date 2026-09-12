@@ -2,6 +2,7 @@ import { emitSimpleEvent } from "../core/events.ts";
 import {
   accountIds,
   bankAccountBalance,
+  bankAccountsForOwner,
   depositOf,
   ensureAccount,
   entityBook,
@@ -51,7 +52,11 @@ function ownerCurrency(world: WorldState, ownerId: string): string | null {
   const population = world.populationCohorts.find((item) => item.id === ownerId);
   const company = world.companies.find((item) => item.id === ownerId);
   const bankId = household?.bankId ?? population?.bankId ?? company?.bankId;
-  return world.banks.find((bank) => bank.id === bankId)?.baseCurrency ?? null;
+  return world.banks.find((bank) => bank.id === bankId)?.baseCurrency
+    ?? world.funds.find((fund) => fund.id === ownerId)?.currencyId
+    ?? world.banks.find((bank) => bank.id === ownerId)?.baseCurrency
+    ?? bankAccountsForOwner(world, ownerId)[0]?.currencyId
+    ?? null;
 }
 
 function holdingFor(world: WorldState, securityId: string, ownerId: string): EquityHolding | undefined {
@@ -244,6 +249,22 @@ export function declareDividend(world: WorldState, companyId: string, totalCents
   return result(true, "Дивиденд выплачен", transactionIds);
 }
 
+export function executeShareBuyback(world: WorldState, companyId: string, sellerId: string, shares: number, pricePerShareCents: number): CorporateResult {
+  const company = world.companies.find((item) => item.id === companyId && item.active && item.corporateStatus === "public");
+  const security = company && world.equitySecurities.find((item) => item.id === company.equitySecurityId && item.status === "listed");
+  const board = company && world.corporateBoards.find((item) => item.id === company.boardId);
+  if (!company || !security || !board || shares <= 0) return result(false, "Выкуп недоступен");
+  const buyerAccount = bankAccountsForOwner(world, company.id, security.currencyId)[0]; const sellerAccount = bankAccountsForOwner(world, sellerId, security.currencyId)[0];
+  if (!buyerAccount || !sellerAccount) return result(false, "Нет расчётного счёта");
+  const transfer = transferShares(world, security.id, sellerId, company.id, shares, pricePerShareCents, "EQUITY_SECONDARY", { buyerBankAccountId: buyerAccount.id, sellerBankAccountId: sellerAccount.id });
+  if (!transfer.ok) return transfer;
+  const treasury = world.equityHoldings.find((item) => item.ownerId === company.id && item.securityId === security.id); const retired = Math.min(shares, treasury?.shares ?? 0);
+  if (treasury) { treasury.shares -= retired; treasury.costBasisCents = Math.max(0, treasury.costBasisCents - retired * pricePerShareCents); }
+  security.sharesOutstanding = Math.max(0, security.sharesOutstanding - retired);
+  recordAction(world, company.id, "buyback", "Выкуп и погашение акций", retired * pricePerShareCents, [sellerId, security.id]);
+  return result(true, `Погашено ${retired} акций`, transfer.transactionIds);
+}
+
 export function issueBond(
   world: WorldState,
   companyId: string,
@@ -386,7 +407,7 @@ export function runBankruptcyWaterfall(world: WorldState, companyId: string): Co
 
 export function startIpo(world: WorldState, companyId: string, investorId: string, primaryCents: number, pricePerShareCents: number): CorporateResult {
   const company = world.companies.find((item) => item.id === companyId);
-  if (!company || company.corporateStatus !== "private") return result(false, "IPO недоступно");
+  if (!company || company.corporateStatus !== "private") return result(false, "Первичное размещение недоступно");
   const exchange = world.exchanges.find((item) => item.countryId === company.headquartersCountryId);
   if (!exchange) return result(false, "В стране нет биржи");
   const raised = raiseEquity(world, companyId, investorId, primaryCents, pricePerShareCents, "IPO");

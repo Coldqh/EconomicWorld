@@ -1,7 +1,9 @@
 import { emitSimpleEvent } from "../core/events.ts";
-import { accountIds, bankAccountBalance, bankAccountsForOwner, ensureAccount, postTransaction, seedDeposit, transferBankAccountBalance } from "../core/ledger.ts";
+import { accountIds, bankAccountBalance, ensureAccount, postTransaction, transferBankAccountBalance } from "../core/ledger.ts";
 import type { FxPair, WorldState } from "../domain/model.ts";
-import { convertMinor, convertMinorAtRate, fxRatePpm } from "./currencies.ts";
+import { convertMinorAtRate, fxRatePpm } from "./currencies.ts";
+import { valueOwnerBalanceSheet } from "./owner-valuation.ts";
+import { issueLoan } from "./credit.ts";
 
 export interface FxConversionQuote {
   fromCurrencyId: string;
@@ -20,17 +22,62 @@ function pairFor(world: WorldState, leftCurrencyId: string, rightCurrencyId: str
     || (pair.baseCurrencyId === rightCurrencyId && pair.quoteCurrencyId === leftCurrencyId)) ?? null;
 }
 
-function dealerAccount(world: WorldState, currencyId: string) {
+function dealerAccounts(world: WorldState, currencyId: string) {
   const dealer = world.fxDealers[0];
-  return dealer && dealer.bankAccountIds.map((id) => world.bankAccounts.find((account) => account.id === id)).find((account) => account?.currencyId === currencyId) || null;
+  if (!dealer) return [];
+  // bankAccountIds is kept for save compatibility, but runtime selection also scans
+  // the owner's live accounts so liquidity facilities opened at another bank become
+  // immediately usable by the dealer.
+  return world.bankAccounts
+    .filter((account) => account.ownerId === dealer.id && account.currencyId === currencyId && account.status === "active")
+    .sort((left, right) => bankAccountBalance(world, right.id) - bankAccountBalance(world, left.id));
 }
 
-function refillDealerInventory(world: WorldState, account: NonNullable<ReturnType<typeof dealerAccount>>, requiredMinor: number): void {
+function dealerAccount(world: WorldState, currencyId: string, requiredMinor = 0): WorldState["bankAccounts"][number] | null {
+  const accounts = dealerAccounts(world, currencyId);
+  if (requiredMinor > 0) return accounts.find((account) => bankAccountBalance(world, account.id) >= requiredMinor) ?? null;
+  return accounts[0] ?? null;
+}
+
+function dealerInventoryMinor(world: WorldState, currencyId: string): number {
+  return dealerAccounts(world, currencyId).reduce((sum, account) => sum + bankAccountBalance(world, account.id), 0);
+}
+
+function fundDealerInventory(world: WorldState, currencyId: string, requiredMinor: number): WorldState["bankAccounts"][number] | null {
+  let funded: WorldState["bankAccounts"][number] | null = dealerAccount(world, currencyId, requiredMinor);
+  if (funded) return funded;
   const dealer = world.fxDealers[0];
-  if (!dealer || world.baselineReference.mode !== "REAL_WORLD") return;
-  const current = bankAccountBalance(world, account.id);
-  const target = Math.max(requiredMinor * 2, dealer.targetInventoryByCurrency[account.currencyId] ?? 0);
-  if (current < requiredMinor) seedDeposit(world, dealer.id, account.bankId, Math.max(1, target - current));
+  if (!dealer) return null;
+
+  // A global FX dealer is a liquidity intermediary, not an ordinary operating firm.
+  // If a currency inventory is temporarily exhausted it draws a *real bank credit
+  // facility*: the bank creates a deposit and a matching loan asset/liability. This
+  // preserves the money/credit identities and replaces the old post-init GENESIS
+  // refill. We spread facilities across eligible same-currency banks, so one bank's
+  // prudential limit cannot become an artificial hard stop for the entire FX market.
+  const banks = world.banks
+    .filter((bank) => bank.baseCurrency === currencyId)
+    .sort((left, right) => {
+      const leftLoans = world.loans.filter((loan) => loan.lenderBankId === left.id && loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
+      const rightLoans = world.loans.filter((loan) => loan.lenderBankId === right.id && loan.status === "active").reduce((sum, loan) => sum + loan.remainingPrincipalCents, 0);
+      return leftLoans - rightLoans;
+    });
+  const targetInventory = Math.max(requiredMinor, dealer.targetInventoryByCurrency[currencyId] ?? requiredMinor);
+  const facilityChunk = Math.max(requiredMinor, Math.ceil(Math.min(targetInventory * 0.05, requiredMinor * 8)));
+
+  for (const bank of banks) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      funded = dealerAccount(world, currencyId, requiredMinor);
+      if (funded) return funded;
+      const existing = world.bankAccounts.find((account) => account.ownerId === dealer.id && account.bankId === bank.id && account.currencyId === currencyId && account.status === "active");
+      const existingBalance = existing ? bankAccountBalance(world, existing.id) : 0;
+      const request = Math.max(1, Math.ceil(Math.max(requiredMinor - existingBalance, facilityChunk) * 1.08));
+      const loan = issueLoan(world, bank.id, dealer.id, request, 120, 120 + attempt * 30, ["fx-dealer-liquidity", currencyId]);
+      if (!loan) break;
+      if (!dealer.bankAccountIds.includes(loan.settlementBankAccountId)) dealer.bankAccountIds.push(loan.settlementBankAccountId);
+    }
+  }
+  return dealerAccount(world, currencyId, requiredMinor);
 }
 
 export function quoteFxConversion(world: WorldState, fromCurrencyId: string, toCurrencyId: string, amountFromMinor: number): FxConversionQuote | null {
@@ -57,8 +104,8 @@ export function executeFxConversion(
   if (!fromAccount || !toAccount || fromAccount.currencyId === toAccount.currencyId) return { ok: false, message: "Выберите два действующих счёта в разных валютах" };
   const quote = quoteFxConversion(world, fromAccount.currencyId, toAccount.currencyId, amountFromMinor);
   const sourceDealer = dealerAccount(world, fromAccount.currencyId);
-  const targetDealer = dealerAccount(world, toAccount.currencyId);
-  if (!quote || !sourceDealer || !targetDealer) return { ok: false, message: "Для пары нет исполнимой котировки" };
+  let targetDealer: WorldState["bankAccounts"][number] | null = dealerAccount(world, toAccount.currencyId, quote?.amountToMinor ?? 0);
+  if (!quote || !sourceDealer) return { ok: false, message: "Для пары нет исполнимой котировки" };
   if (bankAccountBalance(world, fromAccount.id) < quote.amountFromMinor) return { ok: false, message: `Недостаточно ${fromAccount.currencyId}` };
   const maximumEntry = Number.MAX_SAFE_INTEGER - 1_000_000;
   if (quote.amountFromMinor > maximumEntry || quote.amountToMinor > maximumEntry) {
@@ -76,15 +123,36 @@ export function executeFxConversion(
     }
     return { ok: true, message: "Обмен исполнен траншами", tradeId: firstTradeId, quote: lastQuote };
   }
-  refillDealerInventory(world, targetDealer, quote.amountToMinor);
-  if (bankAccountBalance(world, targetDealer.id) < quote.amountToMinor) return { ok: false, message: "У дилера недостаточно ликвидности" };
+  if (!targetDealer) targetDealer = fundDealerInventory(world, toAccount.currencyId, quote.amountToMinor);
+  if (!targetDealer) return { ok: false, message: `У дилера недостаточно ликвидности; банковское фондирование недоступно (${toAccount.currencyId}: ${dealerInventoryMinor(world, toAccount.currencyId)} / ${quote.amountToMinor})` };
 
   const tradeId = `fx-trade-${String(world.nextFxTradeId++).padStart(8, "0")}`;
   const groupId = `fx-group-${tradeId}`;
   const sourceLeg = transferBankAccountBalance(world, fromAccount.id, sourceDealer.id, quote.amountFromMinor, "FX_TRADE", `${tradeId}: ${fromAccount.currencyId} leg`, [groupId]);
   if (!sourceLeg) return { ok: false, message: "Не удалось провести исходящую валютную ногу" };
+  // Reserve/interbank settlement of the first leg can change bank liquidity but must
+  // never leave the client with a one-sided FX trade. Re-check executable inventory
+  // immediately before the counter-leg and draw another real dealer facility if
+  // necessary.
+  let executableTargetDealer: WorldState["bankAccounts"][number] | null = targetDealer;
+  if (!executableTargetDealer || bankAccountBalance(world, executableTargetDealer.id) < quote.amountToMinor) {
+    executableTargetDealer = fundDealerInventory(world, toAccount.currencyId, quote.amountToMinor);
+  }
+  if (!executableTargetDealer) {
+    const rollback = transferBankAccountBalance(world, sourceDealer.id, fromAccount.id, quote.amountFromMinor, "FX_TRADE", `${tradeId}: rollback ${fromAccount.currencyId} leg`, [sourceLeg, groupId]);
+    if (!rollback) throw new Error(`FX ${tradeId}: встречная нога и rollback отклонены`);
+    return { ok: false, message: `FX ${tradeId}: встречная нога не профинансирована, исходящая нога возвращена` };
+  }
+  targetDealer = executableTargetDealer;
+  const targetBalanceBefore = bankAccountBalance(world, targetDealer.id);
   const targetLeg = transferBankAccountBalance(world, targetDealer.id, toAccount.id, quote.amountToMinor, "FX_TRADE", `${tradeId}: ${toAccount.currencyId} leg`, [groupId]);
-  if (!targetLeg) throw new Error(`FX ${tradeId}: исходящая нога проведена, встречная нога отклонена`);
+  if (!targetLeg) {
+    // Compensate the already-settled source leg instead of leaving an economically
+    // impossible half trade in the ledger.
+    const rollback = transferBankAccountBalance(world, sourceDealer.id, fromAccount.id, quote.amountFromMinor, "FX_TRADE", `${tradeId}: rollback ${fromAccount.currencyId} leg`, [sourceLeg, groupId]);
+    if (!rollback) throw new Error(`FX ${tradeId}: встречная нога и rollback отклонены`);
+    return { ok: false, message: `FX ${tradeId}: встречная нога отклонена, исходящая нога возвращена (account=${targetDealer.id}, status=${targetDealer.status}, currency=${targetDealer.currencyId}/${toAccount.currencyId}, balance=${targetBalanceBefore}, required=${quote.amountToMinor})` };
+  }
   const ownerSourcePosition = accountIds.fxPosition(ownerId, tradeId, fromAccount.currencyId);
   const dealerSourcePosition = accountIds.fxPosition(sourceDealer.ownerId, tradeId, fromAccount.currencyId);
   const dealerTargetPosition = accountIds.fxPosition(targetDealer.ownerId, tradeId, toAccount.currencyId);
@@ -103,11 +171,12 @@ export function executeFxConversion(
   ], [targetLeg, groupId]);
 
   const pair = world.fxPairs.find((item) => item.id === quote.pairId)!;
-  pair.previousRatePpm = pair.lastRatePpm;
   const executedPairRate = pair.baseCurrencyId === fromAccount.currencyId
     ? quote.ratePpm
     : Math.max(1, Math.round(1_000_000_000_000 / quote.ratePpm));
-  pair.lastRatePpm = executedPairRate;
+  // Execution occurs at bid/ask. The market mid is updated separately from
+  // dealer inventory/policy pressure in refreshFxQuotes; a retail spread must
+  // never become the new fundamental midpoint by itself.
   pair.volumeBaseMinor += pair.baseCurrencyId === fromAccount.currencyId
     ? quote.amountFromMinor
     : quote.amountToMinor;
@@ -132,42 +201,43 @@ export function executeFxConversion(
 
 export function refreshFxQuotes(world: WorldState): void {
   const dealer = world.fxDealers[0];
+  const inventoryByCurrency = new Map<string, number>();
+  if (dealer) {
+    for (const account of world.bankAccounts) {
+      if (account.ownerId !== dealer.id || account.status !== "active") continue;
+      inventoryByCurrency.set(account.currencyId, (inventoryByCurrency.get(account.currencyId) ?? 0) + bankAccountBalance(world, account.id));
+    }
+  }
+  const policyRateByCurrency = new Map<string, number>();
+  for (const area of world.monetaryAreas) {
+    policyRateByCurrency.set(area.currencyId, world.centralBanks.find((bank) => bank.id === area.monetaryAuthorityId)?.policyRateBps ?? 0);
+  }
   for (const pair of world.fxPairs) {
-    const baseAccount = dealerAccount(world, pair.baseCurrencyId);
-    const quoteAccount = dealerAccount(world, pair.quoteCurrencyId);
     const baseTarget = dealer?.targetInventoryByCurrency[pair.baseCurrencyId] ?? 1;
     const quoteTarget = dealer?.targetInventoryByCurrency[pair.quoteCurrencyId] ?? 1;
-    const baseInventoryPressure = baseAccount ? Math.round((bankAccountBalance(world, baseAccount.id) - baseTarget) * 200 / Math.max(1, baseTarget)) : 0;
-    const quoteInventoryPressure = quoteAccount ? Math.round((bankAccountBalance(world, quoteAccount.id) - quoteTarget) * 200 / Math.max(1, quoteTarget)) : 0;
-    const baseArea = world.monetaryAreas.find((area) => area.currencyId === pair.baseCurrencyId);
-    const quoteArea = world.monetaryAreas.find((area) => area.currencyId === pair.quoteCurrencyId);
-    const baseRate = world.centralBanks.find((bank) => bank.id === baseArea?.monetaryAuthorityId)?.policyRateBps ?? 0;
-    const quoteRate = world.centralBanks.find((bank) => bank.id === quoteArea?.monetaryAuthorityId)?.policyRateBps ?? 0;
+    const baseInventory = inventoryByCurrency.get(pair.baseCurrencyId) ?? 0;
+    const quoteInventory = inventoryByCurrency.get(pair.quoteCurrencyId) ?? 0;
+    const baseInventoryPressure = Math.round((baseInventory - baseTarget) * 200 / Math.max(1, baseTarget));
+    const quoteInventoryPressure = Math.round((quoteInventory - quoteTarget) * 200 / Math.max(1, quoteTarget));
+    const baseRate = policyRateByCurrency.get(pair.baseCurrencyId) ?? 0;
+    const quoteRate = policyRateByCurrency.get(pair.quoteCurrencyId) ?? 0;
     const policySkewBps = Math.max(-80, Math.min(80, Math.round((baseRate - quoteRate) / 20)));
     const inventorySkewBps = Math.max(-45, Math.min(45, quoteInventoryPressure - baseInventoryPressure));
-    const quotedMid = Math.max(1, Math.round(pair.lastRatePpm * (10_000 + policySkewBps + inventorySkewBps) / 10_000));
+    // The midpoint moves only from funding/policy pressure. Dealer bid/ask execution prices
+    // never become the next midpoint by themselves. Divide the instantaneous pressure
+    // over a year-equivalent horizon so a burst of retail conversions cannot compound
+    // into an artificial FX trend inside one simulation month.
+    const midpointMoveBps = Math.max(-25, Math.min(25, Math.round((policySkewBps + inventorySkewBps) / 12)));
+    const quotedMid = Math.max(1, Math.round(pair.lastRatePpm * (10_000 + midpointMoveBps) / 10_000));
+    pair.previousRatePpm = pair.lastRatePpm;
+    pair.lastRatePpm = quotedMid;
     const halfSpread = Math.max(1, Math.round(quotedMid * pair.spreadBps / 20_000));
-    pair.bidRatePpm = quotedMid - halfSpread;
+    pair.bidRatePpm = Math.max(1, quotedMid - halfSpread);
     pair.askRatePpm = quotedMid + halfSpread;
   }
 }
 
 export function valueInReportingCurrency(world: WorldState, ownerId: string, reportingCurrencyId: string): { totalMinor: number; translationEffectMinor: number } {
-  let totalMinor = 0;
-  let translationEffectMinor = 0;
-  for (const account of bankAccountsForOwner(world, ownerId)) {
-    const balance = bankAccountBalance(world, account.id);
-    const converted = convertMinor(world, balance, account.currencyId, reportingCurrencyId) ?? 0;
-    totalMinor += converted;
-    if (account.currencyId !== reportingCurrencyId) translationEffectMinor += converted;
-  }
-  for (const holding of world.equityHoldings.filter((item) => item.ownerId === ownerId && item.shares > 0)) {
-    const listing = world.listings.find((item) => item.securityId === holding.securityId);
-    const security = world.equitySecurities.find((item) => item.id === holding.securityId);
-    const native = holding.shares * (listing?.lastPriceCents ?? Math.round(holding.costBasisCents / Math.max(1, holding.shares)));
-    const converted = convertMinor(world, native, security?.currencyId ?? reportingCurrencyId, reportingCurrencyId) ?? 0;
-    totalMinor += converted;
-    if (security?.currencyId !== reportingCurrencyId) translationEffectMinor += converted;
-  }
-  return { totalMinor, translationEffectMinor };
+  const value = valueOwnerBalanceSheet(world, ownerId, reportingCurrencyId);
+  return { totalMinor: value.totalMinor, translationEffectMinor: value.translationEffectMinor };
 }

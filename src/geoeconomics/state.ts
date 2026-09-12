@@ -22,11 +22,14 @@ export function seedGeoeconomics(world: WorldState): void {
       investmentAccessBonusBps: 800, startsAtMonth: 0, endsAtMonth: null, status: "active",
     });
   }
-  if (world.geoeconomics.soeMandates.length === 0) {
-    for (const country of world.countries) {
-      const company = world.companies.find((item) => item.headquartersCountryId === country.id && item.active);
-      if (company) world.geoeconomics.soeMandates.push({ companyId: company.id, countryId: country.id, stateOwnershipBps: 5_100, mandate: company.goodId === "energy" ? "energy-security" : "infrastructure", softBudgetConstraintBps: 4_000 });
-    }
-  }
+  // Cap table is the only ownership source. Invalid legacy metadata is discarded.
+  world.geoeconomics.soeMandates = world.companies.flatMap((company) => {
+    const security = world.equitySecurities.find((item) => item.id === company.equitySecurityId);
+    if (!security || security.sharesOutstanding <= 0) return [];
+    const governmentIds = new Set(world.governments.filter((item) => item.countryId === company.headquartersCountryId).map((item) => item.id));
+    const stateShares = world.equityHoldings.filter((item) => item.securityId === security.id && governmentIds.has(item.ownerId)).reduce((sum, item) => sum + item.shares, 0);
+    const stateOwnershipBps = Math.round(stateShares * 10_000 / security.sharesOutstanding);
+    if (stateOwnershipBps < 5_001) return [];
+    return [{ companyId: company.id, countryId: company.headquartersCountryId, stateOwnershipBps, mandate: company.goodId === "energy" ? "energy-security" as const : "infrastructure" as const, softBudgetConstraintBps: 4_000 }];
+  });
 }
-

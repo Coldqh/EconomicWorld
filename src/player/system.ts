@@ -1,8 +1,10 @@
 import { currentDate } from "../core/clock.ts";
-import { accountIds, balanceOf, depositOf, entityBook } from "../core/ledger.ts";
+import { bankAccountsForOwner } from "../core/ledger.ts";
 import { emitSimpleEvent } from "../core/events.ts";
 import type { PlayerMonthlySnapshot, PlayerTimelineEvent, SkillId, WorldState } from "../domain/model.ts";
 import { ACADEMY_COURSES } from "../education/catalog.ts";
+import { convertMinor } from "../finance/currencies.ts";
+import { valueOwnerBalanceSheet } from "../finance/owner-valuation.ts";
 
 export const SKILL_LABELS: Record<SkillId, string> = {
   economics: "Экономика",
@@ -38,23 +40,43 @@ export function playerDebtCents(world: WorldState): number {
 }
 
 export function playerNetWorthCents(world: WorldState): number {
-  const book = entityBook(world, world.player.householdId);
-  return book.assets - book.liabilities;
+  return valueOwnerBalanceSheet(world, world.player.householdId, world.player.reportingCurrencyId).totalMinor;
 }
 
-export function playerMonthCashFlow(world: WorldState, elapsedMonth = world.clock.elapsedMonths): { income: number; expenses: number } {
+export function playerMonthCashFlow(world: WorldState, elapsedMonth = world.clock.elapsedMonths): { income: number; expenses: number; investing: number; financing: number; taxes: number; transfers: number; netCashChange: number } {
   let income = 0;
   let expenses = 0;
+  let investing = 0;
+  let financing = 0;
+  let taxes = 0;
+  let transfers = 0;
+  let netCashChange = 0;
+  const accounts = bankAccountsForOwner(world, world.player.householdId);
+  const byLedgerId = new Map(accounts.map((account) => [account.ledgerDepositAccountId, account.currencyId]));
+  const investmentKinds = new Set(["FUND_SUBSCRIPTION", "FUND_REDEMPTION", "MARKET_TRADE", "EQUITY_ISSUE", "EQUITY_SECONDARY", "BOND_ISSUE", "SOVEREIGN_ISSUE", "ETF_CREATION", "ETF_REDEMPTION", "PROPERTY_PURCHASE", "USED_ASSET", "CAPITAL_CONTRIBUTION", "BROKER_DEPOSIT"]);
+  const financingKinds = new Set(["LOAN_ISSUED", "LOAN_PRINCIPAL", "MARGIN_FINANCE", "MARGIN_REPAYMENT", "REPO_OPEN", "REPO_REPAYMENT"]);
+  const taxKinds = new Set(["INCOME_TAX", "SALES_TAX", "PROPERTY_TAX"]);
   for (let index = world.ledger.transactions.length - 1; index >= 0; index -= 1) {
     const transaction = world.ledger.transactions[index];
     if (transaction.elapsedMonth < elapsedMonth) break;
-    if (transaction.elapsedMonth > elapsedMonth) continue;
-    const entry = transaction.entries.find((item) => item.accountId === accountIds.deposit(world.player.householdId));
-    if (!entry) continue;
-    if (entry.side === "debit" && transaction.kind !== "LOAN_ISSUED" && transaction.kind !== "GENESIS") income += entry.amountCents;
-    if (entry.side === "credit" && transaction.kind !== "LOAN_PRINCIPAL") expenses += entry.amountCents;
+    if (transaction.elapsedMonth > elapsedMonth || transaction.kind === "GENESIS") continue;
+    let cashDelta = 0;
+    for (const entry of transaction.entries) {
+      const currencyId = byLedgerId.get(entry.accountId);
+      if (!currencyId) continue;
+      const signed = entry.side === "debit" ? entry.amountCents : -entry.amountCents;
+      cashDelta += convertMinor(world, signed, currencyId, world.player.reportingCurrencyId) ?? 0;
+    }
+    if (!cashDelta) continue;
+    netCashChange += cashDelta;
+    if (transaction.kind === "FX_TRADE" || transaction.kind === "TRANSFER" && transaction.causeIds.some((id) => id.startsWith("own-account:"))) { transfers += cashDelta; continue; }
+    if (investmentKinds.has(transaction.kind)) { investing += cashDelta; continue; }
+    if (financingKinds.has(transaction.kind)) { financing += cashDelta; continue; }
+    if (taxKinds.has(transaction.kind)) { if (cashDelta < 0) { taxes += -cashDelta; expenses += -cashDelta; } else income += cashDelta; continue; }
+    if (cashDelta > 0) income += cashDelta;
+    else expenses += -cashDelta;
   }
-  return { income, expenses };
+  return { income, expenses, investing, financing, taxes, transfers, netCashChange };
 }
 
 export function addPlayerTimeline(world: WorldState, type: PlayerTimelineEvent["type"], title: string, detail: string): void {
@@ -126,7 +148,7 @@ export function playerFinancialSummary(world: WorldState) {
   const cashFlow = current ?? { incomeCents: 0, expensesCents: 0, savingsCents: 0 };
   return {
     age: playerAge(world),
-    depositsCents: depositOf(world, world.player.householdId),
+    depositsCents: valueOwnerBalanceSheet(world, world.player.householdId, world.player.reportingCurrencyId).components.cash ?? 0,
     debtCents: playerDebtCents(world),
     netWorthCents: playerNetWorthCents(world),
     incomeCents: cashFlow.incomeCents,
@@ -138,12 +160,13 @@ export function playerFinancialSummary(world: WorldState) {
 }
 
 export function tracePlayerMoney(world: WorldState) {
+  const accountIds = new Set(bankAccountsForOwner(world, world.player.householdId).map((item) => item.ledgerDepositAccountId));
   return world.ledger.transactions
-    .filter((transaction) => transaction.entries.some((entry) => entry.accountId === accountIds.deposit(world.player.householdId)))
+    .filter((transaction) => transaction.entries.some((entry) => accountIds.has(entry.accountId)))
     .slice(-100)
     .reverse();
 }
 
 export function playerDepositBalance(world: WorldState): number {
-  return balanceOf(world, accountIds.deposit(world.player.householdId));
+  return valueOwnerBalanceSheet(world, world.player.householdId, world.player.reportingCurrencyId).components.cash ?? 0;
 }

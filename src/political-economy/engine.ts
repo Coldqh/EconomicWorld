@@ -1,4 +1,4 @@
-import { bankAccountBalance } from "../core/ledger.ts";
+import { bankAccountBalance, depositOf, transferDeposit } from "../core/ledger.ts";
 import type { PoliticalEconomyDecisionTrace, WorldState } from "../domain/model.ts";
 import { currencyBankAccount, settleFinancialPayment } from "../finance/financial-settlement.ts";
 import { issueLoan } from "../finance/credit.ts";
@@ -28,12 +28,26 @@ export function refreshPoliticalEconomyAccounts(world: WorldState): void {
     if (budget) budget.effectiveTaxCollectionBps = compliance.taxComplianceBps;
     const period = world.countryEconomicAccounts.closedByCountry[country.id];
     const officialOutputMinor = period?.production.valueAddedMinor ?? 0;
-    const hiddenOutputMinor = Math.round(officialOutputMinor * (10_000 - compliance.taxComplianceBps) / Math.max(1, compliance.taxComplianceBps));
+    const estimatedHiddenOutputMinor = Math.round(officialOutputMinor * (10_000 - compliance.taxComplianceBps) / Math.max(1, compliance.taxComplianceBps));
+    const payer = world.populationCohorts.find((item) => item.countryId === country.id);
+    const worker = world.populationCohorts.find((item) => item.countryId === country.id && item.id !== payer?.id) ?? payer;
+    const supplier = world.firmCohorts.find((item) => item.countryId === country.id);
+    const resourceCapacity = supplier ? Math.max(1, Math.round(supplier.capitalCents / 120 + supplier.employment * supplier.productivityBps)) : 0;
+    const monthlyInformalSales = payer && worker && supplier ? Math.min(estimatedHiddenOutputMinor, Math.round(officialOutputMinor * 800 / 10_000), resourceCapacity) : 0;
+    const sale = world.clock.elapsedMonths % 3 === 0 && payer ? Math.min(monthlyInformalSales * 3, depositOf(world, payer.id)) : 0;
+    // Aggregate self-employment: one payment is both a household purchase and
+    // the informal producer's mixed cash income.
+    const saleTx = sale > 0 && payer && worker ? transferDeposit(world, payer.id, worker.id, sale, "COHORT_CONSUMPTION", `Неформальные товары и услуги · ${country.id}`) : null;
+    const hiddenOutputMinor = Math.round(monthlyInformalSales * 6_500 / 10_000);
+    const intermediateInputsMinor = monthlyInformalSales - hiddenOutputMinor;
+    const informalValueAddedMinor = hiddenOutputMinor;
+    const informalWagesMinor = Math.round(informalValueAddedMinor * 7_000 / 10_000);
+    const undeclaredProfitMinor = informalValueAddedMinor - informalWagesMinor;
     const officialEmployment = (period?.labour.explicitEmployment ?? 0) + (period?.labour.cohortEmployment ?? 0);
     const informalEmployment = Math.round(officialEmployment * (10_000 - compliance.labourComplianceBps) / Math.max(1, compliance.labourComplianceBps));
     const assessedTaxMinor = period ? period.fiscal.personalTaxMinor + period.fiscal.corporateTaxMinor + period.fiscal.consumptionTaxMinor + period.fiscal.propertyOtherTaxMinor : 0;
     const collectedTaxMinor = Math.round(assessedTaxMinor * compliance.taxComplianceBps / 10_000);
-    world.politicalEconomy.shadowEconomy.push({ countryId: country.id, elapsedMonth: world.clock.elapsedMonths, trueOutputMinor: officialOutputMinor + hiddenOutputMinor, officialOutputMinor, hiddenOutputMinor, trueEmployment: officialEmployment + informalEmployment, officialEmployment, informalEmployment, assessedTaxMinor, collectedTaxMinor, taxGapMinor: Math.max(0, assessedTaxMinor - collectedTaxMinor) });
+    world.politicalEconomy.shadowEconomy.push({ countryId: country.id, elapsedMonth: world.clock.elapsedMonths, trueOutputMinor: officialOutputMinor + informalValueAddedMinor, officialOutputMinor, hiddenOutputMinor: informalValueAddedMinor, trueEmployment: officialEmployment + informalEmployment, officialEmployment, informalEmployment, assessedTaxMinor, collectedTaxMinor, taxGapMinor: Math.max(0, assessedTaxMinor - collectedTaxMinor), intermediateInputsMinor, informalWagesMinor, undeclaredProfitMinor, informalConsumptionMinor: monthlyInformalSales, transactionIds: [saleTx].filter((item): item is string => Boolean(item)) });
   }
   const cutoff = world.clock.elapsedMonths - 12;
   world.politicalEconomy.shadowEconomy = world.politicalEconomy.shadowEconomy.filter((item) => item.elapsedMonth >= cutoff);
@@ -80,7 +94,9 @@ function formPolicyCoalitions(world: WorldState): void {
     const regulator = institutions.find((item) => item.type === "regulator")!;
     for (const group of [...groups].sort((a, b) => b.influenceBps - a.influenceBps).slice(0, 1)) {
       const account = currencyBankAccount(world, group.id, world.countries.find((item) => item.id === country.id)!.currencyReference);
-      const payment = account ? Math.min(5_000, bankAccountBalance(world, account.id)) : 0;
+      const policyValue = world.countryScaleReconciliations.find((item) => item.countryId === country.id)?.targetMonthlyNominalGdpMinor ?? group.resourcesMinor;
+      const desired = Math.min(Math.round(group.resourcesMinor * 8 / 10_000), Math.round(policyValue * group.influenceBps / 10_000 / 2_000));
+      const payment = account ? Math.min(desired, bankAccountBalance(world, account.id)) : 0;
       const transparent = regulator.integrityBps >= 6_000;
       const recipientId = transparent ? regulator.id : network.id;
       const tx = payment > 0 ? settleFinancialPayment(world, group.id, recipientId, account!.currencyId, payment, "LOBBYING", `Лоббирование ${proposalId}`, [proposalId]) : null;
@@ -111,7 +127,9 @@ function updateZombieFirmsAndSupport(world: WorldState): void {
     const government = governance && world.governments.find((item) => item.countryId === governance.countryId);
     const account = government && currencyBankAccount(world, government.id, government.currencyId);
     if (governance && government && account && bankAccountBalance(world, account.id) > 0 && world.clock.elapsedMonths % 3 === 0) {
-      const amount = Math.min(10_000, bankAccountBalance(world, account.id));
+      const financingGap = Math.max(0, company.lastOperatingExpenseCents + company.lastInterestCents - company.lastGrossRevenueCents);
+      const fiscalLimit = Math.round(bankAccountBalance(world, account.id) * 25 / 10_000);
+      const amount = Math.min(Math.max(1, financingGap), fiscalLimit, bankAccountBalance(world, account.id));
       const tx = settleFinancialPayment(world, government.id, company.id, government.currencyId, amount, "SUBSIDY", `Поддержка SOE: ${company.name}`, [company.id]);
       if (tx) { governance.subsidyTransactionIds.push(tx); record.supportDependencyBps = clamp(record.supportDependencyBps + 500); }
     }
@@ -123,7 +141,11 @@ function runConnectedLending(world: WorldState): void {
   for (const relation of world.politicalEconomy.connectedLending.filter((item) => item.status === "active" && item.connectionBps >= 2_500)) {
     const company = world.companies.find((item) => item.id === relation.borrowerCompanyId && item.active);
     if (!company || company.distressMonths < 2) continue;
-    const loan = issueLoan(world, relation.bankId, company.id, 25_000, 24, Math.max(0, 400 - relation.preferentialSpreadBps), [relation.id]);
+    const bank = world.banks.find((item) => item.id === relation.bankId);
+    const financingNeed = Math.max(company.lastOperatingExpenseCents * 3, company.lastGrossRevenueCents, 1);
+    const prudentialLimit = Math.round((bank?.baselineFinancials?.capitalMinor ?? financingNeed) * 250 / 10_000);
+    const amount = Math.max(1, Math.min(financingNeed, prudentialLimit));
+    const loan = issueLoan(world, relation.bankId, company.id, amount, 24, Math.max(0, 400 - relation.preferentialSpreadBps), [relation.id]);
     if (loan) relation.loanIds.push(loan.id);
     addTrace(world, { countryId: relation.countryId, decision: "connected-lending", actorIds: [relation.bankId, relation.borrowerCompanyId], inputs: { connectionBps: relation.connectionBps, preferentialSpreadBps: relation.preferentialSpreadBps }, reasons: [loan ? "Кредит выдан связанному заёмщику" : "Балансовые ограничения банка не позволили выдать кредит"], transactionIds: loan ? [loan.id] : [], outcome: loan ? "issued" : "rejected-by-ledger-constraints" });
   }
@@ -138,7 +160,8 @@ export function runPoliticalEconomyMonth(world: WorldState): void {
     for (const country of world.countries) {
       const government = world.governments.find((item) => item.countryId === country.id)!;
       const account = currencyBankAccount(world, government.id, government.currencyId);
-      const budget = account ? Math.min(5_000, Math.floor(bankAccountBalance(world, account.id) / 10_000)) : 0;
+      const monthlyGdp = world.countryScaleReconciliations.find((item) => item.countryId === country.id)?.targetMonthlyNominalGdpMinor ?? 0;
+      const budget = account ? Math.min(Math.round(monthlyGdp * 8 / 10_000), Math.floor(bankAccountBalance(world, account.id) * 20 / 10_000)) : 0;
       if (budget > 0) executeProcurement(world, country.id, budget);
     }
   }

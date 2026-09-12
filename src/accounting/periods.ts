@@ -31,8 +31,9 @@ type CompanyCashFlow = { operating: number; investing: number; financing: number
 
 function companyCashFlows(world: WorldState): Map<string, CompanyCashFlow> {
   const companyIdsByDeposit = new Map(world.companies.map((company) => [accountIds.deposit(company.id), company.id]));
+  const companyIds = new Set(world.companies.map((company) => company.id));
   for (const account of world.bankAccounts) {
-    if (world.companies.some((company) => company.id === account.ownerId)) companyIdsByDeposit.set(account.ledgerDepositAccountId, account.ownerId);
+    if (companyIds.has(account.ownerId)) companyIdsByDeposit.set(account.ledgerDepositAccountId, account.ownerId);
   }
   const byCompany = new Map<string, CompanyCashFlow>();
   const financingKinds = new Set<TransactionKind>(["LOAN_ISSUED", "LOAN_PRINCIPAL", "CAPITAL_CONTRIBUTION"]);

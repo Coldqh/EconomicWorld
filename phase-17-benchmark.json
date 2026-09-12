@@ -1,0 +1,108 @@
+{
+  "phase": 17,
+  "generatedAt": "2026-08-28T21:15:21.008Z",
+  "protocol": {
+    "warmupMonths": 600,
+    "measuredRuns": 3,
+    "mode": "REAL_WORLD",
+    "seed": "baseline"
+  },
+  "twentyYears": {
+    "wallClockMs": {
+      "min": 66900,
+      "median": 74109,
+      "max": 80306
+    },
+    "saveSizeBytes": {
+      "min": 33873064,
+      "median": 33873064,
+      "max": 33873064
+    },
+    "heapBytes": {
+      "min": 70272720,
+      "median": 71359296,
+      "max": 71800984
+    },
+    "samples": [
+      {
+        "months": 240,
+        "wallClockMs": 66900,
+        "saveSizeBytes": 33873064,
+        "heapBytes": 71359296,
+        "observations": 654,
+        "beliefs": 285,
+        "traces": 109,
+        "invariantFailures": 0
+      },
+      {
+        "months": 240,
+        "wallClockMs": 74109,
+        "saveSizeBytes": 33873064,
+        "heapBytes": 71800984,
+        "observations": 654,
+        "beliefs": 285,
+        "traces": 109,
+        "invariantFailures": 0
+      },
+      {
+        "months": 240,
+        "wallClockMs": 80306,
+        "saveSizeBytes": 33873064,
+        "heapBytes": 70272720,
+        "observations": 654,
+        "beliefs": 285,
+        "traces": 109,
+        "invariantFailures": 0
+      }
+    ]
+  },
+  "fiftyYears": {
+    "wallClockMs": {
+      "min": 222992,
+      "median": 230509,
+      "max": 269897
+    },
+    "saveSizeBytes": {
+      "min": 44427457,
+      "median": 44427457,
+      "max": 44427457
+    },
+    "heapBytes": {
+      "min": 83480344,
+      "median": 84371736,
+      "max": 84752528
+    },
+    "samples": [
+      {
+        "months": 600,
+        "wallClockMs": 230509,
+        "saveSizeBytes": 44427457,
+        "heapBytes": 83480344,
+        "observations": 654,
+        "beliefs": 288,
+        "traces": 311,
+        "invariantFailures": 0
+      },
+      {
+        "months": 600,
+        "wallClockMs": 269897,
+        "saveSizeBytes": 44427457,
+        "heapBytes": 84371736,
+        "observations": 654,
+        "beliefs": 288,
+        "traces": 311,
+        "invariantFailures": 0
+      },
+      {
+        "months": 600,
+        "wallClockMs": 222992,
+        "saveSizeBytes": 44427457,
+        "heapBytes": 84752528,
+        "observations": 654,
+        "beliefs": 288,
+        "traces": 311,
+        "invariantFailures": 0
+      }
+    ]
+  }
+}

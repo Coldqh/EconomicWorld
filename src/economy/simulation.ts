@@ -20,7 +20,8 @@ import { runGlobalEconomyMonth } from "./global-economy.ts";
 import { runGeoeconomicMonth } from "../geoeconomics/engine.ts";
 import { runPoliticalEconomyMonth } from "../political-economy/engine.ts";
 import { runDefenseEconomyMonth } from "../defense-economy/engine.ts";
-import { runConflictMonth } from "../conflict/engine.ts";
+import { runConflictPostEconomy, runConflictPreEconomy } from "../conflict/engine.ts";
+import { checkLongRunStage } from "./long-run-invariant-harness.ts";
 import { collectCountryMetrics, collectMetrics } from "./metrics.ts";
 import { calculateFundNav, runInstitutionalFinance } from "../finance/institutional.ts";
 import { processMarginRisk } from "../finance/leverage.ts";
@@ -32,6 +33,26 @@ import { runAutonomousDerivativeDecisions } from "../finance/autonomous-derivati
 import { settleFinancialPayment } from "../finance/financial-settlement.ts";
 import { prepareGovernmentCommitments, runMacroeconomicMonth, serviceSovereignDebt } from "./macroeconomics.ts";
 import { collectLongRunDiagnostics } from "./long-run-stability.ts";
+import { runCompanyDecisionCycle } from "../company/decision-engine.ts";
+import { runBankAlm } from "../banking/alm-engine.ts";
+import { runMarketMakers } from "../markets/market-makers/engine.ts";
+import { runEtfArbitrage } from "../finance/etf-ecosystem.ts";
+import { runInsuranceMonth } from "../insurance/engine.ts";
+import { advanceMAndA, advanceIPO, runMAndAIntegration } from "../corporate-finance/transactions.ts";
+import { captureEconomicExplanations } from "./why-engine.ts";
+import { processFundRedemptions } from "../finance/fund-liquidity.ts";
+import { runHeterogeneousMarketAgents } from "../markets/agents/engine.ts";
+import { evaluateCashAndCarry, runAutonomousTriangularFxArbitrage, runCrossVenueArbitrage } from "../markets/arbitrage/engine.ts";
+import { runPrivateEquityMonth } from "../private-equity/engine.ts";
+import { activeIpoProcesses, activeMAndADeals } from "../corporate-finance/pipeline-index.ts";
+import { runInformationMonth } from "../information/system.ts";
+import { syncPlayerProgression } from "../player/progression.ts";
+import {
+  beginSimulationMonthTiming,
+  finishSimulationMonthTiming,
+  finishSimulationPhaseTiming,
+  startSimulationPhaseTiming,
+} from "./performance-timing.ts";
 
 const clamp = (value: number, minimum: number, maximum: number): number => Math.min(maximum, Math.max(minimum, value));
 
@@ -546,12 +567,42 @@ function foundCompanyIfNeeded(world: WorldState): void {
   emitSimpleEvent(world, "CompanyFounded", "Зарегистрирована компания", company.name, [founder.id, company.id], "positive", [tx]);
 }
 
+export function runMonthlyMarketEcology(world: WorldState): void {
+  let phaseStarted = startSimulationPhaseTiming();
+  runMarketMakers(world);
+  finishSimulationPhaseTiming("Market Makers", phaseStarted);
+  phaseStarted = startSimulationPhaseTiming();
+  runCrossVenueArbitrage(world);
+  finishSimulationPhaseTiming("Cross-Venue Arbitrage", phaseStarted);
+  phaseStarted = startSimulationPhaseTiming();
+  runAutonomousTriangularFxArbitrage(world);
+  finishSimulationPhaseTiming("Triangular FX Arbitrage", phaseStarted);
+  phaseStarted = startSimulationPhaseTiming();
+  runEtfArbitrage(world);
+  finishSimulationPhaseTiming("ETF Arbitrage", phaseStarted);
+  phaseStarted = startSimulationPhaseTiming();
+  runHeterogeneousMarketAgents(world);
+  finishSimulationPhaseTiming("Heterogeneous Market Agents", phaseStarted);
+}
+
 export function stepMonth(world: WorldState): void {
+  const monthStarted = beginSimulationMonthTiming(world.clock.elapsedMonths);
+  runInformationMonth(world);
   for (const company of world.companies) resetCompanyPeriod(company);
   openCountryEconomicPeriods(world);
+  runConflictPreEconomy(world);
+  checkLongRunStage(world, "pre-conflict");
+  let phaseStarted = startSimulationPhaseTiming();
   prepareGovernmentCommitments(world);
+  finishSimulationPhaseTiming("Government", phaseStarted);
+  phaseStarted = startSimulationPhaseTiming();
   serviceLoans(world);
+  runBankAlm(world);
+  finishSimulationPhaseTiming("Banks", phaseStarted);
   serviceCorporateBonds(world);
+  phaseStarted = startSimulationPhaseTiming();
+  runCompanyDecisionCycle(world);
+  finishSimulationPhaseTiming("Corporate Decisions", phaseStarted);
   runLabourMarket(world);
   payWagesAndTaxes(world);
   paySocialTransfers(world);
@@ -559,24 +610,57 @@ export function stepMonth(world: WorldState): void {
   updateAggregateEconomies(world);
   procureInputs(world);
   produceGoods(world);
+  checkLongRunStage(world, "production");
   runGeoeconomicMonth(world);
+  phaseStarted = startSimulationPhaseTiming();
   runGlobalEconomyMonth(world);
+  finishSimulationPhaseTiming("Trade", phaseStarted);
+  // FX settlement is part of the global trade clearing call. Recording the
+  // same boundary under FX makes its inclusive cost visible in developer
+  // timing without splitting the causal settlement transaction.
+  finishSimulationPhaseTiming("FX", phaseStarted);
+  checkLongRunStage(world, "trade");
   clearHouseholdMarket(world);
   governmentPurchases(world);
   runDefenseEconomyMonth(world);
-  runConflictMonth(world);
+  phaseStarted = startSimulationPhaseTiming();
   serviceSovereignDebt(world);
+  finishSimulationPhaseTiming("Sovereign Debt", phaseStarted);
   depreciateCapital(world);
   investInCapital(world);
   updatePricesAndExpectations(world);
   updateDistressAndBankruptcies(world);
   collectCorporateTax(world);
+  phaseStarted = startSimulationPhaseTiming();
   runInstitutionalFinance(world);
-  if (isQuarterEnd(world.clock)) runMarketAgents(world);
+  processFundRedemptions(world);
+  finishSimulationPhaseTiming("Fund Rebalancing", phaseStarted);
+  phaseStarted = startSimulationPhaseTiming();
+  runInsuranceMonth(world);
+  finishSimulationPhaseTiming("Insurance", phaseStarted);
+  phaseStarted = startSimulationPhaseTiming();
+  for (const deal of activeMAndADeals(world)) advanceMAndA(world, deal.id);
+  for (const ipo of activeIpoProcesses(world)) advanceIPO(world, ipo.id);
+  runMAndAIntegration(world);
+  runPrivateEquityMonth(world);
+  finishSimulationPhaseTiming("PE/M&A/IPO", phaseStarted);
+  // Market liquidity and no-arbitrage links are monthly infrastructure. Strategic
+  // portfolio styles remain quarterly so they do not dominate the macro timestep.
+  runMonthlyMarketEcology(world);
+  if (isQuarterEnd(world.clock)) {
+    runMarketAgents(world);
+    phaseStarted = startSimulationPhaseTiming();
+    evaluateCashAndCarry(world, world.funds.find((item) => item.type === "hedge")?.id ?? world.player.householdId);
+    finishSimulationPhaseTiming("Cash-and-Carry", phaseStarted);
+  }
   for (const fund of world.funds) calculateFundNav(world, fund.id);
   processMarginRisk(world);
   processDerivativeMonth(world);
   runAutonomousDerivativeDecisions(world);
+  checkLongRunStage(world, "finance");
+  runConflictPostEconomy(world);
+  captureEconomicExplanations(world);
+  checkLongRunStage(world, "post-conflict");
   foundCompanyIfNeeded(world);
   recognizeMonthlySalesCosts(world);
   runMacroeconomicMonth(world);
@@ -586,13 +670,27 @@ export function stepMonth(world: WorldState): void {
   world.countryMetricsHistory.push(...collectCountryMetrics(world));
   recordPlayerMonth(world);
   progressPlayerWorld(world);
+  if (world.clock.elapsedMonths % 3 === 0) syncPlayerProgression(world);
+  phaseStarted = startSimulationPhaseTiming();
   closeMonthlyAccounting(world);
+  finishSimulationPhaseTiming("Accounting Close", phaseStarted);
+  checkLongRunStage(world, "month-close");
   emitSimpleEvent(world, "MonthClosed", "Месяц закрыт", formatSimulationDate(world.clock), [], "info", [], { nominalGdpCents: metric.nominalGdpCents, annualInflationBps: metric.annualInflationBps, unemploymentBps: metric.unemploymentBps });
   world.clock.elapsedMonths += 1;
   collectLongRunDiagnostics(world);
   migratePopulationCohorts(world);
+  phaseStarted = startSimulationPhaseTiming();
   compactLedgerHistory(world);
+  finishSimulationPhaseTiming("History Compaction", phaseStarted);
+  phaseStarted = startSimulationPhaseTiming();
   updateWorldDiagnostics(world);
+  finishSimulationPhaseTiming("Serialization/save preparation", phaseStarted);
+  // The month-scoped ledger indexes are constructed lazily inside consumers;
+  // their inclusive time is currently represented by the measured accounting
+  // and system phases. Keep the explicit slot in every developer record.
+  phaseStarted = startSimulationPhaseTiming();
+  finishSimulationPhaseTiming("Ledger Indexing", phaseStarted);
+  finishSimulationMonthTiming(monthStarted);
 }
 
 export function runMonths(world: WorldState, months: number): void {
